@@ -370,6 +370,10 @@ class ObjectLost(RuntimeError):
 
 RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)  # waits before each reconnect attempt
 CONNECT_TIMEOUT_S = 30.0  # one connect attempt; a timeout counts as a dropped link and is retried
+# Per-call limits (s). A trial hung > 10 min inside one SDK call after a release; a timeout now counts as a
+# dropped link (retryable), so call() reconnects and repeats it. Moves are absolute, so repeating is safe.
+CALL_TIMEOUT_S = {"move": 45.0, "get images": 10.0, "get pose": 10.0, "open": 15.0, "grab": 15.0,
+                  "holding": 10.0, "frame system": 15.0, "geometries": 15.0}
 
 
 def retryable(e: Exception) -> bool:
@@ -424,8 +428,25 @@ class Rig:
             self.fx, self.fy, self.cx, self.cy = intr.focal_x_px, intr.focal_y_px, intr.center_x_px, intr.center_y_px
             await self.detect_depth_shift()
 
+    async def _alive(self) -> None:
+        """
+        Touch $ALIVE_FILE every 5 s while the event loop runs; supervise.sh kills the process if it goes stale.
+
+        WHY: per-call timeouts cover awaits that never return, but a native call that blocks the whole loop
+        would stop everything silently; then this stops touching and the supervisor's watchdog restarts us.
+        """
+        path = os.environ.get("ALIVE_FILE")
+        while path:
+            try:
+                Path(path).touch()
+            except OSError:
+                pass
+            await asyncio.sleep(5.0)
+
     async def start(self) -> None:
         """First connect, with the same backoff as call(): the link from the laptop sometimes refuses outright."""
+        if os.environ.get("ALIVE_FILE") and not hasattr(self, "_alive_task"):
+            self._alive_task = asyncio.create_task(self._alive())
         last = None
         for wait in (0.0,) + RETRY_BACKOFF_S + (15.0, 30.0):
             if wait:
@@ -463,7 +484,7 @@ class Rig:
                 finally:
                     self.status = None
             try:
-                return await fn()
+                return await asyncio.wait_for(fn(), CALL_TIMEOUT_S.get(what, 20.0))
             except Exception as e:
                 if not retryable(e):
                     raise
