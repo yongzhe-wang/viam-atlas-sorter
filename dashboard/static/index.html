@@ -13,6 +13,18 @@
     :root { --bg: #141413; --panel: #1e1e1c; --ink: #ecebe6; --muted: #9a988f; --line: #2f2e2b;
             --ok: #4cc07a; --bad: #ef6b5f; --warn: #e0a64a; --accent: #7aa2ff; --chip: #2a2927; }
   }
+  /* Halloween theme (header toggle; judging gives 5% for Halloween style) */
+  :root[data-theme="halloween"] {
+    --bg: #120d18; --panel: #1d1426; --ink: #f6e9da; --muted: #b59fc4; --line: #3a2a48;
+    --ok: #8be04e; --bad: #ff4d4d; --warn: #ff9a3c; --accent: #ff7518; --chip: #2b1f38;
+  }
+  :root[data-theme="halloween"] body {
+    background: radial-gradient(1200px 500px at 85% -10%, #3b1d52 0%, transparent 60%), var(--bg);
+  }
+  :root[data-theme="halloween"] h1::after { content: " · Trick or Treat"; color: var(--accent); }
+  :root[data-theme="halloween"] .card { box-shadow: 0 0 0 1px #ff751822, 0 8px 30px #00000055; }
+  :root[data-theme="halloween"] button.primary { box-shadow: 0 0 14px #ff751866; }
+  #b-theme { margin-left: auto; }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
          font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
@@ -77,6 +89,7 @@
   <span id="p-atlas" class="pill">Atlas …</span>
   <span id="p-cam" class="pill">Camera …</span>
   <span id="p-perc" class="pill">Perception …</span>
+  <button type="button" id="b-theme" aria-pressed="false" title="Halloween theme">🎃 Spooky mode</button>
 </header>
 <main>
   <section class="card">
@@ -291,6 +304,19 @@ $("b-prev").addEventListener("click", async () => {
     refreshCam();
   } catch (err) { $("msg").textContent = "preview: " + err.message; }
 });
+
+// Halloween theme: remembered per browser; storage can be unavailable (private window), so guard it
+function setTheme(on) {
+  document.documentElement.dataset.theme = on ? "halloween" : "";
+  $("b-theme").setAttribute("aria-pressed", String(on));
+  $("b-theme").textContent = on ? "☀️ Normal mode" : "🎃 Spooky mode";
+  $("t").placeholder = on ? "trick or treat: candy corn" : "grasp green square";
+  try { localStorage.setItem("theme", on ? "halloween" : ""); } catch (e) {}
+}
+$("b-theme").addEventListener("click", () => setTheme(document.documentElement.dataset.theme !== "halloween"));
+let savedTheme = "";
+try { savedTheme = localStorage.getItem("theme") || ""; } catch (e) {}
+setTheme(savedTheme === "halloween");
 
 const safe = (fn) => () => fn().catch(() => {});
 refreshCam(); refreshStatus(); safe(refreshCommands)(); safe(refreshStats)(); safe(refreshAttempts)();
