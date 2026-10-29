@@ -160,17 +160,21 @@ async def capture(rig, n: int, kind: str, extra: dict = None) -> tuple:
 
 async def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
+    # Continue numbering: earlier frames may already be labelled by AGENT3 (label_scan) and must not change
+    existing = [int(f.stem) for f in OUT.glob("[0-9][0-9][0-9].json")]
+    first = max(existing) + 1 if existing else 0
+    survey_id = time.strftime("%Y%m%d-%H%M%S")
     rig = ppa.Rig()
     await rig.start()
     t_start = time.monotonic()
-    n, objects, free_samples = 0, [], []
+    n, objects, free_samples = first, [], []
     try:
         await ppa.apply_workspace_limits(rig)
         grid = [(x, y) for x in GRID_X for y in GRID_Y if ppa.allowed(x, y) and REACH[0] <= math.hypot(x, y) <= REACH[1]]
         print(f"survey: {len(grid)} grid points, theta 0, z {ppa.ALIGN_Z:.0f}")
         for x, y in grid:
             await ppa.travel(rig, x, y, theta=0.0)
-            rgb, depth, p, seg = await capture(rig, n, "grid")
+            rgb, depth, p, seg = await capture(rig, n, "grid", {"survey_id": survey_id})
             n += 1
             table, _ = ppa.table_and_near(depth)
             # Objects -> world positions (edge-cut ones too: their centre is approximate, merged below)
@@ -204,7 +208,7 @@ async def main() -> None:
             await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
         finally:
             await rig.close()
-        print(f"survey: {n} frames in {OUT} ({time.monotonic() - t_start:.0f} s); parked at {ppa.HOME_XY}")
+        print(f"survey: frames {first:03d}-{n - 1:03d} in {OUT} ({time.monotonic() - t_start:.0f} s); parked at {ppa.HOME_XY}")
 
 
 async def around(points: list, offset: float = 40.0) -> None:
