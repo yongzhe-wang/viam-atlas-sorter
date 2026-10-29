@@ -28,6 +28,7 @@ import math
 import os
 import sys
 import time
+from pathlib import Path
 
 import jaw_calib
 import numpy as np
@@ -39,6 +40,8 @@ from viam.components.camera import Camera
 from viam.components.gripper import Gripper
 from viam.proto.common import Pose
 from viam.robot.client import RobotClient
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for `sorter` helpers
 
 CAM_T = (-83.0, 14.0, 18.0)  # camera origin in the flange frame (mm)
 TIP_BELOW_CAM = 155.0 - CAM_T[2]  # fingertips are this far past the camera along the tool axis (mm)
@@ -314,7 +317,11 @@ def intruder(depth: np.ndarray, near_uv=None, radius: float = 300.0) -> bool:
     hist, edges = np.histogram(valid, bins=np.arange(100, 1500, 4))
     table = float(edges[np.argmax(hist)] + 2)
     tall = (depth > 0) & (depth < table - 100) & roi
-    blind = (depth == 0) & roi
+    # The gripper and anything it holds hang in from the bottom edge and are always too close for depth:
+    # drop blind patches touching the bottom row (a held block paused the arm as a "hand" for 120 s)
+    blind_all, _ = ndimage.label(depth == 0)
+    held = np.isin(blind_all, np.unique(blind_all[-1][blind_all[-1] > 0]))
+    blind = (depth == 0) & ~held & roi
     lab, n = ndimage.label(blind)
     biggest = int(ndimage.sum(blind, lab, range(1, n + 1)).max()) if n else 0
     return int(tall.sum()) > INTRUDER_TALL_PX or biggest > INTRUDER_BLIND_PX
@@ -374,6 +381,21 @@ class Rig:
             intr = (await self.cam.get_properties()).intrinsic_parameters
             self.fx, self.fy, self.cx, self.cy = intr.focal_x_px, intr.focal_y_px, intr.center_x_px, intr.center_y_px
             await self.detect_depth_shift()
+
+    async def start(self) -> None:
+        """First connect, with the same backoff as call(): the link from the laptop sometimes refuses outright."""
+        last = None
+        for wait in (0.0,) + RETRY_BACKOFF_S + (15.0, 30.0):
+            if wait:
+                print(f"  connect failed ({type(last).__name__}); retrying in {wait:.0f}s")
+                await asyncio.sleep(wait)
+            try:
+                await self.connect()
+                return
+            except Exception as e:
+                last = e
+                await self.close()
+        raise RuntimeError("could not connect to the machine") from last
 
     async def close(self) -> None:
         if self.robot is not None:
@@ -772,6 +794,38 @@ def near_square(rgb: np.ndarray, uv, radius: float = SQUARE_CLEAR_PX) -> bool:
     return bool(((blue | paper) & disk).sum() > 400)
 
 
+def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = 220.0) -> tuple:
+    """
+    (free?, reason) for putting an object down where pixel `uv` meets the table.
+
+    WHY: depth alone missed a transparent measuring jug (taller than the 10-80 mm "object" band, and seen
+    through) right under the release point; only a false hand-pause stopped the drop. So a spot must be
+    clear in depth at ANY height, have no unexplained blind patch, show only table-coloured pixels
+    (Mahalanobis on the table's own RGB, sorter.perception.non_table_colour) and be away from the square.
+    """
+    from sorter.perception import non_table_colour  # pure numpy; imported here to keep the arm script light
+
+    h, w = depth.shape
+    vv, uu = np.ogrid[:h, :w]
+    disk = (uu - uv[0]) ** 2 + (vv - uv[1]) ** 2 < radius ** 2
+    disk[FINGER_ROW:] = False
+    table, _ = table_and_near(depth)
+    raised = int(((depth > 0) & (depth < table - 10) & disk).sum())
+    blind_all, _ = ndimage.label(depth == 0)
+    held = np.isin(blind_all, np.unique(blind_all[-1][blind_all[-1] > 0]))
+    blind = int(((depth == 0) & ~held & disk).sum())
+    odd = int((non_table_colour(rgb, (depth > 0) & (np.abs(depth - table) < 3)) & disk).sum())
+    if raised > 300:
+        return False, f"something raised ({raised} px)"
+    if blind > 1500:
+        return False, f"unreadable depth ({blind} px)"
+    if odd > 1500:
+        return False, f"non-table colour ({odd} px)"
+    if near_square(rgb, uv):
+        return False, "on/near the tape square or its paper"
+    return True, "clear"
+
+
 async def search_square(rig: Rig) -> None:
     """
     Leave the arm at ALIGN_Z with the whole tape hole in view; raise if it is nowhere on the table.
@@ -814,12 +868,9 @@ async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> 
     table, _ = table_and_near(depth)
     hint = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
     # ~220 px is ~90 mm at ALIGN_Z: keeps the open jaws (84 mm stroke) clear of neighbours
-    _, top = table_and_near(depth, hint, radius=220.0, shift=rig.depth_shift)
-    if top is not None:
-        print(f"  spot ({x:.0f},{y:.0f}) occupied, skipping")
-        return False
-    if near_square(rgb, hint):
-        print(f"  spot ({x:.0f},{y:.0f}) is on/near the tape square or its paper, skipping")
+    free, why = spot_free(rgb, depth, hint)
+    if not free:
+        print(f"  spot ({x:.0f},{y:.0f}) not free: {why}")
         return False
     await release_here(rig, height, grip)
     return True
@@ -827,7 +878,7 @@ async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> 
 
 async def run(mode: str) -> None:
     rig = Rig()
-    await rig.connect()
+    await rig.start()
     try:
         try:
             if mode == "place":

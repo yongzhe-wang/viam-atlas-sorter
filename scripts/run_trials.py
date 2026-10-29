@@ -14,6 +14,7 @@ Run it with a hand near the e-stop.
 """
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -139,9 +140,11 @@ async def main(n: int) -> None:
     run_id = time.strftime("%Y%m%d-%H%M%S")
     store = open_store()
     rig = ppa.Rig()
-    await rig.connect()
+    await rig.start()
     results = []
     try:
+        # Where the block is if the square starts empty (env BLOCK_XY="x,y", flange mm); else from the resets
+        block_xy = tuple(map(float, os.environ["BLOCK_XY"].split(","))) if os.environ.get("BLOCK_XY") else None
         # Empty the square first, so trial 1 is a real pick-into-square
         cleared = await executor.clear_square(rig, store)
         print(f"reset: {cleared['status']} removed={cleared['removed']} wipes={cleared['wipes']} {cleared['duration_s']}s")
@@ -151,8 +154,10 @@ async def main(n: int) -> None:
                 break
             print(f"=== trial {i}/{n} ===")
             if cleared.get("dropped_at"):
-                # The reset leaves the arm over the (now empty) square; the block is where it was dropped
-                await ppa.travel(rig, *cleared["dropped_at"][-1], theta=0.0)
+                block_xy = cleared["dropped_at"][-1]
+            # The reset leaves the arm over the (now empty) square; the block is where it was last dropped
+            if block_xy is not None:
+                await ppa.travel(rig, *block_xy, theta=0.0)
             doc = await trial(rig, store, run_id, i, cleared.get("square_xy"))
             results.append(doc)
             print(f"trial {i}: success={doc['success']} {doc['duration_s']}s phases={doc['phase_times']} "

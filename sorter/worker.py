@@ -24,7 +24,7 @@ def clean(text: str) -> str:
 async def main() -> None:
     store = Store()
     rig = executor.ppa.Rig()
-    await rig.connect()
+    await rig.start()
     print(f"worker: connected, store {'online' if store.online else 'offline (JSONL)'}; waiting for commands")
     try:
         while True:
