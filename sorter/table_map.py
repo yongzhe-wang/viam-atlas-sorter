@@ -140,7 +140,24 @@ def map_from_frames(frames: list, store=None) -> dict:
         doc["square"] = {"xy": [round(float(np.median([q["xy"][k] for q in squares])), 1) for k in (0, 1)],
                          "size_mm": [round(float(np.median([q["size_mm"][k] for q in squares])), 1) for k in (0, 1)],
                          "frame_ids": [q["frame"] for q in squares]}
+    _mark_in_square(doc)
     return doc
+
+
+SQUARE_MARGIN_MM = 10.0  # an object this close to the square's interior counts as inside it
+
+
+def _mark_in_square(tmap: dict) -> None:
+    """
+    Flag every object whose xy lies in the drop square's interior (in_square=True).
+
+    WHY: the module filters objects already in the square out of a single frame, but a query against the map would
+    otherwise pick the yellow block out of the square again after it was delivered.
+    """
+    sq = tmap.get("square")
+    for e in tmap["objects"]:
+        e["in_square"] = bool(sq) and (abs(e["xy"][0] - sq["xy"][0]) <= sq["size_mm"][0] / 2 + SQUARE_MARGIN_MM
+                                       and abs(e["xy"][1] - sq["xy"][1]) <= sq["size_mm"][1] / 2 + SQUARE_MARGIN_MM)
 
 
 # ---- dynamic map: every frame the arm takes updates it ------------------------------------------------------
@@ -316,6 +333,7 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
         if tmap["square"]["misses"] >= MISSES_TO_DROP:
             tmap.pop("square")
 
+    _mark_in_square(tmap)
     tmap["ts"] = now
     tmap["last_update"] = {"ts": now, "pose": dict(pose), "source": source, "skipped": False,
                            "ms": round((time.perf_counter() - t0) * 1000), "detected": len(recs),
@@ -329,9 +347,12 @@ def best_on_map(table_map: dict, text: str, store=None) -> dict:
     clip_embed.best() on the map's objects; adds "xy" and "map_obj" so the executor can go there.
 
     On a fresh whole-table map, searchable=True means "known to the library but not on the table".
+    Objects already in the drop square are never picked; if the named object is only found there, the answer is
+    a refusal with reason "... is already in the square" and already_in_square=True.
     """
+    cands = [m for m in table_map["objects"] if not m.get("in_square")]
     recs = []
-    for k, m in enumerate(table_map["objects"]):
+    for k, m in enumerate(cands):
         # id = list position: dynamic-map ids are stable and stop matching positions once entries are dropped
         ns = SimpleNamespace(id=k, colour=m["colour"], colours=m.get("colours", {}),
                              length_px=m["size_mm"][0], width_px=m["size_mm"][1],
@@ -339,10 +360,16 @@ def best_on_map(table_map: dict, text: str, store=None) -> dict:
         recs.append({"obj": ns, "label": m["label"], "names": m["names"] or [], "score": m["score"],
                      "emb": np.asarray(m["emb"], dtype=np.float32)})
     b = clip_embed.best(None, text, store, recognised=recs)
-    pick = table_map["objects"][b["obj"].id] if b["obj"] is not None else None
+    pick = cands[b["obj"].id] if b["obj"] is not None else None
+    done = None
+    if pick is None:
+        done = next((m for m in table_map["objects"] if m.get("in_square") and m["label"]
+                     and clip_embed.name_matches(text, [m["label"], *(m["names"] or [])])), None)
+        if done is not None:
+            b = {**b, "reason": f"{done['label']!r} is already in the square", "searchable": False}
     # look_first: the entry comes from an edge-cut sighting (approximate xy): go there, re-observe, then grasp
     return {**b, "obj": None, "map_obj": pick, "xy": tuple(pick["xy"]) if pick else None,
-            "look_first": bool(pick and pick.get("partial"))}
+            "look_first": bool(pick and pick.get("partial")), "already_in_square": done is not None}
 
 
 def load_scan_frames(ids: list, scan_dir: Path = None) -> list:
