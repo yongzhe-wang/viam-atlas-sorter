@@ -670,7 +670,10 @@ class Rig:
             busy = depth is not None and intruder(depth, near_uv)
             if depth is not None and not busy:
                 # AGENT3's detector: skin-coloured blind holes / tall blobs reaching into the workspace
-                busy = any(bbox_near(i["bbox"], near_uv, 300.0) for i in segment_full(rgb, depth).intruders)
+                # Static tall things (the ~110 mm transparent cups read "blob 112 mm tall, skin 0%") are not
+                # people; only skin-coloured intruders count here (intruder() above still sees tall blobs at the target)
+                busy = any(bbox_near(i["bbox"], near_uv, 300.0) and "skin 0%" not in i["reason"]
+                           for i in segment_full(rgb, depth).intruders)
             if not busy:
                 clear_since = clear_since or time.monotonic()
                 if not paused or time.monotonic() - clear_since >= 2.0:
