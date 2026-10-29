@@ -172,25 +172,49 @@ class ObjTracker:
     """
     Finder (rgb -> (u, v, yaw, area) or None) that follows one object of any colour.
 
-    Far (depth valid, e.g. at ALIGN_Z): nearest object from perception.segment_full.
-    Close (depth blind < ~280 mm, during the close-range servo): nearest blob of pixels near the object's
-    own median colour. Gives up (None) if the nearest candidate jumped more than MAX_JUMP_PX, i.e. the
-    object was taken or moved by a person; the caller then re-acquires.
+    Far (depth valid, e.g. at ALIGN_Z): nearest object from perception.segment_full, INCLUDING objects cut by
+    the image border: "grasp blue screwdriver" failed with "lost after wrist rotation" because after a 40 deg
+    turn the thin shaft ran out of frame and the screwdriver moved to segment_full().excluded. Excluding cut
+    objects is right for choosing a target, wrong for following one.
+    If the nearest object jumped more than MAX_JUMP_PX (moved by a person, or segmented differently), it
+    re-acquires by recognition: best() with the request text over everything in view, nearest the last pixel.
+    Close (depth blind < ~280 mm, close-range servo): nearest blob near the object's own median colour.
     Limitation: at close range a table-coloured object cannot be told from the table.
     """
 
     MAX_JUMP_PX = 260.0
 
-    def __init__(self, rig, obj, rgb: np.ndarray):
+    def __init__(self, rig, obj, rgb: np.ndarray, text: str = None, store=None):
         self.rig = rig
         self.uv = obj.centroid_px
         self.colour = np.median(rgb[obj.mask].astype(float), axis=0)
+        self.text, self.store = text, store
+
+    def _seg_objects(self, rgb: np.ndarray, depth: np.ndarray) -> list:
+        seg = perception.segment_full(rgb, depth)
+        return list(seg.objects) + [o for o, _ in seg.excluded]
+
+    def _recognise(self, rgb: np.ndarray, objs: list):
+        """Re-acquire by name: best() with the request text, accepted only within 2 x MAX_JUMP_PX of the last pixel."""
+        if not self.text or not objs:
+            return None
+        try:
+            found = clip_embed.best(objs, self.text, self.store)
+        except Exception as e:
+            print(f"  re-acquire by recognition failed: {e}")
+            return None
+        o = found.get("obj")
+        if o is None or math.hypot(o.centroid_px[0] - self.uv[0], o.centroid_px[1] - self.uv[1]) > 2 * self.MAX_JUMP_PX:
+            return None
+        print(f"  re-acquired by recognition ({found.get('label')}, score {found.get('score', 0):.2f})")
+        return (o.centroid_px[0], o.centroid_px[1], o.yaw_deg, int(o.mask.sum()))
 
     def _candidates(self, rgb: np.ndarray) -> list:
         depth = self.rig.last_depth
         if depth is not None and (depth > 0).mean() > 0.6:
-            seg = perception.segment_full(rgb, depth)
-            return [(o.centroid_px[0], o.centroid_px[1], o.yaw_deg, int(o.mask.sum())) for o in seg.objects]
+            self._objs = self._seg_objects(rgb, depth)
+            return [(o.centroid_px[0], o.centroid_px[1], o.yaw_deg, int(o.mask.sum())) for o in self._objs]
+        self._objs = []
         m = np.linalg.norm(rgb.astype(float) - self.colour, axis=2) < COLOUR_TOL
         m[ppa.FINGER_ROW:] = False
         m = ndimage.binary_opening(m, iterations=2)
@@ -207,11 +231,11 @@ class ObjTracker:
 
     def __call__(self, rgb: np.ndarray):
         cands = self._candidates(rgb)
-        if not cands:
-            return None
-        best = min(cands, key=lambda c: math.hypot(c[0] - self.uv[0], c[1] - self.uv[1]))
-        if math.hypot(best[0] - self.uv[0], best[1] - self.uv[1]) > self.MAX_JUMP_PX:
-            return None
+        best = min(cands, key=lambda c: math.hypot(c[0] - self.uv[0], c[1] - self.uv[1])) if cands else None
+        if best is None or math.hypot(best[0] - self.uv[0], best[1] - self.uv[1]) > self.MAX_JUMP_PX:
+            best = self._recognise(rgb, getattr(self, "_objs", []))
+            if best is None:
+                return None
         self.uv = (best[0], best[1])
         return best
 
@@ -402,7 +426,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
             square_xy, doc["square_path"] = tuple(found["square"]["xy"]), "frame"
         elif LAST_SQUARE["xy"] is not None and time.time() - LAST_SQUARE["ts"] < SQUARE_CACHE_S:
             square_xy, doc["square_path"] = LAST_SQUARE["xy"], "cache"
-        tracker = ObjTracker(rig, obj, found["rgb"])
+        tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store)
         height, grip = await ppa.pick(rig, times, tracker)
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy)
