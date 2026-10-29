@@ -381,9 +381,11 @@ def apply(labels_path: str, force: bool, phone: bool = False, only_new: bool = F
     marker = base / "applied.json"
     done = {}
     if only_new:
-        # After carry(): skip sightings already in the Store (recorded in applied_prev.json)
-        prev = base / "applied_prev.json"
-        done = json.loads(prev.read_text())["items"] if prev.exists() else {}
+        # After carry(): skip sightings already in the Store, from before the carry (applied_prev.json) and from
+        # any apply since (applied.json), so applying twice in a row never duplicates views
+        for f in (base / "applied_prev.json", marker):
+            if f.exists():
+                done.update(json.loads(f.read_text()).get("items", {}))
     elif marker.exists() and not force:
         sys.exit(f"labels already applied ({marker}); use --force, or --only-new after --carry")
     labels = json.loads(Path(labels_path).read_text())
