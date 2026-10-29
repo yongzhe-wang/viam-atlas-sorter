@@ -219,7 +219,10 @@ class GraspByDescription(Generic, EasyResource):
                 busy = self.job is not None and not self.job.done()
                 phase = f"{self.job_info.get('kind')}: {self.job_info.get('text') or 'square'}" if busy else "idle"
                 err = self.last.get("error") if not busy else None
-                self.store.heartbeat(self.worker_id, phase, error=err, last_status=self.last.get("status"))
+                # consumer: whether this instance takes dashboard commands, so the dashboard can warn when two
+                # consumers are live at once (EXEC_PLAN: exactly one)
+                self.store.heartbeat(self.worker_id, phase, error=err, last_status=self.last.get("status"),
+                                     consumer=bool(self.attrs.get("consume_dashboard_commands", False)))
             except Exception as e:
                 LOGGER.warning(f"heartbeat failed: {e}")
             await asyncio.sleep(HEARTBEAT_S)
