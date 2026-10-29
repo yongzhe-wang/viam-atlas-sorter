@@ -218,6 +218,26 @@ class Store:
             out.append(v)
         return out
 
+    def list_labels(self) -> list:
+        """
+        Every object the library knows, as [[label, *aliases], ...]: label first, then its aliases (sorted,
+        deduplicated across all of that label's views), ordered by label. Same result online and offline.
+
+        WHY: clip_embed.library_names() needs which queries the library covers, and the dashboard shows the
+        audience what it can ask for; both previously reached into views directly.
+        """
+        if self.online:
+            rows = self.db.views.find({}, {"label": 1, "aliases": 1, "_id": 0})
+        else:
+            rows = self._read_offline("views")
+        names = {}
+        for r in rows:
+            label = r.get("label")
+            if not label:
+                continue
+            names.setdefault(label, set()).update(a for a in (r.get("aliases") or []) if a and a != label)
+        return [[label, *sorted(names[label])] for label in sorted(names)]
+
     def add_command(self, text: str) -> str:
         """Queue a dashboard command ("grasp green square"); status starts as pending."""
         now = time.time()

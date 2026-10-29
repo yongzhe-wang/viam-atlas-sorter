@@ -68,6 +68,10 @@
   .badge.busy, .badge.rejected, .badge.ambiguous, .badge.too_wide { color: var(--warn); }
   .badge.sending { color: var(--accent); }
   .cmdfail { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
+  #known { margin-top: 8px; font-size: 12px; line-height: 2; }
+  .chip { display: inline-block; padding: 1px 9px; margin: 0 4px 0 0; border-radius: 999px; background: var(--chip);
+          border: 1px solid var(--line); cursor: pointer; font-size: 12px; color: var(--ink); }
+  .chip:hover { border-color: var(--accent); }
   .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
   .kpi { background: var(--bg); border-radius: 8px; padding: 8px 10px; }
   .kpi b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
@@ -115,6 +119,7 @@
       <button type="button" id="b-reset">Clear square</button>
     </form>
     <div id="msg"></div>
+    <div id="known" hidden><span class="muted">Known objects:</span> <span id="known-list"></span></div>
     <ul class="cmds" id="cmds"></ul>
   </section>
 
@@ -341,6 +346,20 @@ let savedTheme = "";
 try { savedTheme = localStorage.getItem("theme") || ""; } catch (e) {}
 setTheme(savedTheme === "halloween");
 
+// Known objects from the view library: shows the audience what it can ask for; a click fills the box
+async function refreshLabels() {
+  const list = await api("/api/labels");
+  const box = $("known-list"); box.replaceChildren();
+  for (const [label, ...aliases] of list) {
+    const chip = el("button", label, "chip");
+    chip.type = "button";
+    if (aliases.length) chip.title = "also: " + aliases.join(", ");
+    chip.addEventListener("click", () => { $("t").value = label; $("t").focus(); });
+    box.appendChild(chip);
+  }
+  $("known").hidden = !list.length;
+}
+
 const safe = (fn) => () => fn().catch(() => {});
 refreshCam(); refreshStatus(); safe(refreshCommands)(); safe(refreshStats)(); safe(refreshAttempts)();
 setInterval(refreshCam, 1000);
@@ -348,6 +367,8 @@ setInterval(refreshStatus, 2000);
 setInterval(safe(refreshCommands), 1500);
 setInterval(safe(refreshStats), 3000);
 setInterval(safe(refreshAttempts), 3000);
+safe(refreshLabels)();
+setInterval(safe(refreshLabels), 30000);  // the library changes only when objects are scanned
 </script>
 </body>
 </html>

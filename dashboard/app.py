@@ -358,6 +358,12 @@ async def preview(body: TextIn):
     return [{"id": o.id, "score": float(s)} for o, s in ranked]
 
 
+@app.get("/api/labels")
+def labels():
+    """Known objects for the "you can ask for" list: [[label, *aliases], ...] from the view library."""
+    return store.list_labels()
+
+
 @app.get("/api/attempts")
 def attempts(limit: int = 30):
     return store.list_attempts(limit=min(limit, 200))
