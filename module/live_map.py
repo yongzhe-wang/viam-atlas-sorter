@@ -74,6 +74,7 @@ class LiveMap:
         self._task: Optional[asyncio.Task] = None
         self._persist_task: Optional[asyncio.Task] = None
         self._saved_at, self._dirty = 0.0, False
+        self._saving = False  # a save is being written (its thread cannot be cancelled: close() waits for it)
         self.stats = {"updates": 0, "dropped": 0, "errors": 0, "last_ms": None, "last_source": None,
                       "last_error": None, "last_error_ts": None, "last_ok_ts": None, "logged": 0, "log_errors": 0}
         self._error_logged = (None, 0.0)  # (message, when): repeated failures are logged once a minute, not per frame
@@ -206,12 +207,14 @@ class LiveMap:
         """Save at most every persist_s; updates landing meanwhile ride along with the next save."""
         while self._dirty:
             await asyncio.sleep(max(0.0, self._saved_at + self.persist_s - time.time()))
-            self._dirty = False
+            self._dirty, self._saving = False, True
             try:
                 await asyncio.to_thread(self.store.put_table_map, self.map, False)  # live saves skip the history
             except Exception as e:
                 self._dirty = True  # retried at the next round
                 LOGGER.warning(f"live map: save failed: {type(e).__name__}: {e}")
+            finally:
+                self._saving = False
             self._saved_at = time.time()
 
     async def clear(self, reason: str) -> dict:
@@ -268,14 +271,23 @@ class LiveMap:
                 "pending": len(self._keep) + (self._newest is not None), **self.stats}
 
     async def close(self) -> None:
-        """Stop the worker and save what is unsaved."""
-        for t in (self._task, self._persist_task):
-            if t is not None and not t.done():
-                t.cancel()
+        """
+        Stop: queued frames are dropped; an update / log / save already running is let finish, since their worker
+        threads keep writing files after a cancel (a cancelled save once hit a deleted directory); then whatever
+        is unsaved is saved.
+        """
+        self._newest = None
         for _, f in self._keep:  # a drain() still waiting must not hang on frames that will never be applied
             if not f.done():
                 f.cancel()
         self._keep.clear()
+        if self._task is not None and not self._task.done():
+            await asyncio.wait({self._task}, timeout=30.0)  # the frame in hand; the queues are empty now
+        if self._persist_task is not None and not self._persist_task.done():
+            if self._saving:
+                await asyncio.wait({self._persist_task}, timeout=30.0)
+            else:
+                self._persist_task.cancel()  # only sleeping until the next save: nothing half written
         if self._dirty and self.map is not None:
             try:
                 await asyncio.to_thread(self.store.put_table_map, self.map, False)

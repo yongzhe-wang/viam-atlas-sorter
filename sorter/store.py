@@ -73,8 +73,12 @@ def _safe_name(worker: str) -> str:
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
-    """Write then rename, so a reader in another process never sees a half-written file."""
-    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    """
+    Write then rename, so a reader in another process never sees a half-written file. The temp name is unique per
+    call: two threads of one process saving the same file (the live map's periodic save and a Clear map) shared
+    "<name>.<pid>.tmp", one renamed it away and the other failed with FileNotFoundError.
+    """
+    tmp = path.with_name(path.name + f".{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     tmp.write_bytes(data)
     tmp.replace(path)
 
