@@ -10,6 +10,7 @@ Usage (data in data/eval/, gitignored):
   eval_perception.py annotate NAME           writes NAME_ann.png with object ids for labelling
   eval_perception.py label NAME 0="green square" 2=cup missed=1
   eval_perception.py report [--store] [--absent "green square" ...]
+  eval_perception.py demo                    rehearsal queries (docs/demo_queries.md) on arm-scan frames
 Env for capture: VIAM_MACHINE_ADDRESS, VIAM_API_KEY_ID, VIAM_API_KEY.
 """
 import asyncio
@@ -94,6 +95,51 @@ def label(name: str, args: list) -> None:
     print("labelled", name, labels, "missed", missed)
 
 
+# Rehearsal queries (docs/demo_queries.md): (query, label the pick must be recognised as or None = must refuse,
+# arm-scan frames where the target is fully visible at z=400)
+DEMO = [("grasp green square", "green cube", ["033", "034", "035"]),
+        ("pick up the yellow block", "yellow block", ["006", "007", "036", "038"]),
+        ("trick or treat: candy", "kind bar", ["014", "015", "035"]),
+        ("the blue cylinder", "blue cylinder", ["010", "011", "012"]),
+        ("red ball", None, ["032", "035", "036"])]
+
+
+def demo() -> None:
+    """
+    Check every rehearsal query with best() on saved arm-scan frames, leave-one-frame-out.
+
+    WHY: the library was built from these frames, so each test frame's own views are removed first; what is
+    left is the situation on stage (library from the scan, a new frame from the camera).
+    """
+    import shutil
+    import tempfile
+
+    from sorter.store import Store
+
+    scan = EVAL.parent / "scan"
+    rows = [json.loads(line) for line in (EVAL.parent / "views.jsonl").read_text().splitlines() if line.strip()]
+    tmp = Path(tempfile.mkdtemp(prefix="demo_lofo_"))
+    total = passed = 0
+    try:
+        for q, want, frames in DEMO:
+            res = []
+            for fr in frames:
+                d = tmp / fr
+                if not d.exists():
+                    d.mkdir()
+                    (d / "views.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows if r.get("frame") != fr))
+                rgb = np.asarray(Image.open(scan / f"{fr}.jpg").convert("RGB"))
+                b = clip_embed.best(perception.segment_full(rgb, np.load(scan / f"{fr}_depth.npy")).objects, q,
+                                    Store(uri="", data_dir=str(d)))
+                ok = b["obj"] is None if want is None else (b["obj"] is not None and b["recognised"] == want)
+                total, passed = total + 1, passed + ok
+                res.append(f"{fr}:{'OK' if ok else 'FAIL'}(s={b['score']:.2f} m={b['margin']:.2f}{' ' + b['reason'] if b['reason'] else ''})")
+            print(f"{q!r:28} -> {want or 'REFUSE':14} " + "  ".join(res))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"demo queries: {passed}/{total} passed")
+
+
 def report(use_store: bool, absent: list) -> None:
     """
     Segmentation recall, and top-1 for each labelled object queried by its own label.
@@ -148,6 +194,8 @@ if __name__ == "__main__":
         annotate(sys.argv[2])
     elif cmd == "label":
         label(sys.argv[2], sys.argv[3:])
+    elif cmd == "demo":
+        demo()
     elif cmd == "report":
         # report [--store] [--absent "green square" ...]
         rest = sys.argv[2:]
