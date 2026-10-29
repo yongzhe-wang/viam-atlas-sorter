@@ -32,7 +32,7 @@ from scipy.spatial import ConvexHull
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import pick_place_auto as ppa  # noqa: E402  arm library (Rig, pick, place_in_square, place_at, ...)
 
-from sorter import clip_embed, perception  # noqa: E402
+from sorter import clip_embed, drop_square, perception  # noqa: E402
 
 MAX_OPEN_MM = 78.0  # jaws open ~84 mm; keep a margin so the fingers clear the sides
 COLOUR_TOL = 60.0  # RGB distance that still counts as the object at close range (grey/black/white objects)
@@ -670,7 +670,19 @@ async def look_here(rig, text: str, store, source: str = "demo") -> dict:
     # One CLIP batch for the sightings and for best(): it used to embed every crop twice per look
     recs = record_sightings(store, rgb, depth, seg, pose, intr(rig), source) if abs(pose["theta"]) <= 1.0 else []
     hole = hole_mask(rgb, depth)
-    objs = [o for o in seg.objects if not o.touches_edge and (hole is None or not in_hole(o, hole))]
+    sq = (live_map(rig) or {}).get("square")
+    k = intr(rig)
+
+    def delivered(o) -> bool:
+        # In the square in this frame, or inside the map's estimated full interior (any rotation, even when only
+        # part of the paper is in view: AGENT3's drop_square), by the grasp point's table xy
+        if hole is not None and in_hole(o, hole):
+            return True
+        if not sq:
+            return False
+        gu, gv, _ = grasp_px(o, pose, k)
+        return drop_square.contains(sq, perception.world_xy(pose, k, gu, gv, o.top_depth_mm))
+    objs = [o for o in seg.objects if not o.touches_edge and not delivered(o)]
     ids = {id(o) for o in objs}
     found = (clip_embed.best(objs, text, store, recognised=[r for r in recs if id(r["obj"]) in ids])
              if objs else {"obj": None, "reason": "nothing seen", "searchable": True})
@@ -1009,8 +1021,9 @@ SQUARE_FAR_MM = 350.0  # beyond this from the square, nearer to the arm wins
 def square_sightings(rig) -> list:
     """
     [(xy, source)] where the square was seen, newest first, each < SQUARE_CACHE_S old: LAST_SQUARE (executor
-    frames, a full view: "cache") and the live map's square (every module frame: "map", or "map-partial" when
-    only its border-cut part was seen; then xy is the visible part's centre, a rough guess, never a place target).
+    frames, a full view: "cache") and the live map's square (every module frame: "map", or "map-partial" when not
+    all four tape sides were seen yet; its xy is then drop_square's estimate of the full centre, a guess to look at,
+    never a place target).
 
     WHY (2026-10-29): the user moved the paper next to the screwdrivers and a grasp still used square_path
     "cache" at the old spot; the live map had already seen it elsewhere. The paper moves at will, so these are
