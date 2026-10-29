@@ -56,19 +56,23 @@ def free_mask(rgb: np.ndarray, depth: np.ndarray) -> np.ndarray:
     only table colour, and no tape/paper. Same criteria as pick_place_auto.spot_free, computed for every
     pixel at once (box windows on a 4x-downsampled grid) so a whole frame costs one pass.
     """
-    table, _ = ppa.table_and_near(depth)
-    up = (depth > 0) & (depth < table - 10)
+    # Same rules as ppa.spot_free: height above the fitted plane > SPOT_MIN_H_MM (thin things like a
+    # screwdriver shaft are 8-9 mm), any unreadable depth, any non-table colour
+    a_, b_, c_ = perception.fit_table(depth)
+    h, w = depth.shape
+    plane = a_ * np.arange(w)[None, :] + b_ * np.arange(h)[:, None] + c_
+    up = (depth > 0) & (plane - depth > ppa.SPOT_MIN_H_MM)
     blind = depth == 0
     hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
     paper = (hsv[..., 2] > 200) & (hsv[..., 1] < 40)
-    odd = perception.non_table_colour(rgb, (depth > 0) & (np.abs(depth - table) < 3))
+    odd = perception.non_table_colour(rgb, (depth > 0) & (np.abs(plane - depth) < 3))
     bad = up | blind | odd | paper | ppa.blue_mask(rgb)
     bad[ppa.FINGER_ROW:] = True  # fingers: never trust that band
     small = bad[::4, ::4].astype(float)
     win = int(2 * FREE_CLEAR_PX / 4) | 1
-    # fraction of "bad" pixels in the window; 1% tolerance for speckle
+    # fraction of "bad" pixels in the window; 0.3% tolerance for speckle (a thin shaft is ~1-2%)
     frac = ndimage.uniform_filter(small, size=win, mode="constant", cval=1.0)
-    ok = np.repeat(np.repeat(frac < 0.01, 4, axis=0), 4, axis=1)
+    ok = np.repeat(np.repeat(frac < 0.003, 4, axis=0), 4, axis=1)
     return ok[: rgb.shape[0], : rgb.shape[1]]
 
 

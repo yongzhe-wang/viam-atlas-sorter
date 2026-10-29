@@ -855,6 +855,7 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
 SEARCH_XY = [(x, y) for x in (250.0, 380.0, 500.0) for y in (-300.0, -150.0, 0.0, 150.0, 300.0)
              if 150.0 <= math.hypot(x, y) <= 600.0]
 SQUARE_CLEAR_PX = 145.0  # ~60 mm at the 378 mm observe depth (~2.4 px/mm)
+SPOT_MIN_H_MM = 4.0  # anything this far above the fitted table plane occupies a drop spot
 
 
 # Horizontal reach of the tool around the flange axis: camera body ~85 mm out (cam frame -83, 14) plus its
@@ -942,14 +943,18 @@ def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = 220.0) -> 
     clear in depth at ANY height, have no unexplained blind patch, show only table-coloured pixels
     (Mahalanobis on the table's own RGB, sorter.perception.non_table_colour) and be away from the square.
     """
-    from sorter.perception import non_table_colour  # pure numpy; imported here to keep the arm script light
+    from sorter.perception import fit_table, non_table_colour  # pure numpy; imported here to keep the arm script light
 
     h, w = depth.shape
     vv, uu = np.ogrid[:h, :w]
     disk = (uu - uv[0]) ** 2 + (vv - uv[1]) ** 2 < radius ** 2
     disk[FINGER_ROW:] = False
     table, _ = table_and_near(depth)
-    up = (depth > 0) & (depth < table - 10)
+    # Height above the FITTED table plane (the table tilts ~6 mm across a frame): anything > SPOT_MIN_H_MM
+    # counts. A screwdriver shaft only 8-9 mm tall passed the old "> 10 mm" rule and the block was dropped on it.
+    a_, b_, c_ = fit_table(depth)
+    plane = a_ * np.arange(w)[None, :] + b_ * np.arange(h)[:, None] + c_
+    up = (depth > 0) & (plane - depth > SPOT_MIN_H_MM)
     # The held object hangs in from the bottom edge: unreadable core plus close valid edges. Everything
     # close/unreadable and connected to the bottom row is the gripper's own load, not the table's.
     close, _ = ndimage.label((depth == 0) | up)
@@ -957,12 +962,13 @@ def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = 220.0) -> 
     disk &= ~held
     raised = int((up & disk).sum())
     blind = int(((depth == 0) & disk).sum())
-    odd = int((non_table_colour(rgb, (depth > 0) & (np.abs(depth - table) < 3)) & disk).sum())
-    if raised > 300:
+    odd = int((non_table_colour(rgb, (depth > 0) & (np.abs(plane - depth) < 3)) & disk).sum())
+    if raised > 150:
         return False, f"something raised ({raised} px)"
     if blind > 1500:
         return False, f"unreadable depth ({blind} px)"
-    if odd > 1500:
+    # 400 px ~ a 19 px wide shaft over ~20 px; plain wood measured 0 non-table pixels
+    if odd > 400:
         return False, f"non-table colour ({odd} px)"
     if near_square(rgb, uv):
         return False, "on/near the tape square or its paper"
