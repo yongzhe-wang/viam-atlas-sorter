@@ -572,9 +572,10 @@ def square_spot(rig, size_mm: tuple = (40.0, 40.0)):
     def choose(rgb: np.ndarray, depth: np.ndarray, pose: dict) -> tuple:
         if depth is None:
             return None, "no depth"
-        hole = hole_mask(rgb, depth)
+        # The full interior only (no border-cut fallback): the release needs all of it in view
+        hole = hole_mask(rgb)
         if hole is None:
-            return None, "hole not visible"
+            raise ppa.SquareNotFound("the square's full interior is not in view at the carry-offset pose")
         plane = table_plane(depth)
         up = (depth > 0) & (plane - depth > perception.MIN_HEIGHT_MM)
         blind = depth == 0
@@ -911,15 +912,14 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if width_mm(obj, rig.fx) > MAX_OPEN_MM and ring_geometry(obj) is None:
             doc.update(status="too_wide", fail_phase="find", fail_reason=f"{width_mm(obj, rig.fx):.0f} mm across")
             return doc
-        # Where to put it: a frame of this search, else the last known square, else search while carrying
+        # Where to look for the square while carrying: a full view from this task's frames, then recent
+        # sightings newest first, then a search; place_in_square releases only after a full view of the interior
         square_xy, doc["square_path"] = None, "search"
         if found.get("square"):
             square_xy, doc["square_path"] = tuple(found["square"]["xy"]), found.get("square_from", "frame")
-        else:
-            # Newest of the executor's own sighting and the live map's (place_in_square searches if it moved)
-            square_xy, src = known_square(rig)
-            if square_xy is not None:
-                doc["square_path"] = src
+        sightings = square_sightings(rig)
+        if square_xy is None and sightings:
+            doc["square_path"] = sightings[0][1]
         tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store)
         # One move (translation + wrist yaw) to the pre-grasp pose computed from the found frame, where best()
         # already accepted the whole object: identity is fixed there (tracker.ref); pick() refines and checks
@@ -928,7 +928,11 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         height, grip = await ppa.pick(rig, times, tracker, check=lambda: still_target(rig, text, store, tracker))
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
-        await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy, choose_spot=square_spot(rig, size))
+        centre = await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy,
+                                           choose_spot=square_spot(rig, size),
+                                           more_guesses=[xy for xy, _ in sightings],
+                                           search_poses=[(x, y, SWEEP_Z) for x, y in SWEEP_XY])
+        LAST_SQUARE.update(xy=tuple(centre), ts=time.time())
         q = await rig.pose()
         times["at"] = "check"
         rgb, depth = await rig.frame()
@@ -1002,22 +1006,32 @@ SQUARE_AVOID_MM = 180.0  # never drop within this of the square's centre (hole ~
 SQUARE_FAR_MM = 350.0  # beyond this from the square, nearer to the arm wins
 
 
-def known_square(rig) -> tuple:
+def square_sightings(rig) -> list:
     """
-    (flange xy over the square's centre, "cache" / "map") from whichever was seen LATER: LAST_SQUARE (executor
-    frames) or the live map's square (every module frame); (None, None) if neither is < SQUARE_CACHE_S old.
+    [(xy, source)] where the square was seen, newest first, each < SQUARE_CACHE_S old: LAST_SQUARE (executor
+    frames, a full view: "cache") and the live map's square (every module frame: "map", or "map-partial" when
+    only its border-cut part was seen; then xy is the visible part's centre, a rough guess, never a place target).
 
     WHY (2026-10-29): the user moved the paper next to the screwdrivers and a grasp still used square_path
-    "cache" at the old spot; the live map had already seen it elsewhere.
+    "cache" at the old spot; the live map had already seen it elsewhere. The paper moves at will, so these are
+    only where place_in_square looks first; it releases only after a full view of the interior.
+    {AGENT3 2026-10-29 "PARTIAL == TRUE ... XY / SIZE_MM ARE ONLY THE VISIBLE PART, NOT THE HOLE CENTRE"}
+    [CONFIDENCE: SINGLE-SRC 85% — AGENT3's map format]
     """
-    best = (LAST_SQUARE["ts"], LAST_SQUARE["xy"], "cache") if LAST_SQUARE["xy"] is not None else None
-    m = live_map(rig)
-    sq = (m or {}).get("square")
-    if sq and sq.get("xy") and (best is None or float(sq.get("seen_ts") or 0.0) > best[0]):
-        best = (float(sq.get("seen_ts") or 0.0), tuple(sq["xy"]), "map")
-    if best is None or time.time() - best[0] > SQUARE_CACHE_S:
-        return None, None
-    return tuple(best[1]), best[2]
+    seen = []
+    if LAST_SQUARE["xy"] is not None:
+        seen.append((float(LAST_SQUARE["ts"]), tuple(LAST_SQUARE["xy"]), "cache"))
+    sq = (live_map(rig) or {}).get("square")
+    if sq and sq.get("xy"):
+        seen.append((float(sq.get("seen_ts") or 0.0), tuple(sq["xy"]), "map-partial" if sq.get("partial") else "map"))
+    now = time.time()
+    return [(xy, src) for ts, xy, src in sorted(seen, reverse=True) if now - ts <= SQUARE_CACHE_S]
+
+
+def known_square(rig) -> tuple:
+    """(xy, source) of the newest square sighting (square_sightings), or (None, None)."""
+    seen = square_sightings(rig)
+    return seen[0] if seen else (None, None)
 
 
 def live_map(rig):

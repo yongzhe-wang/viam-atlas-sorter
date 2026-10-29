@@ -1010,47 +1010,99 @@ async def locate_square(rig: Rig) -> tuple:
     return p.x, p.y
 
 
-async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None,
-                          choose_spot=None) -> None:
-    """
-    Steps 3-4: carry to the square, release over its hole.
+TABLE_DEPTH_MM = 378.0  # camera -> table at ALIGN_Z (measured 373-379 across a frame)
 
-    With `square_xy` (a frame or cache, empty gripper) go there and refine by servo; if the hole is not seen
-    there the paper was moved, so search and servo while holding, exactly as without `square_xy` (works when
-    the held object does not hide the hole). Before 2026-10-29 an unseen hole at square_xy still got the release
-    there: a moved paper meant an object put down at the old spot. Raises (still holding) if the hole is nowhere.
-    `choose_spot(rgb, depth, pose) -> (flange xy or None, why)` (the executor's free-spot finder): the servo stops
-    at the carry-offset view, where the hole is clear of the held object, and the release goes to the spot it
-    picks instead of the hole's centre; None raises SquareFull (still holding). The blue screwdriver was put down
-    on the yellow block already in the hole (2026-10-29).
+
+def carry_look_xy(rig: Rig, xy: tuple) -> tuple:
+    """
+    Flange xy (ALIGN_Z, theta 0) where the table point `xy` (a hole centre estimate) appears at the carry-offset
+    pixel (axis pixel + CARRY_OFFSET_PX), clear of the held object: from the camera model, no probing.
+    """
+    J = model_jacobian(rig.fx, rig.fy, rig.cx, rig.cy, 0.0, TABLE_DEPTH_MM)
+    d = np.linalg.solve(J, np.array(CARRY_OFFSET_PX, float))
+    return xy[0] + float(d[0]), xy[1] + float(d[1])
+
+
+async def locate_square_carrying(rig: Rig, guesses: list = (), search_poses: list = None) -> tuple:
+    """
+    Leave the arm at ALIGN_Z, theta 0, with the square's FULL interior in view and its centre servoed onto the
+    carry-offset pixel; returns the flange xy over the hole centre. Raises SquareNotFound (still holding).
+
+    WHY (2026-10-29): the user moves the paper around ("WE NEED TO BE ABLE TO MOVE THIS AROUND"), at any rotation,
+    and the square may be seen only cut off by the image edge. So: each guess (a full centre from this task, then
+    a rough one such as the live map's partial square) gets ONE move to the pose that shows it at the carry-offset
+    pixel; a full, enclosed interior there is servoed. Otherwise search like search_and_find: `search_poses`
+    ((x, y, z), e.g. the executor's sweep poses) nearest-first, early exit at the first full view, then one move to
+    its carry-offset pose. The release only ever follows a full view of the interior from this function.
+    {VIAM CENTERAL 2026-10-29 "NEVER RELEASE UNLESS THE FULL INTERIOR WAS SEEN WITHIN THIS TASK"}
+    [CONFIDENCE: SINGLE-SRC 85% — coordinator's rule; find_square only accepts a tape-ringed hole not touching the border]
+    The hole centre is the enclosed region's centroid, the same at any rotation of the paper.
+    """
+    from sorter.perception import world_xy
+
+    async def confirm() -> tuple:
+        # Full interior in view here: refine onto the carry-offset pixel, return the hole centre's flange xy
+        await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX, blind_step=False)
+        q = await rig.pose()
+        J = model_jacobian(rig.fx, rig.fy, rig.cx, rig.cy, q.theta, TABLE_DEPTH_MM)
+        d = np.linalg.solve(J, -np.array(CARRY_OFFSET_PX, float))
+        return q.x + float(d[0]), q.y + float(d[1])
+
+    for xy in guesses:
+        lx, ly = carry_look_xy(rig, xy)
+        if not allowed(lx, ly) or not 150.0 <= math.hypot(lx, ly) <= 600.0:
+            continue
+        await travel(rig, lx, ly, theta=0.0)
+        if find_square((await rig.frame())[0]) is not None:
+            print(f"  square: full interior at the guess ({xy[0]:.0f},{xy[1]:.0f})")
+            return await confirm()
+        print(f"  square: not fully in view at the guess ({xy[0]:.0f},{xy[1]:.0f}); searching")
+    poses = list(search_poses or [(x, y, ALIGN_Z) for x, y in SEARCH_XY])
+    poses = [q for q in poses if allowed(q[0], q[1]) and 150.0 <= math.hypot(q[0], q[1]) <= 600.0]
+    p = await rig.pose()
+    at = (p.x, p.y)
+    while poses:
+        x, y, z = min(poses, key=lambda q: math.hypot(q[0] - at[0], q[1] - at[1]))
+        poses.remove((x, y, z))
+        at = (x, y)
+        await travel(rig, x, y, theta=0.0, z=z)
+        rgb, depth = await rig.frame()
+        hit = find_square(rgb)
+        if hit is None or depth is None:
+            continue
+        q = await rig.pose()
+        table, _ = table_and_near(depth)
+        xy = world_xy({"x": q.x, "y": q.y, "z": q.z, "theta": q.theta},
+                      {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}, hit[0], hit[1], table)
+        print(f"  square: full view from ({x:.0f},{y:.0f},{z:.0f}) -> centre ({xy[0]:.0f},{xy[1]:.0f})")
+        await travel(rig, *carry_look_xy(rig, xy), theta=0.0)
+        if find_square((await rig.frame())[0]) is not None:
+            return await confirm()
+    raise SquareNotFound("square: no full view of its interior anywhere on the table")
+
+
+async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None,
+                          choose_spot=None, more_guesses: list = (), search_poses: list = None) -> tuple:
+    """
+    Steps 3-4: carry to the square, release in its hole; returns the flange xy over the hole's centre.
+
+    locate_square_carrying() with the guesses square_xy (a full centre: a frame of this task) then more_guesses
+    (recent sightings, newest first, e.g. the live map's partial square), then the search; it never returns without a full
+    view of the interior, so nothing is released at an old or guessed spot (before 2026-10-29 an unseen hole at
+    square_xy still got the release there). Raises (still holding) if the hole is nowhere.
+    `choose_spot(rgb, depth, pose) -> (flange xy or None, why)` (the executor's free-spot finder) picks the release
+    point from the carry-offset view, where the hole is clear of the held object; None raises SquareFull (still
+    holding). The blue screwdriver was put down on the yellow block already in the hole (2026-10-29). Without it
+    the release goes to the hole's centre.
     """
     times = {} if times is None else times
     t = time.monotonic()
     print("3/5 carry to the blue square")
     times["at"] = "carry"
-    blind = choose_spot is None
-    seen = False
-    if square_xy is not None:
-        # Wrist back to 0 so the nominal Jacobian holds if a probe loses the square behind the held object
-        await travel(rig, *square_xy, theta=0.0)
-        seen = find_square((await rig.frame())[0]) is not None
-        if seen:
-            try:
-                await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX, blind_step=blind)
-            except RuntimeError as e:
-                if not blind:
-                    raise
-                print(f"  refine skipped ({e}); placing at the located square")
-                await travel(rig, *square_xy)
-        else:
-            print(f"  no square at ({square_xy[0]:.0f},{square_xy[1]:.0f}): the paper moved, searching")
-    if not seen:
-        # The square is on paper that people move around: never assume where it is
-        q = await rig.pose()
-        await rig.goto(q.x, q.y, ALIGN_Z, theta=0.0)
-        await search_square(rig)
-        await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX, blind_step=blind)
-    if not blind:
+    guesses = [g for g in [square_xy, *more_guesses] if g is not None]
+    centre = await locate_square_carrying(rig, guesses, search_poses)
+    spot = centre
+    if choose_spot is not None:
         q = await rig.pose()
         rgb, depth = await rig.frame()
         spot, why = choose_spot(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
@@ -1058,7 +1110,7 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
         print(f"  drop spot in the square: {why}")
         if spot is None:
             raise SquareFull(f"square is full, clear it first ({why})")
-        await travel(rig, *spot, theta=0.0)
+    await travel(rig, *spot, theta=0.0)
     t = mark(times, "carry", t)
 
     if not await rig.holding():
@@ -1067,6 +1119,11 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     times["at"] = "place"
     await release_here(rig, height, grip)
     mark(times, "place", t)
+    return centre
+
+
+class SquareNotFound(RuntimeError):
+    """No full view of the square's interior anywhere on the table; still holding the object."""
 
 
 class SquareFull(RuntimeError):
@@ -1248,7 +1305,8 @@ async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = A
     if not allowed(x, y):
         raise RuntimeError(f"refusing ({x:.0f},{y:.0f}): inside an obstacle keep-out zone")
     p = await rig.pose()
-    if p.z < z - 1:
+    # Change height first, straight up or down: a leg that also drops z 580 -> 400 is ~270 mm, over MAX_STEP_MM
+    if abs(p.z - z) > 1:
         await rig.goto(p.x, p.y, z, settle=False)
     legs = max(1, math.ceil(math.hypot(x - p.x, y - p.y) / 200.0))
     for i in range(1, legs + 1):
