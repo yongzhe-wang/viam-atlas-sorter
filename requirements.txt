@@ -2,3 +2,6 @@ viam-sdk
 numpy
 pillow
 scipy
+pymongo
+torch
+open_clip_torch
