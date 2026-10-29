@@ -290,7 +290,8 @@ def _sync_module_cmds() -> None:
         if last and same:
             c.update(status=last.get("status") or "done", finished=last.get("finished"), attempt_id=last.get("_id"),
                      fail_reason=last.get("fail_reason") or last.get("error"), duration_s=last.get("duration_s"),
-                     chosen={"label": last.get("label"), "score": last.get("score")} if last.get("label") else None)
+                     chosen={"label": last.get("label"), "colour": last.get("colour"), "score": last.get("score")}
+                     if last.get("label") or last.get("colour") else None)
 
 
 async def module_call(command: dict) -> dict:
@@ -365,7 +366,8 @@ async def add_command(body: TextIn):
     if res.get("accepted"):
         target = res.get("target") or {}
         entry.update(status="running", job=res.get("job"),
-                     chosen={"label": target.get("label"), "score": target.get("score")} if target else None)
+                     chosen={"label": target.get("label"), "colour": target.get("colour"), "score": target.get("score")}
+                     if target else None)
     elif res.get("status") in ("not_found", "ambiguous"):
         # Always-ready module answers at once from its cached frame: nothing started, here is why
         entry.update(status=res["status"], fail_reason=res.get("reason"))

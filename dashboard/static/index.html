@@ -276,7 +276,9 @@ async function refreshCommands() {
     const li = el("li");
     const left = el("div");
     left.appendChild(el("div", c.text === "__reset__" ? "Clear square" : c.text));
-    const chosen = c.chosen ? `picked ${c.chosen.label ?? "#" + c.chosen.id}${c.chosen.score != null ? " · " + Number(c.chosen.score).toFixed(2) : ""}` : "";
+    // Library name first, its colour in brackets ("picked blue screwdriver (black)"); colour alone if unrecognised
+    const ch = c.chosen, name = ch && (ch.label ?? (ch.colour ? `${ch.colour} object` : "#" + ch.id));
+    const chosen = ch ? `picked ${name}${ch.label && ch.colour ? ` (${ch.colour})` : ""}${ch.score != null ? " · " + Number(ch.score).toFixed(2) : ""}` : "";
     const took = c.duration_s != null ? `${Number(c.duration_s).toFixed(0)} s` : "";
     const decided = c.decide_ms != null ? `decided in ${c.decide_ms} ms` : "";
     left.appendChild(el("div", [hhmm(c.ts), chosen, decided, took].filter(Boolean).join(" · "), "muted"));
