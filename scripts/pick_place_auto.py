@@ -264,9 +264,17 @@ def find_square(rgb: np.ndarray):
     for i in range(1, n + 1):
         if i in border:
             continue
-        ys, xs = np.nonzero(lab == i)
-        if len(xs) > 2000 and (best is None or len(xs) > best[2]):
-            best = (xs, ys, len(xs))
+        region = lab == i
+        size = int(region.sum())
+        if size <= 2000 or (best is not None and size <= best[2]):
+            continue
+        # Must be ringed by tape: an enclosed patch inside a snack bag's black print was taken for the hole
+        # and the servo jumped 475 px. Occluders (held object, fingers) are excluded from the ratio.
+        band = ndimage.binary_dilation(region, iterations=10) & ~region & ~yellow & ~dark
+        if band.sum() == 0 or (band & blue).sum() < 0.6 * band.sum():
+            continue
+        ys, xs = np.nonzero(region)
+        best = (xs, ys, size)
     if best is None:
         return None
     xs, ys, area = best
@@ -463,6 +471,10 @@ class Rig:
             iou = (moved & near).sum() / max((moved | near).sum(), 1)
             if best is None or iou > best[0]:
                 best = (iou, (float(du), float(dv)))
+        if best[0] < 0.1:
+            # Too little overlap either way (e.g. the only yellow thing is held, too close for depth)
+            print(f"  depth shift: no evidence (IoU {best[0]:.2f}), keeping {self.depth_shift}")
+            return
         self.depth_shift = best[1]
         print(f"  depth shift: using {self.depth_shift} (IoU {best[0]:.2f})")
 
@@ -684,15 +696,44 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
     await rig.goto(q.x, q.y, ALIGN_Z)
 
 
-async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None) -> None:
-    """Steps 3-4: find the blue square, servo over its hole, release there (with calibration samples)."""
-    times = {} if times is None else times
-    t = time.monotonic()
-    print("3/5 find blue square")
-    times["at"] = "carry"
-    # The square is on paper that people move around: never assume where it is
+async def locate_square(rig: Rig) -> tuple:
+    """
+    Flange (x, y) that puts the jaws over the square's centre; found with an EMPTY gripper.
+
+    WHY: a held object hangs in front of the camera and covers part of the hole (the hole then leaks to
+    the border or vanishes), so the square is located before the pick and the carry goes to that point.
+    """
     await search_square(rig)
     await rig.servo(find_square, False, "square")
+    p = await rig.pose()
+    print(f"  square at flange ({p.x:.0f},{p.y:.0f})")
+    return p.x, p.y
+
+
+async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None) -> None:
+    """
+    Steps 3-4: carry to the square, release over its hole (with calibration samples).
+
+    With `square_xy` (from locate_square, empty gripper) go there and only refine by servo if the hole is
+    still seen; the paper may have been moved meanwhile, and then the servo follows it. Without it, search
+    and servo while holding (works when the held object does not hide the hole).
+    """
+    times = {} if times is None else times
+    t = time.monotonic()
+    print("3/5 carry to the blue square")
+    times["at"] = "carry"
+    if square_xy is not None:
+        await travel(rig, *square_xy)
+        if find_square((await rig.frame())[0]):
+            try:
+                await rig.servo(find_square, False, "square")
+            except RuntimeError as e:
+                print(f"  refine skipped ({e}); placing at the located square")
+                await travel(rig, *square_xy)
+    else:
+        # The square is on paper that people move around: never assume where it is
+        await search_square(rig)
+        await rig.servo(find_square, False, "square")
     t = mark(times, "carry", t)
 
     if not await rig.holding():

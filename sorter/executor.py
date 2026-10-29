@@ -163,6 +163,9 @@ async def execute(rig, text: str, store, mode: str = "demo") -> dict:
     times = {}
     t0 = time.monotonic()
     try:
+        # Locate the square first, while the gripper is empty: a held object hides part of the hole
+        times["at"] = "square"
+        square_xy = await ppa.locate_square(rig)
         times["at"] = "find"
         found = await find_target(rig, text, store)
         obj = found.get("obj")
@@ -180,7 +183,7 @@ async def execute(rig, text: str, store, mode: str = "demo") -> dict:
         tracker = ObjTracker(rig, obj, found["rgb"])
         height, grip = await ppa.pick(rig, times, tracker)
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
-        await ppa.place_in_square(rig, height, grip, times)
+        await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy)
         times["at"] = "check"
         rgb, depth = await rig.frame()
         seen, inside = objects_in_hole(rgb, depth)
@@ -270,7 +273,9 @@ async def clear_square(rig, store) -> dict:
             if not seen:
                 raise RuntimeError("square not visible after servo")
             if not inside:
-                doc.update(success=True, status="done")
+                q = await rig.pose()
+                # Arm is centred over the empty square with an empty gripper: the place target for the next run
+                doc.update(success=True, status="done", square_xy=[q.x, q.y])
                 break
             obj = inside[0]
             print(f"reset: {len(inside)} object(s) in the square; removing one ({obj.colour}, {obj.height_mm:.0f} mm)")

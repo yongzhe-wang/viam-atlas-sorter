@@ -93,7 +93,7 @@ async def snapshot(rig, path: Path) -> np.ndarray:
     return rgb
 
 
-async def trial(rig, store, run_id: str, i: int) -> dict:
+async def trial(rig, store, run_id: str, i: int, square_xy=None) -> dict:
     """
     One measured pick-into-square. Never raises: failures are recorded with the phase they happened in.
 
@@ -112,7 +112,7 @@ async def trial(rig, store, run_id: str, i: int) -> dict:
         tracker = seed_tracker(rig)
         height, grip = await ppa.pick(rig, times, tracker)
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1)}
-        await ppa.place_in_square(rig, height, grip, times)
+        await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy)
         # Check from right above the square, where the whole hole is in view
         times["at"] = "check"
         doc["img_after"] = str(DATA / f"trial_{run_id}_{i:02d}_after.jpg")
@@ -153,7 +153,7 @@ async def main(n: int) -> None:
             if cleared.get("dropped_at"):
                 # The reset leaves the arm over the (now empty) square; the block is where it was dropped
                 await ppa.travel(rig, *cleared["dropped_at"][-1], theta=0.0)
-            doc = await trial(rig, store, run_id, i)
+            doc = await trial(rig, store, run_id, i, cleared.get("square_xy"))
             results.append(doc)
             print(f"trial {i}: success={doc['success']} {doc['duration_s']}s phases={doc['phase_times']} "
                   f"fail={doc['fail_phase']} {doc['fail_reason'] or ''}")
