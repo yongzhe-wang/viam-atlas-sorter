@@ -288,7 +288,87 @@ def phone_propose(photo_dir: Path) -> None:
         print(f"  {gid}: {g['proposed']} n={g['n']}")
 
 
-def apply(labels_path: str, force: bool, phone: bool = False) -> None:
+CARRY_XY_MM = 50.0  # a new group this close to a labelled one (same height/colour) is that object
+CARRY_COS = 0.88  # appearance-only carry (the object moved): mean-crop cosine at least this
+
+
+def _applied_items(groups: dict, applied: dict) -> dict:
+    """{(frame, obj): label} for every sighting already written to the Store."""
+    if "items" in applied:  # format written by carry()
+        return {tuple(k.split("|")): v for k, v in applied["items"].items()}
+    out = {}
+    for gid, a in applied.items():  # first apply() format: {gid: {"label", "views"}}
+        for it in groups.get(gid, {}).get("items", []):
+            out[(it["frame"], str(it["obj"]))] = a["label"]
+    return out
+
+
+def carry(labels_path: str) -> None:
+    """
+    Regroup all frames after a re-shoot and carry the existing labels over; sheet only for what changed.
+
+    Per new group: (1) sightings already labelled keep their label (old frames segment identically);
+    (2) else a labelled group at the same table xy, height and colour; (3) else appearance + colour + height
+    only, flagged "moved" (the yellow block is the trial object and moves). Writes data/scan/labels_carried.json
+    and docs/scan/contact_changed.jpg; apply with --apply labels_carried.json --only-new.
+    """
+    old_groups = json.loads((SCAN / "groups.json").read_text())
+    applied = json.loads((SCAN / "applied.json").read_text()) if (SCAN / "applied.json").exists() else {}
+    names = json.loads(Path(labels_path).read_text())  # the labels.json that was applied: {gid: [label, ...]}
+    by_label = {v[0]: v for v in names.values()}
+    done = _applied_items(old_groups, applied)
+    old_emb = np.load(SCAN / "embeddings.npy")
+    # Reference per labelled old group: median xy, height, colours, mean embedding
+    refs = []
+    for gid, v in names.items():
+        g = old_groups.get(gid)
+        if not g:
+            continue
+        e = old_emb[[it["index"] for it in g["items"]]].mean(0)
+        refs.append({"label": v[0], "xy": g["xy"], "h": g["height_mm"], "colours": set(g["colours"]),
+                     "emb": e / np.linalg.norm(e)})
+    old_frames = {it["frame"] for g in old_groups.values() for it in g["items"]}
+    (SCAN / "applied_prev.json").write_text(json.dumps({"items": {"|".join(k): v for k, v in done.items()}}, indent=1))
+
+    fr = load_frames()
+    its, cr, em = sightings(fr)
+    new = write_outputs(its, cr, em, group(its, em))
+    carried, rows = {}, []
+    for gid, g in new.items():
+        keys = [(it["frame"], str(it["obj"])) for it in g["items"]]
+        prior = [done[k] for k in keys if k in done]
+        e = em[[it["index"] for it in g["items"]]].mean(0)
+        e = e / np.linalg.norm(e)
+        ok = [r for r in refs if abs(r["h"] - g["height_mm"]) <= LINK_DH_MM
+              and any(clip_embed.colour_ok({c}, gc) for c in r["colours"] for gc in g["colours"])]
+        how = label = None
+        if prior:
+            label, how = max(set(prior), key=prior.count), "same sightings"
+        else:
+            near = [r for r in ok if math.dist(r["xy"], g["xy"]) <= CARRY_XY_MM]
+            if near:
+                label, how = min(near, key=lambda r: math.dist(r["xy"], g["xy"]))["label"], "same place"
+            else:
+                look = [r for r in ok if float(r["emb"] @ e) >= CARRY_COS]
+                if len(look) == 1:
+                    label, how = look[0]["label"], "moved (appearance)"
+        g["carried"] = {"label": label, "how": how}
+        if label:
+            carried[gid] = by_label[label]
+        has_new = any(it["frame"] not in old_frames for it in g["items"])
+        if has_new or (how and how != "same sightings"):
+            rows.append((f"G{gid}", [f"-> {label or '?'}", how or "unmatched", f"n={g['n']} h={g['height_mm']:.0f}"],
+                         [Image.fromarray(cr[it["index"]]) for it in g["items"]]))
+    (SCAN / "groups.json").write_text(json.dumps(new, indent=1))
+    (SCAN / "labels_carried.json").write_text(json.dumps(carried, indent=1))
+    _sheet(rows, SHEET.parent / "contact_changed.jpg")
+    print(f"{len(new)} groups, {len(carried)} labelled by carry-over, {len(rows)} new/changed -> "
+          f"{SHEET.parent / 'contact_changed.jpg'}")
+    for title, lines, _ in rows:
+        print(f"  {title}: {' | '.join(lines)}")
+
+
+def apply(labels_path: str, force: bool, phone: bool = False, only_new: bool = False) -> None:
     """
     Write one Store view per crop of every labelled group.
 
@@ -299,13 +379,19 @@ def apply(labels_path: str, force: bool, phone: bool = False) -> None:
 
     base = SCAN / "phone" if phone else SCAN
     marker = base / "applied.json"
-    if marker.exists() and not force:
-        sys.exit(f"labels already applied ({marker}); use --force to add them again")
+    done = {}
+    if only_new:
+        # After carry(): skip sightings already in the Store (recorded in applied_prev.json)
+        prev = base / "applied_prev.json"
+        done = json.loads(prev.read_text())["items"] if prev.exists() else {}
+    elif marker.exists() and not force:
+        sys.exit(f"labels already applied ({marker}); use --force, or --only-new after --carry")
     labels = json.loads(Path(labels_path).read_text())
     groups = json.loads((base / "groups.json").read_text())
     emb = np.load(base / "embeddings.npy")
     store = Store()
     written = {}
+    items_done = dict(done)
     for gid, names in labels.items():
         if gid not in groups or not names:
             print(f"{gid}: not in groups.json or no name, skipped")
@@ -313,6 +399,10 @@ def apply(labels_path: str, force: bool, phone: bool = False) -> None:
         label, aliases = names[0], list(names[1:])
         ids = []
         for it in groups[gid]["items"]:
+            key = f"{it.get('frame', it.get('photo'))}|{it.get('obj', it['index'])}"
+            if key in done:
+                continue
+            items_done[key] = label
             jpeg = (SCAN / it["crop"]).read_bytes()
             if phone:
                 meta = {"aliases": aliases, "source": "phone", "group": gid, "photo": it["photo"]}
@@ -322,7 +412,7 @@ def apply(labels_path: str, force: bool, phone: bool = False) -> None:
             ids.append(store.add_view(label, emb[it["index"]], jpeg, meta))
         written[gid] = {"label": label, "views": ids}
         print(f"{gid}: {len(ids)} views as {label!r} aliases={aliases}")
-    marker.write_text(json.dumps(written, indent=1))
+    marker.write_text(json.dumps({"items": items_done, "groups": written}, indent=1))
     print(f"store online={store.online}; skipped groups: {sorted(set(groups) - set(labels))}")
 
 
@@ -332,12 +422,16 @@ if __name__ == "__main__":
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--scan-dir", help="read frames from here instead of data/scan (tests)")
     ap.add_argument("--phone", help="photo directory: propose labels for phone close-ups (with --apply: apply them)")
+    ap.add_argument("--carry", help="after a re-shoot: the labels.json applied before; regroup and carry labels over")
+    ap.add_argument("--only-new", action="store_true", help="with --apply after --carry: add only new sightings")
     a = ap.parse_args()
     if a.scan_dir:
         SCAN = Path(a.scan_dir)
         SHEET = SCAN / "contact.jpg"
-    if a.apply:
-        apply(a.apply, a.force, phone=bool(a.phone))
+    if a.carry:
+        carry(a.carry)
+    elif a.apply:
+        apply(a.apply, a.force, phone=bool(a.phone), only_new=a.only_new)
     elif a.phone:
         phone_propose(Path(a.phone))
     else:
