@@ -1,0 +1,126 @@
+# Full plan: a self-improving, language-driven sorter
+
+Hackathon: Viam x MongoDB, Oct 29-30 2026. Demo Friday 3:30 PM. Hardware on `sfhack4`: xArm6, ufactory gripper, wrist RealSense (color + depth), table at z = -123 mm in the arm base frame.
+
+## Demo story
+
+1. **Overnight practice.** The robot practiced unattended on ~6 objects. The dashboard shows success rate over time, per object and per grasp type.
+2. **Language.** "Put the thing you drink from into the box" → it picks the cup (CLIP text→image match, not color), using the grasp it learned works for cups overnight.
+3. **Teach once.** An unseen object → zero-shot guess → wrong → one click to correct → next time it is right.
+
+Atlas does three jobs: vector search (what is this / which object did the user mean), memory that drives control (which grasp to use), and the ledger behind the dashboard.
+
+## Architecture
+
+| Module | Job | Owner |
+|---|---|---|
+| Perception | Find every object on the table, measure its shape, embed it | B |
+| Memory (Atlas) | Object library, grasp stats, places, attempts, commands | B |
+| Grasp planner | Pick a grasp primitive + params per object | A |
+| Executor | Move safely, run the primitive, check success | A |
+| Language | Parse a command, ground object and place | C |
+| Autonomy | Self-reset loop + watchdog for overnight | A |
+| UI | Live view, command box, teach buttons, Charts | C |
+
+The control loop runs on the `sfhack4-main` Linux box (LAN, survives laptop sleep). The laptop only hosts the UI.
+
+## 1. Perception
+
+- Set `align_color_depth: true` on `cam` so depth pixels line up with color pixels (off by default).
+- **Segment by height, not color:** depth points more than 8 mm above the table plane, inside a fixed workspace rectangle → connected components → objects. Blue tape is flat, so it is ignored automatically. HSV color stays as a fallback.
+- Per object: mask, centroid, footprint (min-area rect length × width, yaw), height `h`, and `hollow` (centre of the top surface lower than the rim).
+- Embedding: CLIP ViT-B/32 on the crop (512-d). The same model's text encoder serves the language step.
+- **Fix first:** frames returned right after a move are stale (measured: block at v=475 at t+0 s, v=496 at t+0.5 s). Wait ≥ 0.6 s after every move, or check `captured_at` > move end. This is the most likely cause of the servo divergence seen on the first autonomous run.
+
+## 2. Grasp primitives (different objects, different grasps)
+
+A small fixed library. Each primitive has the same parameter set, so learning is just choosing a primitive + tuning a few numbers.
+
+| Primitive | When | How |
+|---|---|---|
+| `TOP_PINCH` | default: blocks, boxes, small items | top-down, jaws across the short side, fingertips at `top - min(h/2, 25)` |
+| `TOP_LOW` | low objects, `h` 10–25 mm | top-down, fingertips ~3 mm above table, slow close |
+| `RIM` | hollow: cups, bowls, open boxes | top-down at the rim, one finger inside one outside, yaw radial |
+| `SOFT` | sponges, plush | top-down deeper, higher force |
+| `SIDE` (stretch) | tall: `h > 1.5·max(l,w)` and `h > 80` mm, e.g. bottles | horizontal approach at `0.6·h` |
+| `SKIP` | wider than max opening, `h < 8` mm, transparent/reflective (depth fails) | log and leave it |
+
+Parameters (all relative to the object, never absolute poses): `yaw_offset`, `z_offset`, `open_width`, `force`, `speed`, `lift_height`, plus the grasp point offset for `RIM`.
+
+**Choosing a grasp:**
+
+1. **Known object** (nearest neighbour similarity ≥ τ): candidates are that object's stored grasps. Overnight, choose with Thompson sampling on `Beta(n_ok+1, n_fail+1)` so it keeps exploring. At demo time choose the best mean (greedy).
+2. **Unknown object:** geometry rules pick the primitive; params come from the top-3 neighbours' best grasps. Optional: ask an LLM for a semantic prior from the zero-shot label ("mug → RIM"), used only as a tie-breaker.
+3. **After each attempt:** update `n_try / n_ok`. On failure, add a perturbed copy as a new candidate (yaw ±10°, z ±5 mm, width ±5 mm).
+
+**Success check (all three):** `grab()` result, the gripper's own holding bit (G2 `IsHoldingSomething`), and after the lift the depth at the original spot is back to table height.
+
+## 3. Atlas data model
+
+```
+views     { object_id, label, embedding[512], cam_pose, img_path }            # vector index on embedding, filter: label, bin
+objects   { _id, label, bin, aliases[], text_emb[512], geometry{l,w,h,hollow},
+            grasps: [{ id, primitive, params{...}, n_try, n_ok }] }
+places    { name, aliases[], text_emb[512], drop_pose }                       # "box", "blue square", bins
+attempts  { ts, run_id, mode: overnight|demo|teach, object_id, sim, grasp_id, primitive, params,
+            success, fail_reason, img_before, img_after, duration_s }
+commands  { ts, text, parsed{object, place}, chosen_object, score, margin, place, success }
+```
+
+Several `views` per object (multi-angle), so a query takes the top-k views and votes by label.
+
+## 4. Object library pre-collection (Day 1 afternoon)
+
+`scripts/scan_object.py`: put an object in the centre → the arm visits 8 poses (2 heights × 4 wrist angles) → 8 views embedded → asks for label, bin, aliases → writes `views` + `objects`. About 1 minute per object. Target 15–25 objects: everything the organizers provide plus our own.
+
+## 5. Overnight autonomy (organizers confirmed overnight running is allowed)
+
+Loop: observe → pick a random object in the workspace → choose grasp (Thompson) → execute → success check → **place it at a random free spot in the workspace** (self-reset, not into a bin) → log → repeat. 4–6 different objects on the table for variety.
+
+Watchdog:
+
+- Supervisor restarts the process if it crashes (`tmux` + `while true`).
+- Stall stop: 10 consecutive failures, or 20 minutes without a success → park at a safe pose and exit.
+- Lost objects: nothing detected 3 times in a row → park and exit.
+- Viam trigger emails us when the machine goes offline.
+
+Before leaving (by ~8:30 PM): 30 attended minutes with no table hits and no objects lost; collision sensitivity on (config currently `0`, check what that means on xArm); room lights stay on overnight; desk cleared of phones and bottles; one person checks the dashboard and camera remotely every ~2 h (Viam app CONTROL tab has camera and STOP).
+
+Expected volume: ~12 h × (3600 / ~50 s per attempt) ≈ 850 attempts (cycle time not measured yet).
+
+## 6. Language commands
+
+1. Input: text box, optional mic (browser Web Speech API).
+2. Parse to `{object, place}`: template `put X into Y` first, LLM fallback for free-form sentences.
+3. Ground the object: CLIP text embedding of `"a photo of " + X` vs. each detected crop → argmax. `"this"` means the object nearest the pick-zone centre. Spatial words ("left one", "second") go to the LLM along with the detection list (positions + labels).
+4. Ground the place: match against `places.aliases` / `text_emb`.
+5. If the top two candidates are close, highlight both in the UI and ask the user to choose. Text-image scores are lower than image-image, so compare candidates against each other rather than using a fixed threshold.
+6. Execute with the normal grasp pipeline; log to `commands`.
+
+## 7. UI (laptop browser)
+
+Live camera with detection boxes and the chosen grasp drawn on top · command box · teach panel (bin buttons + label field) · embedded Atlas Charts (success over time, per object, per primitive, language success).
+
+## 8. Timeline
+
+| When | A: robot / executor | B: perception / Atlas | C: language / UI |
+|---|---|---|---|
+| Thu → 1 PM | fix frame lag; stable `TOP_PINCH` pick-and-place | `align_color_depth`; depth segmentation; CLIP; Atlas collections + indexes | UI skeleton; Charts wired to `attempts` |
+| 2–5 PM | `RIM`, `SOFT`, success check | `scan_object.py`; scan 15–25 objects | parse + grounding |
+| 5–8 PM | self-reset loop + watchdog | Thompson selection + stats updates | command flow end-to-end |
+| 8–8:45 PM | attended 30-minute test, checklist, start overnight | | |
+| Fri 9–10 AM | analyze the night, fix the top failure mode | write best grasps back to `objects` | dashboard from overnight data |
+| 10 AM–12:30 PM | demo hardening | teach-once polish | language polish, mic |
+| 12:30–3 PM | feature freeze, rehearse 5×, record a backup video | | |
+| 3:30 PM | demo | | |
+
+## Cut lines
+
+- `SIDE` grasp is stretch only.
+- LLM parsing → templates only. Mic → text box only.
+- Depth segmentation not working by 1 PM → color-only objects.
+- Self-reset loop not stable by 8 PM → run the overnight loop on one known object at a fixed spot, just to get a reliable curve.
+
+## Still to verify on the hardware
+
+Gripper maximum opening · decoding the `image/vnd.viam.dep` depth format · what `collision_sensitivity: 0` means on xArm · lights overnight · real cycle time per attempt.
