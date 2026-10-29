@@ -109,10 +109,12 @@ sh module/build.sh                                    # -> module/dist/archive.t
 The archive must contain `meta.json`: `viam module reload-local` rejects a local tarball without one ("local
 tarballs must contain a meta.json with the 'entrypoint' field"). `build.sh` copies it in.
 
-First start on a robot: `run.sh` creates a virtualenv, installs **CPU-only** torch from
-`https://download.pytorch.org/whl/cpu` (the default Linux wheel pulls more than 2 GB of CUDA libraries), then
-`requirements.txt`. On our robot (sfhack4, linux/amd64) this took about 10 minutes before the service came up.
-Later starts skip the install. If viam-server gives up waiting, run `./run.sh` once by hand on the robot.
+First start on a robot: `run.sh` creates a virtualenv in `$VIAM_MODULE_DATA/venv` (kept across module
+versions), installs **CPU-only** torch from `https://download.pytorch.org/whl/cpu` (the default Linux wheel pulls
+more than 2 GB of CUDA libraries), then `requirements.txt`. On our robot (sfhack4, linux/amd64) this took about
+10 minutes before the service came up. Restarts and redeploys reuse that venv; it is reinstalled only when
+`requirements.txt` changes (the install marker is keyed on its hash). If viam-server gives up waiting on the
+first start, run `./run.sh` once by hand on the robot.
 
 Test on one machine without publishing. This runs as a local module under the placeholder namespace
 `sorter-team`, so no registry namespace is needed yet. Tested on sfhack4 on 2026-10-29: the machine lists the
