@@ -95,21 +95,30 @@ Then set `MONGODB_URI` for the module. Charts: `dashboard/CHARTS.md`. The live d
 ## Build, test, publish (maintainers)
 
 ```bash
-sh module/build.sh                                    # -> module/dist/archive.tar.gz (run.sh at its root)
+sh module/build.sh                                    # -> module/dist/archive.tar.gz (run.sh + meta.json at its root)
 ```
 
-The first start on a robot creates a virtualenv and installs `requirements.txt`, including torch. That takes
-several minutes; if viam-server gives up waiting, run `./run.sh` once by hand on the robot to pre-install.
+The archive must contain `meta.json`: `viam module reload-local` rejects a local tarball without one ("local
+tarballs must contain a meta.json with the 'entrypoint' field"). `build.sh` copies it in.
 
-Before publishing, create the module under your registry namespace (Viam app → Registry, or the CLI), then put
-that namespace in **both** `meta.json` (`module_id`, `models[].model`) and `NAMESPACE` in
-`module/sorter_service.py`.
+First start on a robot: `run.sh` creates a virtualenv, installs **CPU-only** torch from
+`https://download.pytorch.org/whl/cpu` (the default Linux wheel pulls more than 2 GB of CUDA libraries), then
+`requirements.txt`. On our robot (sfhack4, linux/amd64) this took about 10 minutes before the service came up.
+Later starts skip the install. If viam-server gives up waiting, run `./run.sh` once by hand on the robot.
 
-Test on one machine without publishing (from the Viam CLI docs):
+Test on one machine without publishing. This runs as a local module under the placeholder namespace
+`sorter-team`, so no registry namespace is needed yet. Tested on sfhack4 on 2026-10-29: the machine lists the
+generic service `sorter`, and `{"status": true}` returns `{"busy": false, "store": "jsonl", ...}`.
 
 ```bash
-viam module reload-local --part-id <machine-part-id> --model-name <namespace>:sorter:grasp-by-description --resource-name sorter
+viam login
+viam module reload-local --file module/dist/archive.tar.gz --part-id <machine-part-id> --model-name sorter-team:sorter:grasp-by-description --resource-name sorter
 ```
+
+Before publishing, create the module under your registry namespace (Viam app → org Settings → public
+namespace, or the CLI), then put that namespace in **both** `meta.json` (`module_id`, `models[].model`) and
+`NAMESPACE` in `module/sorter_service.py`. `viam module create` writes a new `meta.json` into the current
+directory, so run it outside the repo or copy just the `module_id`.
 
 Publish:
 
