@@ -52,6 +52,7 @@ SANITY_MIN_Z = 120.0  # absolute flange floor; Viam's own collision check refuse
 HOME_XY = (250.0, 0.0)
 MAX_STEP_MM = 250.0
 TOL_PX = 7.0
+GRAB_TRIES = 3  # first grab + 2 retries
 SETTLE_S = 1.0  # wait after every move before trusting a camera frame
 # Jaw-axis model fitted from released blocks (data/jaw_calib.json); None until `jaw_calib.py fit` has run
 JAW_CAL = jaw_calib.load()
@@ -280,6 +281,41 @@ def find_square(rgb: np.ndarray):
     return xs.mean(), ys.mean(), area
 
 
+FINGER_ROW = 600  # image rows below this always hold the fingers / held object (invalid depth)
+INTRUDER_BLIND_PX = 40000  # invalid-depth patch this big = something within ~280 mm (normal frames <= ~13k)
+INTRUDER_TALL_PX = 5000  # valid depth this many px > 100 mm above the table = hand/arm (blocks are < 80 mm)
+
+
+def intruder(depth: np.ndarray, near_uv=None, radius: float = 300.0) -> bool:
+    """
+    True if a hand or arm seems to be in the workspace around `near_uv` (whole view if None).
+
+    WHY: people reach into the table while the arm works (the block was moved mid-servo on 2026-10-29).
+    At ALIGN_Z a hand 100 mm above the table is closer than the RealSense minimum range, so it shows as a
+    large patch of invalid depth rather than as a tall blob; both signals count.
+    {BASELINE 2026-10-29 "LARGEST INVALID BLOB ABOVE ROW 600: 13158 PX"} vs a hand ~200k px at 250 mm
+    [CONFIDENCE: INFERRED 75% — thresholds from 4 baseline frames and geometry, no real hand tested yet]
+    """
+    h, w = depth.shape
+    roi = np.ones((h, w), bool)
+    if near_uv is not None:
+        vv, uu = np.ogrid[:h, :w]
+        roi = (uu - near_uv[0]) ** 2 + (vv - near_uv[1]) ** 2 < radius ** 2
+    roi[FINGER_ROW:] = False
+    valid = depth[depth > 0]
+    hist, edges = np.histogram(valid, bins=np.arange(100, 1500, 4))
+    table = float(edges[np.argmax(hist)] + 2)
+    tall = (depth > 0) & (depth < table - 100) & roi
+    blind = (depth == 0) & roi
+    lab, n = ndimage.label(blind)
+    biggest = int(ndimage.sum(blind, lab, range(1, n + 1)).max()) if n else 0
+    return int(tall.sum()) > INTRUDER_TALL_PX or biggest > INTRUDER_BLIND_PX
+
+
+class ObjectLost(RuntimeError):
+    """The held object is no longer in the gripper (dropped or taken)."""
+
+
 RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)  # waits before each reconnect attempt
 
 
@@ -481,6 +517,29 @@ class Rig:
         if abs(err2) > abs(err) * 0.5:
             await self.goto(p.x, p.y, p.z, theta=self.theta - 2 * err)
 
+    async def wait_clear(self, near_uv=None, timeout_s: float = 120.0) -> None:
+        """
+        Pause while something reaches into the workspace near `near_uv`; resume after 2 s clear.
+
+        Raises RuntimeError if it does not clear within timeout_s (the caller lifts and reports).
+        """
+        t0, clear_since, paused = time.monotonic(), None, False
+        while True:
+            _, depth = await self.frame()
+            if depth is None or not intruder(depth, near_uv):
+                clear_since = clear_since or time.monotonic()
+                if not paused or time.monotonic() - clear_since >= 2.0:
+                    if paused:
+                        print("  workspace clear, resuming")
+                    return
+            else:
+                if not paused:
+                    print("  hand/arm in the workspace: pausing")
+                paused, clear_since = True, None
+            if time.monotonic() - t0 > timeout_s:
+                raise RuntimeError("workspace not clear for too long")
+            await asyncio.sleep(0.5)
+
     async def descend(self, z_target: float) -> None:
         """Straight down in <=50 mm steps so a wrong target can be interrupted before contact."""
         p = await self.pose()
@@ -525,37 +584,46 @@ async def pick(rig: Rig, times: dict = None, finder=None) -> tuple:
     t = mark(times, "servo", t)
 
     print("2/5 measure + descend + grab")
-    times["at"] = "descend"
-    z0, table, top = await rig.measure(finder)
-    if top is None:
-        raise RuntimeError("block top not found in depth map")
-    height = table - top
-    if not 10.0 <= height <= 80.0:
-        raise RuntimeError(f"implausible block height {height:.0f} mm")
-    grip = min(GRIP_DEPTH, height / 2)
-    # Close range re-alignment: fingertips APPROACH_GAP above the block top, where pixel offsets are larger
-    # and any error in the depth scaling of JAW_TIP_PX shrinks
-    z_mid = z0 - (top - TIP_BELOW_CAM - APPROACH_GAP)
-    print(f"  table={table:.0f}mm top={top:.0f}mm height={height:.0f}mm -> approach z={z_mid:.0f}")
-    await rig.descend(z_mid)
-    # Too close for the RealSense depth range (~280 mm min), so the block-top depth is carried over
-    # from the measurement above; straight vertical moves keep that relation exact
-    await rig.servo(finder, True, "block-close", plane_at=lambda z: top - (z0 - z))
-    # Fingertips (TIP_BELOW_CAM past the camera) end `grip` below the block top
-    z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
-    print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
-    await rig.descend(z_grasp)
-    t = mark(times, "descend", t)
+    for attempt in range(1, GRAB_TRIES + 1):
+        times["at"] = "descend"
+        z0, table, top = await rig.measure(finder)
+        if top is None:
+            raise RuntimeError("block top not found in depth map")
+        height = table - top
+        if not 10.0 <= height <= 80.0:
+            raise RuntimeError(f"implausible block height {height:.0f} mm")
+        grip = min(GRIP_DEPTH, height / 2)
+        # Never descend into a hand: check the area the jaws are about to enter
+        await rig.wait_clear(axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top))
+        # Close range re-alignment: fingertips APPROACH_GAP above the block top, where pixel offsets are larger
+        # and any error in the depth scaling of JAW_TIP_PX shrinks
+        z_mid = z0 - (top - TIP_BELOW_CAM - APPROACH_GAP)
+        print(f"  table={table:.0f}mm top={top:.0f}mm height={height:.0f}mm -> approach z={z_mid:.0f}")
+        await rig.descend(z_mid)
+        # Too close for the RealSense depth range (~280 mm min), so the block-top depth is carried over
+        # from the measurement above; straight vertical moves keep that relation exact
+        await rig.servo(finder, True, "block-close", plane_at=lambda z: top - (z0 - z))
+        # Fingertips (TIP_BELOW_CAM past the camera) end `grip` below the block top
+        z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
+        print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
+        await rig.descend(z_grasp)
+        t = mark(times, "descend", t)
 
-    times["at"] = "grab"
-    grabbed = await rig.grab()
-    print("  grab returned", grabbed)
-    p = await rig.pose()
-    await rig.goto(p.x, p.y, ALIGN_Z)
-    mark(times, "grab", t)
-    if not grabbed:
+        times["at"] = "grab"
+        grabbed = await rig.grab()
+        print(f"  grab {attempt}/{GRAB_TRIES} returned", grabbed)
+        p = await rig.pose()
+        await rig.goto(p.x, p.y, ALIGN_Z)
+        t = mark(times, "grab", t)
+        if grabbed:
+            break
+        # Missed (or the object was moved): open, re-align from the observation height, try again
         await rig.open()
-        raise PickFailed("nothing in gripper; stopped before moving to the square")
+        if attempt < GRAB_TRIES:
+            times["at"] = "servo"
+            await rig.servo(finder, True, "block")
+    else:
+        raise PickFailed(f"nothing in gripper after {GRAB_TRIES} tries")
     return height, grip
 
 
@@ -566,6 +634,7 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
     `observe` records jaw-calibration samples from the released block before lifting away.
     """
     z1, table, _ = await rig.measure()
+    await rig.wait_clear(axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table))
     # Block bottom hangs (height - grip) below the fingertips; release it PLACE_GAP above the table
     z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z)
     print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
@@ -592,6 +661,8 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     await rig.servo(find_square, False, "square")
     t = mark(times, "carry", t)
 
+    if not await rig.holding():
+        raise ObjectLost("object no longer in the gripper during the carry")
     print("4/5 lower + release")
     times["at"] = "place"
     await release_here(rig, height, grip, observe=True)
