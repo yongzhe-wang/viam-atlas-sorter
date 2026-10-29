@@ -103,6 +103,16 @@ DASH_COMMAND_PATH=module VIAM_MACHINE_ADDRESS=... VIAM_API_KEY_ID=... VIAM_API_K
 4. Optional: `data/workspace.json`, a polygon `[[u, v], ...]` in colour pixels, limits where objects may be
    picked from.
 
+## Recording
+
+- **Every attempt:** the arm code calls `Store.put_clip_frame(attempt_id, phase, jpeg, meta)` at each phase and
+  servo step; the dashboard's attempts table then has a **Replay** button (frame-by-frame player with phase and
+  time, speed control, GIF / MP4 download; MP4 needs `ffmpeg` on the dashboard machine).
+- **Timelapse:** the service saves one colour frame every 5 s, stamped with the time and what it is doing, to
+  `$VIAM_MODULE_DATA/timelapse/<epoch_ms>.jpg`, keeping the last 2 hours (`"timelapse"` in status). To cut a
+  backup video on the robot:
+  `ffmpeg -framerate 12 -pattern_type glob -i "$VIAM_MODULE_DATA/timelapse/*.jpg" -pix_fmt yuv420p timelapse.mp4`
+
 ## Object library (what "green square" is matched against)
 
 `build.sh` bundles `data/views.jsonl` (labelled CLIP embeddings from `scripts/capture_views.py` /

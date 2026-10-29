@@ -76,6 +76,8 @@ OBSERVE_TOL_MM = 15.0  # the arm counts as "at the observe pose" within this of 
 OBSERVE_TOL_DEG = 1.0  # ... and theta 0: AGENT1's pixel->world mapping for a target holds only there
 SEEN_IMAGE_WIDTH = 640
 WARM_RETRY_S = 30.0
+TIMELAPSE_EVERY_S = 5.0  # rolling timelapse for a backup demo video: one frame every 5 s ...
+TIMELAPSE_KEEP_S = 2 * 3600.0  # ... kept for the last 2 hours
 
 
 def seed_library(bundle: Path, data: Path) -> str:
@@ -192,9 +194,10 @@ class GraspByDescription(Generic, EasyResource):
         self._seen_raw = None  # {"ts", "recs", "objs", "rgb", "depth", "pose"} behind self.seen, for a fast grasp
         self._jpeg_cache = (None, None, 1.0)  # (frame ts, base64 jpeg, scale) for seen_image
         self._no_target_warned = False
+        self.timelapse_dir = (Path(module_data) if module_data else self.store.data) / "timelapse"
         loop = asyncio.get_event_loop()
         self.tasks = [loop.create_task(self._heartbeat_loop()), loop.create_task(self._warmup()),
-                      loop.create_task(self._watch_loop())]
+                      loop.create_task(self._watch_loop()), loop.create_task(self._timelapse_loop())]
         if attrs.get("consume_dashboard_commands", False):
             self.tasks.append(loop.create_task(self._command_loop()))
         LOGGER.info(f"{config.name}: store {'Atlas' if self.store.online else 'local JSONL'}, "
@@ -383,6 +386,56 @@ class GraspByDescription(Generic, EasyResource):
                 "objects": [{**o, "bbox": [x * scale for x in o["bbox"]]} for o in seen["objects"]],
                 "intruders": [{**i, "bbox": [x * scale for x in i["bbox"]]} for i in seen["intruders"]]}
 
+    # ---- timelapse ---------------------------------------------------------------------------------
+
+    def _timelapse_save(self, jpeg: bytes, ts: float, label: str) -> None:
+        """Downscale, stamp time + what the robot is doing, save as <epoch_ms>.jpg, drop frames older than 2 h."""
+        from PIL import Image, ImageDraw
+
+        im = Image.open(io.BytesIO(jpeg)).convert("RGB")
+        if im.width > SEEN_IMAGE_WIDTH:
+            im = im.resize((SEEN_IMAGE_WIDTH, round(im.height * SEEN_IMAGE_WIDTH / im.width)))
+        text = f"{time.strftime('%H:%M:%S', time.localtime(ts))}  {label}"
+        draw = ImageDraw.Draw(im)
+        draw.rectangle([0, 0, 8 + 6 * len(text), 16], fill=(0, 0, 0))
+        draw.text((4, 2), text, fill=(255, 255, 255))
+        self.timelapse_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.timelapse_dir / f".{int(ts * 1000)}.tmp"
+        im.save(tmp, "JPEG", quality=75)
+        tmp.replace(self.timelapse_dir / f"{int(ts * 1000)}.jpg")
+        cutoff = (ts - TIMELAPSE_KEEP_S) * 1000
+        for p in self.timelapse_dir.glob("*.jpg"):
+            if p.stem.isdigit() and int(p.stem) < cutoff:
+                p.unlink(missing_ok=True)
+
+    async def _timelapse_loop(self) -> None:
+        """
+        One colour frame every TIMELAPSE_EVERY_S, during jobs too (read-only camera), into
+        $VIAM_MODULE_DATA/timelapse/, so a backup demo video can be cut from the last 2 hours.
+        """
+        while True:
+            await asyncio.sleep(TIMELAPSE_EVERY_S)
+            try:
+                try:
+                    res = await self.camera.get_images(filter_source_names=["color"])
+                except Exception:
+                    res = await self.camera.get_images()
+                images = res[0] if isinstance(res, tuple) else res
+                jpeg = next((im.data for im in images if im.mime_type == "image/jpeg"), None)
+                if jpeg is None:
+                    continue
+                label = (f"{self.job_info.get('kind')}: {self.job_info.get('text') or 'square'}" if self._busy()
+                         else "idle")
+                await asyncio.to_thread(self._timelapse_save, jpeg, time.time(), label)
+            except Exception as e:
+                LOGGER.warning(f"timelapse frame skipped: {type(e).__name__}: {e}")
+
+    def _timelapse_stats(self) -> dict:
+        stamps = sorted(int(p.stem) for p in self.timelapse_dir.glob("*.jpg") if p.stem.isdigit()) \
+            if self.timelapse_dir.exists() else []
+        return {"frames": len(stamps), "span_s": round((stamps[-1] - stamps[0]) / 1000) if stamps else 0,
+                "dir": str(self.timelapse_dir)}
+
     # ---- deciding --------------------------------------------------------------------------------------
 
     def _not_ready(self) -> Optional[Dict[str, ValueTypes]]:
@@ -527,7 +580,7 @@ class GraspByDescription(Generic, EasyResource):
         return {"busy": self._busy(), "running": dict(self.job_info) if self._busy() else {}, "last": dict(self.last),
                 "store": "atlas" if self.store.online else "jsonl", "worker_id": self.worker_id,
                 "library": dict(self.library), "warm": self.warm, "warm_ms": self.warm_ms,
-                "warm_error": self.warm_error, "seen": seen}
+                "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats()}
 
     async def do_command(self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None,
                          **kwargs) -> Mapping[str, ValueTypes]:

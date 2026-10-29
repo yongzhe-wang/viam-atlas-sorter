@@ -34,6 +34,9 @@ LIVE_COLLECTIONS = ("status", "frames")
 VECTOR_INDEX = "views_vec"  # Atlas Vector Search index on views.embedding (scripts/atlas_setup.py)
 EMBED_DIM = 512
 IMAGE_FIELDS = {"attempts": ("img_before", "img_after"), "views": ("jpeg",)}
+# Clip ids and phases become folder / file names offline: allow only safe characters (no "..", no "/")
+_ID_OK = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_PHASE_BAD = re.compile(r"[^A-Za-z0-9_-]")
 MAX_IMG_WIDTH = 640
 
 
@@ -407,6 +410,83 @@ class Store:
                 best = (data, doc)
         return best
 
+    # ---- clips: every frame of an attempt, for replay ----------------------------------------------
+
+    @staticmethod
+    def new_attempt_id() -> str:
+        """An id to use for put_clip_frame() during an attempt and as log_attempt({"_id": ...}) at its end."""
+        return _new_id()
+
+    def put_clip_frame(self, attempt_id: str, phase: str, jpeg: bytes, meta: dict = None) -> int:
+        """
+        Append one frame to an attempt's clip; returns its sequence number (0, 1, 2, ...).
+
+        WHY: the user wants every attempt replayable (phase by phase, servo iterations included). Offline the
+        frames are data/clips/<attempt_id>/NNN_<phase>.jpg + .json; online a `clips` collection (one doc per
+        frame). JPEGs are downscaled to <= 640 px wide like every other image the Store keeps.
+        """
+        if not _ID_OK.fullmatch(attempt_id or ""):
+            raise ValueError("attempt_id must be letters, digits, '-' or '_' (it becomes a folder name)")
+        phase = _PHASE_BAD.sub("_", str(phase or "frame"))[:32] or "frame"
+        data = _small_jpeg(bytes(jpeg))
+        now = time.time()
+        if self.online:
+            from bson import Binary
+
+            seq = self.db.clips.count_documents({"attempt_id": attempt_id})
+            self.db.clips.insert_one(_with_date({"_id": f"{attempt_id}:{seq:04d}", "attempt_id": attempt_id,
+                                                 "seq": seq, "phase": phase, "ts": now, "meta": meta or {},
+                                                 "jpeg": Binary(data)}))
+            return seq
+        folder = self.data / "clips" / attempt_id
+        folder.mkdir(parents=True, exist_ok=True)
+        with self._lock("clips"):
+            seq = len(list(folder.glob("*.jpg")))
+            stem = f"{seq:04d}_{phase}"
+            _write_atomic(folder / f"{stem}.jpg", data)
+            _write_atomic(folder / f"{stem}.json", json.dumps({"seq": seq, "phase": phase, "ts": now,
+                                                               "meta": meta or {}}, default=str).encode())
+        return seq
+
+    def list_clip_frames(self, attempt_id: str) -> list:
+        """[{"seq", "phase", "ts", "meta"}, ...] in order, without image bytes; [] for an unknown attempt."""
+        if not _ID_OK.fullmatch(attempt_id or ""):
+            return []
+        if self.online:
+            return list(self.db.clips.find({"attempt_id": attempt_id}, {"jpeg": 0, "_id": 0, "at": 0}).sort("seq", 1))
+        folder = self.data / "clips" / attempt_id
+        frames = []
+        for p in sorted(folder.glob("*.json")) if folder.exists() else []:
+            try:
+                frames.append(json.loads(p.read_text()))
+            except ValueError:
+                continue
+        return frames
+
+    def get_clip_frame(self, attempt_id: str, seq: int):
+        """JPEG bytes of one clip frame, or None."""
+        if not _ID_OK.fullmatch(attempt_id or ""):
+            return None
+        if self.online:
+            doc = self.db.clips.find_one({"attempt_id": attempt_id, "seq": int(seq)}, {"jpeg": 1})
+            return bytes(doc["jpeg"]) if doc else None
+        hits = sorted((self.data / "clips" / attempt_id).glob(f"{int(seq):04d}_*.jpg"))
+        return hits[0].read_bytes() if hits else None
+
+    def clip_counts(self, attempt_ids: list) -> dict:
+        """{attempt_id: number of clip frames} for the dashboard's Replay buttons."""
+        ids = [a for a in attempt_ids if _ID_OK.fullmatch(a or "")]
+        if self.online:
+            rows = self.db.clips.aggregate([{"$match": {"attempt_id": {"$in": ids}}},
+                                            {"$group": {"_id": "$attempt_id", "n": {"$sum": 1}}}])
+            return {r["_id"]: r["n"] for r in rows}
+        out = {}
+        for a in ids:
+            folder = self.data / "clips" / a
+            if folder.exists():
+                out[a] = len(list(folder.glob("*.jpg")))
+        return out
+
     # ---- reads for the dashboard -------------------------------------------------------------------
 
     def _list(self, coll: str, limit: int, newest_first: bool = True) -> list:
@@ -479,4 +559,24 @@ class Store:
             if docs:
                 self._file(coll).rename(self.data / f"{coll}.jsonl.flushed-{int(time.time())}")
             counts[coll] = len(docs)
+        counts["clips"] = self._flush_clips()
         return counts
+
+    def _flush_clips(self) -> int:
+        """Upload offline clip frames (data/clips/*) into the `clips` collection; the folders are kept."""
+        from bson import Binary
+
+        n = 0
+        root = self.data / "clips"
+        for folder in sorted(root.iterdir()) if root.exists() else []:
+            for meta_path in sorted(folder.glob("*.json")):
+                jpg = meta_path.with_suffix(".jpg")
+                if not jpg.exists():
+                    continue
+                f = json.loads(meta_path.read_text())
+                doc = {"_id": f"{folder.name}:{f['seq']:04d}", "attempt_id": folder.name, "seq": f["seq"],
+                       "phase": f.get("phase"), "ts": f.get("ts"), "meta": f.get("meta") or {},
+                       "jpeg": Binary(jpg.read_bytes())}
+                self.db.clips.replace_one({"_id": doc["_id"]}, _with_date(doc), upsert=True)
+                n += 1
+        return n

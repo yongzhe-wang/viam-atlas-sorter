@@ -88,6 +88,18 @@
   .ok { color: var(--ok); } .bad { color: var(--bad); }
   .muted { color: var(--muted); }
   iframe { width: 100%; height: 360px; border: 0; border-radius: 8px; background: var(--bg); }
+  /* Replay player */
+  dialog#player { border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; background: var(--panel);
+                  color: var(--ink); width: min(760px, calc(100vw - 32px)); }
+  dialog#player::backdrop { background: rgba(0, 0, 0, .55); }
+  #pl-img { width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #000; border-radius: 8px; display: block; }
+  .pl-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .pl-head b { font-size: 14px; }
+  #pl-cap { margin: 8px 0; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .pl-ctl { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .pl-ctl input[type=range] { flex: 1 1 200px; }
+  .pl-ctl select, .pl-ctl a { font-size: 13px; }
+  .pl-ctl a { color: var(--accent); }
   .bars div { display: grid; grid-template-columns: 120px 1fr 60px; gap: 8px; align-items: center; margin: 4px 0; font-size: 12px; }
   .bar { height: 8px; border-radius: 4px; background: var(--chip); overflow: hidden; }
   .bar i { display: block; height: 100%; background: var(--ok); }
@@ -151,12 +163,26 @@
     <div class="tablewrap">
       <table>
         <thead><tr><th>Time</th><th>Mode</th><th>Asked</th><th>Picked</th><th>Score</th><th>Result</th>
-          <th>Fail phase</th><th>Seconds</th><th>Before</th><th>After</th></tr></thead>
+          <th>Fail phase</th><th>Seconds</th><th>Before</th><th>After</th><th>Replay</th></tr></thead>
         <tbody id="att"></tbody>
       </table>
     </div>
   </section>
 </main>
+<dialog id="player" aria-label="Attempt replay">
+  <div class="pl-head"><b id="pl-title">Replay</b><button type="button" id="pl-close">Close</button></div>
+  <img id="pl-img" alt="replay frame">
+  <div id="pl-cap" class="muted"></div>
+  <div class="pl-ctl">
+    <button type="button" id="pl-prev" aria-label="previous frame">⏮</button>
+    <button type="button" id="pl-play" class="primary">▶ Play</button>
+    <button type="button" id="pl-next" aria-label="next frame">⏭</button>
+    <input type="range" id="pl-seek" min="0" value="0" aria-label="frame">
+    <select id="pl-speed" aria-label="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option>
+      <option value="2">2×</option><option value="4">4×</option></select>
+    <a id="pl-gif" download>GIF</a><a id="pl-mp4" download>MP4</a>
+  </div>
+</dialog>
 <script>
 const $ = (id) => document.getElementById(id);
 const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; };
@@ -305,9 +331,17 @@ async function refreshAttempts() {
       if (a[f]) { const i = el("img"); i.loading = "lazy"; i.alt = f; i.src = `/api/image/attempts/${encodeURIComponent(a._id)}/${f}`; td.appendChild(i); }
       tr.appendChild(td);
     }
+    const rp = el("td");
+    if (a.clip_frames) {
+      const b = el("button", `▶ Replay (${a.clip_frames})`, "chip");
+      b.type = "button";
+      b.addEventListener("click", () => openPlayer(a._id, `${a.target_text || a.label || a.mode || "attempt"} · ${hhmm(a.ts)}`));
+      rp.appendChild(b);
+    }
+    tr.appendChild(rp);
     tb.appendChild(tr);
   }
-  if (!list.length) { const tr = el("tr"); const td = el("td", "No attempts yet", "muted"); td.colSpan = 10; tr.appendChild(td); tb.appendChild(tr); }
+  if (!list.length) { const tr = el("tr"); const td = el("td", "No attempts yet", "muted"); td.colSpan = 11; tr.appendChild(td); tb.appendChild(tr); }
 }
 
 async function send(text) {
@@ -362,6 +396,48 @@ $("b-theme").addEventListener("click", () => setTheme(document.documentElement.d
 let savedTheme = "";
 try { savedTheme = localStorage.getItem("theme") || ""; } catch (e) {}
 setTheme(savedTheme === "halloween");
+
+// Replay player: frames of one attempt with phase + time; plays at the real pace times the chosen speed
+const player = {id: null, frames: [], i: 0, timer: null, imgs: []};
+function showFrame(i) {
+  const f = player.frames[i];
+  if (!f) return;
+  player.i = i;
+  $("pl-img").src = player.imgs[i].src;
+  $("pl-seek").value = i;
+  const t = f.ts - player.frames[0].ts;
+  $("pl-cap").textContent = `${f.phase} · +${t.toFixed(1)} s · frame ${i + 1} / ${player.frames.length}`;
+}
+function stopPlay() { clearTimeout(player.timer); player.timer = null; $("pl-play").textContent = "▶ Play"; }
+function step() {
+  if (player.i >= player.frames.length - 1) { stopPlay(); return; }
+  const gap = (player.frames[player.i + 1].ts - player.frames[player.i].ts) * 1000;
+  const wait = Math.min(Math.max(gap, 80), 2000) / Number($("pl-speed").value);
+  player.timer = setTimeout(() => { showFrame(player.i + 1); step(); }, wait);
+}
+async function openPlayer(id, title) {
+  stopPlay();
+  player.id = id;
+  player.frames = await api(`/api/clips/${encodeURIComponent(id)}`);
+  player.imgs = player.frames.map((f) => { const im = new Image(); im.src = `/api/clips/${encodeURIComponent(id)}/${f.seq}.jpg`; return im; });
+  $("pl-title").textContent = title;
+  $("pl-seek").max = Math.max(player.frames.length - 1, 0);
+  $("pl-gif").href = `/api/clips/${encodeURIComponent(id)}/download.gif`;
+  $("pl-mp4").href = `/api/clips/${encodeURIComponent(id)}/download.mp4`;
+  showFrame(0);
+  $("player").showModal();
+}
+$("pl-play").addEventListener("click", () => {
+  if (player.timer) { stopPlay(); return; }
+  if (player.i >= player.frames.length - 1) showFrame(0);
+  $("pl-play").textContent = "⏸ Pause";
+  step();
+});
+$("pl-prev").addEventListener("click", () => { stopPlay(); showFrame(Math.max(player.i - 1, 0)); });
+$("pl-next").addEventListener("click", () => { stopPlay(); showFrame(Math.min(player.i + 1, player.frames.length - 1)); });
+$("pl-seek").addEventListener("input", (e) => { stopPlay(); showFrame(Number(e.target.value)); });
+$("pl-close").addEventListener("click", () => { stopPlay(); $("player").close(); });
+$("player").addEventListener("close", stopPlay);
 
 // Known objects from the view library: shows the audience what it can ask for; a click fills the box
 async function refreshLabels() {

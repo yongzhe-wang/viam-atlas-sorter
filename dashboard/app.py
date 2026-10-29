@@ -428,7 +428,10 @@ def labels():
 
 @app.get("/api/attempts")
 def attempts(limit: int = 30):
-    return store.list_attempts(limit=min(limit, 200))
+    """Recent attempts; clip_frames = how many replay frames each has (0 = no Replay button)."""
+    docs = store.list_attempts(limit=min(limit, 200))
+    counts = store.clip_counts([d["_id"] for d in docs])
+    return [{**d, "clip_frames": counts.get(d["_id"], 0)} for d in docs]
 
 
 @app.get("/api/stats")
@@ -464,6 +467,96 @@ def image(coll: str, doc_id: str, field: str):
     if data is None:
         raise HTTPException(404, "no image")
     return Response(data, media_type="image/jpeg", headers={"Cache-Control": "max-age=3600"})
+
+
+# ---- replay: every frame of an attempt (Store.put_clip_frame) -----------------------------------------
+
+CLIP_MIN_MS, CLIP_MAX_MS = 100, 1500  # per-frame display time in exports: real gaps, clamped to stay watchable
+
+
+def _clip_frames(attempt_id: str) -> list:
+    frames = store.list_clip_frames(attempt_id)
+    if not frames:
+        raise HTTPException(404, "no replay frames for this attempt")
+    return frames
+
+
+def _clip_durations_ms(frames: list) -> list:
+    """How long to show each frame: the real gap to the next one, clamped; the last frame holds 1.5 s."""
+    out = []
+    for a, b in zip(frames, frames[1:] + [None]):
+        gap = (b["ts"] - a["ts"]) * 1000 if b else CLIP_MAX_MS
+        out.append(int(min(max(gap, CLIP_MIN_MS), CLIP_MAX_MS)))
+    return out
+
+
+@app.get("/api/clips/{attempt_id}")
+def clip(attempt_id: str):
+    """Frame list for the player: [{"seq", "phase", "ts", "meta"}, ...]."""
+    return _clip_frames(attempt_id)
+
+
+@app.get("/api/clips/{attempt_id}/{seq}.jpg")
+def clip_frame(attempt_id: str, seq: int):
+    data = store.get_clip_frame(attempt_id, seq)
+    if data is None:
+        raise HTTPException(404, "no such frame")
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
+
+
+def _labelled_frames(attempt_id: str) -> tuple:
+    """(PIL frames with "phase  +t s" stamped on them, durations ms), shared by the GIF and MP4 exports."""
+    from PIL import Image, ImageDraw
+
+    frames = _clip_frames(attempt_id)
+    t0, images = frames[0]["ts"], []
+    for f in frames:
+        im = Image.open(io.BytesIO(store.get_clip_frame(attempt_id, f["seq"]))).convert("RGB")
+        text = f"{f['phase']}  +{f['ts'] - t0:.1f} s"
+        draw = ImageDraw.Draw(im)
+        draw.rectangle([0, 0, 8 + 6 * len(text), 16], fill=(0, 0, 0))
+        draw.text((4, 2), text, fill=(255, 255, 255))
+        images.append(im)
+    return images, _clip_durations_ms(frames)
+
+
+@app.get("/api/clips/{attempt_id}/download.gif")
+def clip_gif(attempt_id: str):
+    images, durations = _labelled_frames(attempt_id)
+    buf = io.BytesIO()
+    images[0].save(buf, "GIF", save_all=True, append_images=images[1:], duration=durations, loop=0, optimize=True)
+    return Response(buf.getvalue(), media_type="image/gif",
+                    headers={"Content-Disposition": f'attachment; filename="attempt-{attempt_id}.gif"'})
+
+
+@app.get("/api/clips/{attempt_id}/download.mp4")
+async def clip_mp4(attempt_id: str):
+    """MP4 via ffmpeg's concat demuxer (per-frame durations); 503 when ffmpeg is not installed."""
+    import shutil
+    import tempfile
+
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(503, "ffmpeg is not installed on this machine; use the GIF download")
+    images, durations = _labelled_frames(attempt_id)
+    with tempfile.TemporaryDirectory() as tmp:
+        lines = []
+        for i, (im, ms) in enumerate(zip(images, durations)):
+            name = f"{i:05d}.jpg"
+            im.save(Path(tmp) / name, "JPEG", quality=90)
+            lines += [f"file '{name}'", f"duration {ms / 1000:.3f}"]
+        lines.append(f"file '{len(images) - 1:05d}.jpg'")  # concat demuxer needs the last file twice
+        (Path(tmp) / "list.txt").write_text("\n".join(lines) + "\n")
+        out = Path(tmp) / "out.mp4"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", "list.txt",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p", "-r", "25", "-movflags", "+faststart",
+            "out.mp4", cwd=tmp, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode != 0 or not out.exists():
+            raise HTTPException(500, f"ffmpeg failed: {err.decode(errors='replace')[-300:]}")
+        data = out.read_bytes()
+    return Response(data, media_type="video/mp4",
+                    headers={"Content-Disposition": f'attachment; filename="attempt-{attempt_id}.mp4"'})
 
 
 if __name__ == "__main__":
