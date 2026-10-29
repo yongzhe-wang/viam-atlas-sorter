@@ -30,6 +30,7 @@ import sys
 
 import jaw_calib
 import numpy as np
+from grpclib.exceptions import GRPCError, StreamTerminatedError
 from PIL import Image
 from scipy import ndimage
 from viam.components.arm import Arm
@@ -226,18 +227,91 @@ def find_square(rgb: np.ndarray):
     return xs.mean(), ys.mean(), area
 
 
-class Rig:
-    """Holds the connection and wraps motion with the safety limits."""
+RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)  # waits before each reconnect attempt
 
-    def __init__(self, arm, cam, gripper, intr):
-        self.arm, self.cam, self.gripper = arm, cam, gripper
-        self.fx, self.fy, self.cx, self.cy = intr.focal_x_px, intr.focal_y_px, intr.center_x_px, intr.center_y_px
+
+def retryable(e: Exception) -> bool:
+    """
+    True for a dropped link, False for a real error (e.g. the planner refusing a pose).
+
+    WHY: the laptop <-> arm WebRTC link dropped mid-run twice in ten minutes with SESSION_EXPIRED; those
+    calls are safe to repeat after reconnecting, a refused move is not something a retry fixes.
+    {RUN2 2026-10-29 "GRPCERROR: (<STATUS.INVALID_ARGUMENT: 3>, 'SESSION_EXPIRED', NONE)"}
+    [CONFIDENCE: CONFIRMED 90% — seen in runs 2 and 2b; other transient statuses added by inference]
+    """
+    if isinstance(e, (StreamTerminatedError, ConnectionError, OSError, asyncio.TimeoutError)):
+        return True
+    if isinstance(e, GRPCError):
+        return e.status.name in ("UNAVAILABLE", "UNKNOWN", "CANCELLED", "DEADLINE_EXCEEDED") or "SESSION_EXPIRED" in str(e.message)
+    return False
+
+
+class Rig:
+    """
+    Holds the connection and wraps motion with the safety limits.
+
+    Every robot call goes through `call()`, which reconnects with backoff and repeats the call when the
+    link drops. Moves are to absolute poses and open/grab are idempotent, so repeating one is safe.
+    """
+
+    def __init__(self):
+        self.robot = None
         self.theta = 0.0
         # Flange floor; tightened from measured table depth before any descent
         self.floor_z = 250.0
 
+    async def connect(self) -> None:
+        opts = RobotClient.Options.with_api_key(
+            api_key=os.environ["VIAM_API_KEY"], api_key_id=os.environ["VIAM_API_KEY_ID"]
+        )
+        self.robot = await RobotClient.at_address(os.environ["VIAM_MACHINE_ADDRESS"], opts)
+        # Resource handles belong to one connection, so rebind them on every (re)connect
+        self.arm = Arm.from_robot(self.robot, "arm")
+        self.cam = Camera.from_robot(self.robot, "cam")
+        self.gripper = Gripper.from_robot(self.robot, "gripper")
+        if not hasattr(self, "fx"):
+            intr = (await self.cam.get_properties()).intrinsic_parameters
+            self.fx, self.fy, self.cx, self.cy = intr.focal_x_px, intr.focal_y_px, intr.center_x_px, intr.center_y_px
+
+    async def close(self) -> None:
+        if self.robot is not None:
+            try:
+                await self.robot.close()
+            except Exception:
+                pass  # the old link is usually already dead when we get here
+
+    async def call(self, what: str, fn):
+        """Run `fn()` (a zero-arg coroutine factory using self.arm/cam/gripper), reconnecting on a dropped link."""
+        last = None
+        for wait in (0.0,) + RETRY_BACKOFF_S:
+            if wait:
+                print(f"  link dropped during {what} ({type(last).__name__}); reconnecting in {wait:.0f}s")
+                await asyncio.sleep(wait)
+                try:
+                    await self.close()
+                    await self.connect()
+                except Exception as e:
+                    last = e
+                    continue
+            try:
+                return await fn()
+            except Exception as e:
+                if not retryable(e):
+                    raise
+                last = e
+        raise RuntimeError(f"{what}: link still down after {len(RETRY_BACKOFF_S)} reconnects") from last
+
     async def pose(self):
-        return await self.arm.get_end_position()
+        return await self.call("get pose", lambda: self.arm.get_end_position())
+
+    async def open(self) -> None:
+        await self.call("open", lambda: self.gripper.open())
+
+    async def grab(self) -> bool:
+        return await self.call("grab", lambda: self.gripper.grab())
+
+    async def holding(self) -> bool:
+        return (await self.call("holding", lambda: self.gripper.is_holding_something())).is_holding_something
 
     async def goto(self, x: float, y: float, z: float, theta: float = None) -> None:
         """
@@ -255,14 +329,15 @@ class Rig:
             raise RuntimeError("refusing step larger than MAX_STEP_MM")
         if theta is not None:
             self.theta = theta
-        await self.arm.move_to_position(Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=-1, theta=self.theta))
+        target = Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=-1, theta=self.theta)
+        await self.call("move", lambda: self.arm.move_to_position(target))
         # get_images() right after a move returns a stale frame; servo on stale frames diverged (68->142->297 px)
         # {LAGTEST 2026-10-29 "T+0S: BLOCK=(107, 475, 34)" "T+0.5S: BLOCK=(107, 496, 34)"}
         # [CONFIDENCE: CONFIRMED 90% — measured on sfhack4; 1 s gives margin over the observed ~0.5 s]
         await asyncio.sleep(SETTLE_S)
 
     async def frame(self) -> tuple:
-        res = await self.cam.get_images()
+        res = await self.call("get images", lambda: self.cam.get_images())
         return decode(res[0] if isinstance(res, tuple) else res)
 
     async def measure(self, finder=None) -> tuple:
@@ -363,7 +438,7 @@ async def pick(rig: Rig) -> tuple:
 
     Exits the program (gripper open, arm lifted) if the grab closes on nothing.
     """
-    await rig.gripper.open()
+    await rig.open()
     p = await rig.pose()
     await rig.goto(p.x, p.y, ALIGN_Z, theta=0.0)
 
@@ -392,25 +467,20 @@ async def pick(rig: Rig) -> tuple:
     z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
     print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
     await rig.descend(z_grasp)
-    grabbed = await rig.gripper.grab()
+    grabbed = await rig.grab()
     print("  grab returned", grabbed)
     p = await rig.pose()
     await rig.goto(p.x, p.y, ALIGN_Z)
     if not grabbed:
-        await rig.gripper.open()
+        await rig.open()
         sys.exit("nothing in gripper; stopped before moving to the square")
     return height, grip
 
 
 async def run(mode: str) -> None:
-    opts = RobotClient.Options.with_api_key(
-        api_key=os.environ["VIAM_API_KEY"], api_key_id=os.environ["VIAM_API_KEY_ID"]
-    )
-    robot = await RobotClient.at_address(os.environ["VIAM_MACHINE_ADDRESS"], opts)
+    rig = Rig()
+    await rig.connect()
     try:
-        cam = Camera.from_robot(robot, "cam")
-        intr = (await cam.get_properties()).intrinsic_parameters
-        rig = Rig(Arm.from_robot(robot, "arm"), cam, Gripper.from_robot(robot, "gripper"), intr)
         try:
             if mode == "place":
                 # Resume after an interrupted run with the block already held: never open the gripper here
@@ -435,7 +505,7 @@ async def run(mode: str) -> None:
             z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z)
             print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
             await rig.descend(z_place)
-            await rig.gripper.open()
+            await rig.open()
             # Free calibration data: the released block marks where the jaw axis really is
             await observe_release(rig, z1, table, height)
             q = await rig.pose()
@@ -451,7 +521,7 @@ async def run(mode: str) -> None:
             finally:
                 raise
     finally:
-        await robot.close()
+        await rig.close()
 
 
 if __name__ == "__main__":
