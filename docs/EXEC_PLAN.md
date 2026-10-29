@@ -125,5 +125,5 @@ the dashboard ("Clear square" button → `Store.add_command("__reset__")`).
 - Fingertips ≈ 155 mm past the flange; camera ≈ 137 mm above the fingertips along the tool axis.
 - Jaw axis pixel at fingertip depth ≈ (864, 685); configured cam offset is 3–4 cm off.
 - Frames right after a move are stale for ~0.5 s; wait 1 s.
-- RealSense depth invalid closer than ~280 mm; unaligned to colour unless `align_color_depth` is on.
+- RealSense depth invalid closer than ~280 mm. `align_color_depth: true` set on `cam` at 13:0x Oct 29 (fragment override; delete it to roll back): depth is now pixel-aligned to colour (IoU 0.31 at identity vs 0.06 at the old (-60,+22) shift).
 - Laptop ↔ arm WebRTC link dropped twice in ~10 minutes.
