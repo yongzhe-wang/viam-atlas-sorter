@@ -4,7 +4,7 @@ Hackathon: Viam x MongoDB, Oct 29-30 2026. Demo Friday 3:30 PM. Hardware on `sfh
 
 ## Demo story
 
-1. **Overnight practice.** The robot practiced unattended on ~6 objects. The dashboard shows success rate over time, per object and per grasp type.
+1. **Overnight practice.** The robot practiced unattended on ~6 objects. The dashboard shows success rate over time, per object and per grasp type, plus a fixed before/after test run Friday morning.
 2. **Language.** Type "the thing you drink from" → it picks the cup (CLIP text→image match, not color) with the grasp it learned for cups overnight, and drops it in the blue square. The destination is always the blue square.
 3. **Teach once.** The words pick the wrong object → one click on the right one → next time the same words find it.
 
@@ -55,44 +55,33 @@ Parameters (all relative to the object, never absolute poses): `yaw_offset`, `z_
 
 **Success check (all three):** `grab()` result, the gripper's own holding bit (G2 `IsHoldingSomething`), and after the lift the depth at the original spot is back to table height.
 
-## 3. History: how past attempts and trajectories are reused
+## 3. Using the overnight data
 
-Every attempt is recorded in full, and the history is used in five ways. Raw trajectories are stored **relative to the object**, never as absolute poses, because the object is somewhere different every time.
+For top-down primitives the path is fully determined by (object pose, primitive, params), so storing full waypoint trajectories adds nothing beyond debugging. Record only what the uses below need:
 
-**What gets recorded per attempt**
+- `est_pose`: object `(x, y, yaw, h)` estimated by vision before the grasp
+- `tcp_close`: fingertip position and yaw at the moment the gripper closed
+- primitive + params, `success`, `fail_phase`
+- crop embedding + images (observe, close, after)
 
-- Object pose at observation: `(x, y, yaw, h)` in the arm base frame.
-- The grasp used: primitive + params.
-- Trajectory as phased waypoints: `observe → servo → pre_grasp → descend → close → lift → transport → place → retreat`. Each waypoint has the flange pose, joint angles, gripper state (open/closed, holding bit) and a timestamp.
-- High-rate joint stream: Viam data capture on the arm (~10 Hz), synced to the Viam cloud and joined to the attempt by timestamp. Atlas keeps the per-attempt summary; Viam keeps the raw stream.
-- Outcome: `success`, plus `fail_phase` and `fail_reason` on failure; images at observe, at close, and after.
+Uses, most valuable first:
 
-**How it is used**
+1. **Self-calibration from successful grasps.** On a success the object sat between the fingers, so `tcp_close` is ground truth for where it really was. `tcp_close - est_pose` over all successes is the systematic vision error (camera extrinsics, depth, TCP offset). Fit a 2D affine correction by least squares and apply it to every future grasp. A few lines of numpy, and it improves every object at once.
+2. **Self-labelled views.** The robot knows which object it put where, so the next observation of that spot is a free labelled view (new position, rotation, lighting). Append it to `views` with `source: overnight`. The library grows from 8 views to hundreds per object, which makes retrieval and the language match more robust.
+3. **Grasp success model.** Train `P(success | embedding (PCA to 16-d), geometry, primitive, params)` with logistic regression or gradient boosting on every attempt. For any object, including unseen ones, sample ~50 candidate grasps, score them, and run the best. This generalizes across objects where per-object stats cannot. It is the self-supervised idea of Pinto & Gupta 2016 ("Learning to Grasp from 50K Tries and 700 Robot Hours") at hackathon scale: we will have ~850 attempts, so low-dimensional features only, never raw pixels. Hold out 20% and report accuracy.
+4. **Before/after test for the demo.** The overnight curve is confounded (random positions, changing light). Friday morning run a fixed test: 5 objects × 4 placements, once with night-0 defaults and once with calibration + model. That A/B number is the honest claim to make on stage.
+5. **Baseline during the night:** per-object Thompson stats + failure-phase repair keep improving the robot while it runs. The model in 3 is trained in the morning (or retrained every ~2 h overnight if time allows).
 
-1. **Trajectory templates in the object frame.** For a successful attempt, subtract the object's `(x, y)` and rotate by `-yaw` to get the waypoints in the object's own frame, then store them on that grasp (`waypoints_obj`). Next time, wherever the object is, transform them back with the new `(x, y, yaw)` and execute. The pre-grasp height, approach direction and lift path that worked are reused exactly.
-2. **Choosing the grasp.** `n_try / n_ok` per grasp candidate feeds Thompson sampling overnight and the greedy choice at demo time (section 2).
-3. **Repair by failure phase** instead of random perturbation:
-
-| `fail_phase` | What it means | Next candidate |
-|---|---|---|
-| `close`, holding bit false | missed: position or yaw off | tighter servo tolerance; `z_offset` 5 mm deeper |
-| `lift` / `transport`, holding lost | slipped | more force, lower grasp point, slower lift |
-| `descend`, arm error or stall | hit the object or the table | raise `z_offset`; switch primitive (e.g. `TOP_PINCH` → `RIM`) |
-| `servo`, did not converge | perception problem | not a grasp problem: flag the object, skip it |
-
-4. **Unseen objects borrow history.** kNN on the embedding returns the neighbours' best grasps with their `waypoints_obj`, scaled by the new object's height and width.
-5. **Replay and debugging.** The dashboard can replay any attempt (images + 3D path) and filter failures by phase, which shows what to fix in the morning.
-
-Not in scope for the hackathon: training a policy (e.g. ACT/VLA) on these trajectories. The overnight log is already a dataset (images + actions + outcomes) that could be exported to LeRobot format later.
+Kept only for replay/debug, not for decisions: phase timestamps and Viam data capture of the arm joints.
 
 ## 4. Atlas data model
 
 ```
-views     { object_id, label, embedding[512], cam_pose, img_path }            # vector index on embedding, filter: label
+views     { object_id, label, embedding[512], cam_pose, img_path, source: scan|overnight }            # vector index on embedding, filter: label
 objects   { _id, label, aliases[], geometry{l,w,h,hollow},
-            grasps: [{ id, primitive, params{...}, waypoints_obj[], n_try, n_ok }] }
-attempts  { ts, run_id, mode: overnight|demo|teach, object_id, sim, obj_pose{x,y,yaw,h}, grasp_id, primitive, params,
-            waypoints[{phase, t, flange_pose, joints[6], gripper, holding}],
+            grasps: [{ id, primitive, params{...}, n_try, n_ok }] }
+attempts  { ts, run_id, mode: overnight|demo|teach, object_id, sim, est_pose{x,y,yaw,h}, embedding[512], grasp_id, primitive, params,
+            tcp_close{x,y,z,yaw}, phase_times{...},
             success, fail_phase, fail_reason, img_observe, img_close, img_after, duration_s }
 commands  { ts, text, chosen_object, score, margin, corrected_to, success }
 ```
@@ -137,10 +126,10 @@ Live camera with detection boxes and the chosen grasp drawn on top · command bo
 | When | A: robot / executor | B: perception / Atlas | C: language / UI |
 |---|---|---|---|
 | Thu → 1 PM | fix frame lag; stable `TOP_PINCH` pick-and-place | `align_color_depth`; depth segmentation; CLIP; Atlas collections + indexes | UI skeleton; Charts wired to `attempts` |
-| 2–5 PM | `RIM`, `SOFT`, success check | `scan_object.py`; scan 15–25 objects | text → object grounding |
+| 2–5 PM | `RIM`, `SOFT`, success check; log `est_pose` / `tcp_close` | `scan_object.py`; scan 15–25 objects | text → object grounding |
 | 5–8 PM | self-reset loop + watchdog | Thompson selection + stats updates | command flow end-to-end |
 | 8–8:45 PM | attended 30-minute test, checklist, start overnight | | |
-| Fri 9–10 AM | analyze the night, fix the top failure mode | write best grasps back to `objects` | dashboard from overnight data |
+| Fri 9–10:30 AM | before/after test (5 objects × 4 placements) | fit calibration correction; train success model | dashboard from overnight data + test result |
 | 10 AM–12:30 PM | demo hardening | teach-once polish | language polish, mic |
 | 12:30–3 PM | feature freeze, rehearse 5×, record a backup video | | |
 | 3:30 PM | demo | | |
@@ -148,6 +137,7 @@ Live camera with detection boxes and the chosen grasp drawn on top · command bo
 ## Cut lines
 
 - `SIDE` grasp is stretch only.
+- Grasp success model → per-object Thompson stats + calibration only.
 - Mic → text box only.
 - Depth segmentation not working by 1 PM → color-only objects.
 - Self-reset loop not stable by 8 PM → run the overnight loop on one known object at a fixed spot, just to get a reliable curve.
