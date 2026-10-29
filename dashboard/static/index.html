@@ -535,7 +535,11 @@ async function refreshMap() {
     // AGENT3: size_mm = [along x, along y] of the white inner area; x is up on screen, y is left
     const [sx, sy] = mapXY(...m.square.xy), size = [].concat(m.square.size_mm || [200, 200]);
     const w = (size[1] ?? size[0]) * MAP.s, h = size[0] * MAP.s;
-    svg.appendChild(mk("rect", {x: sx - w / 2, y: sy - h / 2, width: w, height: h, fill: "none", stroke: "#2457d6", "stroke-width": 4}));
+    // partial (AGENT3): the square was cut by the picture's edge; xy/size cover only the part in view: dashed
+    const sq = mk("rect", {x: sx - w / 2, y: sy - h / 2, width: w, height: h, fill: "none", stroke: "#2457d6", "stroke-width": 4,
+                           ...(m.square.partial ? {"stroke-dasharray": "10 6"} : {})});
+    sq.appendChild(mk("title", {}, m.square.partial ? "drop square, only partly in view so far" : "drop square"));
+    svg.appendChild(sq);
     frames.push({x0: sx - w / 2 - 2, y0: sy - h / 2 - 2, x1: sx + w / 2 + 2, y1: sy + h / 2 + 2});
   }
   const pick = (label) => { if (label) { $("t").value = label; $("t").focus(); } };

@@ -249,7 +249,6 @@ class GraspByDescription(Generic, EasyResource):
         ppa, executor = rt.ppa, rt.executor
         if self.attrs.get("home_xy"):
             ppa.HOME_XY = tuple(self.attrs["home_xy"])
-            executor.OBSERVE_XY = [ppa.HOME_XY] + list(ppa.SEARCH_XY)
         if self.attrs.get("jaw_tip_px"):
             ppa.JAW_TIP_PX = tuple(self.attrs["jaw_tip_px"])
         if self.attrs.get("tip_below_cam_mm"):
@@ -642,9 +641,10 @@ class GraspByDescription(Generic, EasyResource):
     async def _from_map(self, text: str) -> Optional[dict]:
         """
         The live map as a hint, never as an extra step (user: "just search, and if found just start grasp; do NOT
-        have an initial step"). best_on_map() names an object seen within MAP_FRESH_S -> {"found": True, "xy",
-        "label", "seen_s_ago", "look_first", ...}: the search looks there first. Only in the drop square (AGENT3)
-        -> {"found": False, "status": "already_in_square", "reason"}. Anything else -> None: search the table.
+        have an initial step"). best_on_map() names an object -> {"found": True, "xy", "label", "seen_s_ago",
+        "stale", "look_first", ...}: the search looks there first, however long ago it was seen (stale: more than
+        MAP_FRESH_S; AGENT1: an old xy is still the best first look, and the search goes on if it is gone). Only in
+        the drop square (AGENT3) -> {"found": False, "status": "already_in_square", "reason"}. Else None: search.
         """
         now = time.time()
         m = self.live.map
@@ -656,11 +656,10 @@ class GraspByDescription(Generic, EasyResource):
         o = b.get("map_obj")
         if o is not None and not b.get("ambiguous"):
             seen_ago = now - float(o.get("seen_ts") or m.get("ts") or 0.0)
-            if seen_ago > MAP_FRESH_S:
-                return None  # remembered too long ago to be worth a first look; the search finds it anyway
             return {**out, "found": True, "xy": [round(float(v), 1) for v in b["xy"]], "label": o.get("label"),
                     "colour": o.get("colour"), "score": round(float(b.get("score") or 0.0), 3),
-                    "seen_s_ago": round(seen_ago, 1), "look_first": bool(b.get("look_first"))}
+                    "seen_s_ago": round(seen_ago, 1), "stale": seen_ago > MAP_FRESH_S,
+                    "look_first": bool(b.get("look_first"))}
         if b.get("already_in_square"):
             # AGENT3: the named object is only in the drop square (delivered): say so at once, never search for it
             # or pick it out again
@@ -669,10 +668,13 @@ class GraspByDescription(Generic, EasyResource):
 
     @staticmethod
     def _map_message(found: dict) -> str:
-        """'remembered at (x, y) on the table map, seen N s ago', plus a note for an edge-only sighting."""
-        x, y = found["xy"]
+        """'remembered at (x, y) on the table map, seen N s ago' (or 'last seen ... N min ago' when stale)."""
+        x, y, ago = found["xy"][0], found["xy"][1], found["seen_s_ago"]
+        when = f"{ago:.0f} s ago" if ago < 90 else f"{ago / 60:.0f} min ago"
         edge = " (only seen at a picture's edge)" if found.get("look_first") else ""
-        return f"remembered at ({x:.0f}, {y:.0f}) on the table map, seen {found['seen_s_ago']:.0f} s ago{edge}"
+        if found.get("stale"):
+            return f"last seen at ({x:.0f}, {y:.0f}) {when}{edge}"
+        return f"remembered at ({x:.0f}, {y:.0f}) on the table map, seen {when}{edge}"
 
     async def _preview(self, text: str) -> Dict[str, ValueTypes]:
         """
@@ -699,8 +701,9 @@ class GraspByDescription(Generic, EasyResource):
         if found["found"]:
             return {"ok": True, "via": "map", "target_xy": found["xy"], "label": found["label"],
                     "decide_ms": found["decide_ms"], "map_age_s": found["map_age_s"], "seen_s_ago": found["seen_s_ago"],
-                    "look_first": found["look_first"],
-                    "message": self._map_message(found) + ": a grasp would look there first"}
+                    "look_first": found["look_first"], "stale": found["stale"],
+                    "message": self._map_message(found) + ": a grasp would look there first"
+                               + (", then search the table" if found["stale"] else "")}
         return {"ok": False, "status": found["status"], "reason": found["reason"], "decide_ms": found["decide_ms"]}
 
     @staticmethod
@@ -768,6 +771,8 @@ class GraspByDescription(Generic, EasyResource):
             rig = await self._get_rig()
             # Every frame the executor takes from here on also updates the live map (AGENT1's hook in Rig.frame)
             rig.on_map_frame = lambda rgb, depth, pose: self._on_map_frame(rig, rgb, depth, pose)
+            # AGENT1: the executor reads the live map for the newest drop square and free drop spots
+            rig.live_map = lambda: self.live.map if self.live is not None else None
             if kind == "grasp":
                 params = inspect.signature(rt.executor.execute).parameters
                 kwargs = {"progress": self._search_progress} if "progress" in params else {}
@@ -860,7 +865,8 @@ class GraspByDescription(Generic, EasyResource):
             res = await self._start("grasp", text, wait, target_xy=found["xy"], decide_ms=found["decide_ms"],
                                     chosen={"label": found["label"], "colour": found.get("colour")})
             return {**res, "ok": bool(res.get("accepted")), "via": "map", "status_text": "searching",
-                    "message": self._map_message(found) + " · looking there first",
+                    "message": self._map_message(found) + " · looking there first"
+                               + (", then searching" if found["stale"] else ""), "stale": found["stale"],
                     "target_xy": found["xy"], "label": found["label"], "map_age_s": found["map_age_s"],
                     "seen_s_ago": found["seen_s_ago"], "look_first": found["look_first"],
                     "decide_ms": found["decide_ms"]}
