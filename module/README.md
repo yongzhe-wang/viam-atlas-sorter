@@ -147,8 +147,11 @@ The archive must contain `meta.json`: `viam module reload-local` rejects a local
 tarballs must contain a meta.json with the 'entrypoint' field"). `build.sh` copies it in.
 
 First start on a robot: `run.sh` creates a virtualenv in `$VIAM_MODULE_DATA/venv` (kept across module
-versions), installs **CPU-only** torch from `https://download.pytorch.org/whl/cpu` (the default Linux wheel pulls
-more than 2 GB of CUDA libraries), then `requirements.txt`. On our robot (sfhack4, linux/amd64) this took about
+versions), installs **CPU-only** torch and torchvision as a pair from `https://download.pytorch.org/whl/cpu` (the
+default Linux wheel pulls more than 2 GB of CUDA libraries; a torchvision from PyPI does not match that torch and
+CLIP dies on import with `operator torchvision::nms does not exist`), then `requirements.txt`. Before marking the
+venv installed it imports torch, torchvision and open_clip and runs `torchvision.ops.nms`; if that fails, `run.sh`
+exits with the installed versions on stderr and installs again on the next start. On our robot (sfhack4, linux/amd64) this took about
 10 minutes before the service came up. Restarts and redeploys reuse that venv; it is reinstalled only when
 `requirements.txt` changes (the install marker is keyed on its hash). If viam-server gives up waiting on the
 first start, run `./run.sh` once by hand on the robot.

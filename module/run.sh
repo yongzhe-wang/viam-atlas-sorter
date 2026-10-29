@@ -27,6 +27,13 @@ if [ ! -f "$MARKER" ]; then
   "$VENV/bin/pip" uninstall --quiet -y torch torchvision >/dev/null 2>&1 || true
   "$VENV/bin/pip" install --quiet $TORCH_INSTALL
   "$VENV/bin/pip" install --quiet -r requirements.txt
+  # Prove the stack loads before marking the venv good: a torch/torchvision mismatch only shows up on import
+  # ("operator torchvision::nms does not exist"). No marker on failure, so the next start installs again.
+  if ! "$VENV/bin/python" -c "import torch, torchvision, open_clip; torchvision.ops.nms(torch.zeros((1, 4)), torch.zeros(1), 0.5)"; then
+    echo "run.sh: torch / torchvision / open_clip do not load together after install; venv not marked installed:" >&2
+    "$VENV/bin/pip" list 2>/dev/null | grep -iE '^(torch|torchvision|open[-_]clip)' >&2 || true
+    exit 1
+  fi
   rm -f "$VENV"/.installed-*
   touch "$MARKER"
 fi
