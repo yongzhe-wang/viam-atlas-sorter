@@ -12,6 +12,8 @@ Flow:
   label_scan.py --apply labels.json     {"3": ["green square", "green block"], ...}: first name = label,
                            rest = aliases -> Store.add_view for every crop in each labelled group
                            (source="arm_scan"). Unlabelled groups (e.g. transparent cups) are skipped.
+  label_scan.py --phone DIR             phone close-ups: crops + CLIP-proposed labels -> docs/scan/phone_contact.jpg
+  label_scan.py --phone DIR --apply labels.json     {"P2": ["green cube", "green square"]} -> source="phone"
 
 Frames: data/scan/<n>.jpg + <n>_depth.npy (or <n>_depth.png, uint16 mm) + <n>.json (arm pose x, y, z,
 theta; optionally "intrinsics"). Depth must be aligned to colour.
@@ -150,60 +152,173 @@ def write_outputs(items: list, crops: list, emb: np.ndarray, groups: list) -> di
     return out
 
 
-def contact_sheet(groups: dict, crops: list) -> None:
-    """One row per group: id + summary, then up to CROPS_PER_ROW crops scaled to the same height."""
+def _sheet(rows: list, path: Path) -> None:
+    """Contact sheet: rows of (title, [text lines], [PIL images]); title in magenta, images scaled to fit."""
     row_h, label_w, cell_w = 150, 300, 200
-    sheet = Image.new("RGB", (label_w + cell_w * CROPS_PER_ROW, row_h * max(len(groups), 1)), "white")
+    sheet = Image.new("RGB", (label_w + cell_w * CROPS_PER_ROW, row_h * max(len(rows), 1)), "white")
     dr = ImageDraw.Draw(sheet)
     try:
         font = ImageFont.load_default(size=22)
         small = ImageFont.load_default(size=16)
     except TypeError:
         font = small = ImageFont.load_default()
-    for r, (gid, g) in enumerate(groups.items()):
+    for r, (title, lines, ims) in enumerate(rows):
         y0 = r * row_h
         dr.rectangle((0, y0, sheet.width - 1, y0 + row_h - 1), outline=(200, 200, 200))
-        dr.text((10, y0 + 10), f"G{gid}", fill=(200, 0, 120), font=font)
-        dr.text((10, y0 + 45), f"n={g['n']} {'/'.join(g['colours'])}", fill=(0, 0, 0), font=small)
-        dr.text((10, y0 + 68), f"h={g['height_mm']:.0f} mm", fill=(0, 0, 0), font=small)
-        dr.text((10, y0 + 91), f"xy=({g['xy'][0]:.0f},{g['xy'][1]:.0f})", fill=(0, 0, 0), font=small)
-        if g["unstable"]:
-            dr.text((10, y0 + 114), "UNSTABLE", fill=(220, 0, 0), font=small)
-        for c, it in enumerate(g["items"][:CROPS_PER_ROW]):
-            im = Image.fromarray(crops[it["index"]])
+        dr.text((10, y0 + 10), title, fill=(200, 0, 120), font=font)
+        for k, line in enumerate(lines):
+            dr.text((10, y0 + 45 + 23 * k), line, fill=(220, 0, 0) if line == "UNSTABLE" else (0, 0, 0), font=small)
+        for c, im in enumerate(ims[:CROPS_PER_ROW]):
+            im = im.copy()
             im.thumbnail((cell_w - 10, row_h - 10))
             sheet.paste(im, (label_w + c * cell_w + 5, y0 + 5))
-    SHEET.parent.mkdir(parents=True, exist_ok=True)
-    sheet.save(SHEET, quality=88)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(path, quality=88)
 
 
-def apply(labels_path: str, force: bool) -> None:
-    """Write one Store view per crop of every labelled group (source="arm_scan")."""
+def contact_sheet(groups: dict, crops: list) -> None:
+    """Arm-scan sheet: one row per group with id, colour, height, table xy and up to 6 crops."""
+    rows = []
+    for gid, g in groups.items():
+        lines = [f"n={g['n']} {'/'.join(g['colours'])}", f"h={g['height_mm']:.0f} mm",
+                 f"xy=({g['xy'][0]:.0f},{g['xy'][1]:.0f})"] + (["UNSTABLE"] if g["unstable"] else [])
+        rows.append((f"G{gid}", lines, [Image.fromarray(crops[it["index"]]) for it in g["items"]]))
+    _sheet(rows, SHEET)
+
+
+# ---- phone photos (low-weight extra views) ------------------------------------------------------------
+# Objects per photo, from the user's list relayed by VIAM CENTERAL 2026-10-29. Overviews (7383-7385, 7409)
+# and the measuring cups are skipped. A proposal is restricted to the photo's own objects.
+PHONE_MAP = {
+    **{n: ["black tape roll"] for n in (7386, 7387, 7388)},
+    **{n: ["granola bar", "KIND bar"] for n in (7389, 7390, 7391)},
+    **{n: ["KIND bar"] for n in (7392, 7393)},
+    **{n: ["yellow block"] for n in (7394, 7395, 7396, 7397)},
+    **{n: ["green cylinder", "green cube"] for n in (7398, 7399, 7400, 7401, 7402)},
+    **{n: ["blue cylinder", "yellow cylinder", "blue block", "blue-handle screwdriver", "green cylinder"]
+       for n in (7403, 7404, 7405, 7406)},
+    **{n: ["red screwdriver"] for n in (7407, 7408)},
+}
+# Zero-shot prompts: descriptive, so the two snack bars and the two screwdrivers separate; labels stay short
+PHONE_PROMPTS = {
+    "black tape roll": "a roll of black tape", "granola bar": "a granola bar in a black and green wrapper",
+    "KIND bar": "a KIND bar in a teal wrapper", "yellow block": "a yellow rectangular wooden block",
+    "green cylinder": "a green wooden cylinder", "green cube": "a small green wooden cube",
+    "blue cylinder": "a blue wooden cylinder", "yellow cylinder": "a yellow wooden cylinder",
+    "blue block": "a blue rectangular block", "blue-handle screwdriver": "a screwdriver with a blue and black handle",
+    "red screwdriver": "a screwdriver with a red and black handle"}
+# A crop whose best global match is one of these (or another photo's object) is a neighbour/background: dropped
+PHONE_DISTRACTORS = ["blue tape on white paper", "a sheet of white paper", "a wooden table top",
+                     "a clear plastic measuring cup", "the metal base of a robot arm", "a phone in an orange case"]
+PHONE_MAX_PER_GROUP = 12
+PHONE_SAT, PHONE_VAL = 0.45, 0.25  # saturated-colour blob thresholds (HSV 0-1)
+PHONE_AREA = (0.004, 0.12)  # blob area as a fraction of the photo; larger = the blue paper/tape
+
+
+def phone_crops(path: Path) -> list:
+    """Saturated-colour blobs (cubes, cylinders, handles, wrappers) plus a centre crop for black objects."""
+    from scipy import ndimage
+
+    im = Image.open(path).convert("RGB")
+    im.thumbnail((800, 800))
+    a = np.asarray(im)
+    hsv = np.asarray(im.convert("HSV")).astype(float) / 255.0
+    lab, n = ndimage.label(ndimage.binary_opening((hsv[..., 1] > PHONE_SAT) & (hsv[..., 2] > PHONE_VAL), iterations=2))
+    H, W = lab.shape
+    out = []
+    for i in range(1, n + 1):
+        vs, us = np.nonzero(lab == i)
+        frac = len(us) / (H * W)
+        borders = (us.min() <= 1) + (vs.min() <= 1) + (us.max() >= W - 2) + (vs.max() >= H - 2)
+        if not PHONE_AREA[0] <= frac <= PHONE_AREA[1] or borders >= 2:
+            continue
+        mu, mv = int((np.ptp(us) + 1) * 0.15) + 4, int((np.ptp(vs) + 1) * 0.15) + 4
+        out.append(a[max(0, vs.min() - mv):vs.max() + mv, max(0, us.min() - mu):us.max() + mu].copy())
+    out.append(a[H // 5:H - H // 5, W // 5:W - W // 5].copy())  # centre crop
+    return out
+
+
+def phone_propose(photo_dir: Path) -> None:
+    """Crop every mapped photo, propose a label per crop by CLIP zero-shot, write the phone contact sheet."""
+    out_dir = SCAN / "phone"
+    (out_dir / "crops").mkdir(parents=True, exist_ok=True)
+    items, crops = [], []
+    for p in sorted(photo_dir.glob("IMG_*.jpg")):
+        try:
+            num = int(p.stem.split("_")[1])
+        except ValueError:
+            continue
+        if num not in PHONE_MAP or p.stem.count("_") > 1:
+            continue
+        for k, c in enumerate(phone_crops(p)):
+            items.append({"photo": p.name, "allowed": PHONE_MAP[num], "crop": f"phone/crops/{p.stem}_{k}.jpg"})
+            crops.append(c)
+    emb = clip_embed.embed_images(crops)
+    names = sorted(PHONE_PROMPTS)
+    # Prompts are embedded raw (they already read "a ..."), so embed_text's "a photo of a" prefix is not doubled
+    text = np.stack([clip_embed.embed_text(PHONE_PROMPTS[n]) for n in names] +
+                    [clip_embed.embed_text(d) for d in PHONE_DISTRACTORS])
+    groups, dropped = {}, 0
+    for k, (it, c) in enumerate(zip(items, crops)):
+        sims = text @ emb[k]
+        top = int(np.argmax(sims))
+        # Keep only crops whose best match over every name and distractor is one of this photo's objects
+        if top >= len(names) or names[top] not in it["allowed"]:
+            dropped += 1
+            continue
+        Image.fromarray(c).save(SCAN / it["crop"], quality=90)
+        it.update(index=k, proposed=names[top], sim=round(float(sims[top]), 3))
+        groups.setdefault(it["proposed"], []).append(it)
+    np.save(out_dir / "embeddings.npy", emb)
+    out = {f"P{i}": {"proposed": lab, "n": min(len(its), PHONE_MAX_PER_GROUP),
+                     "items": sorted(its, key=lambda t: -t["sim"])[:PHONE_MAX_PER_GROUP]}
+           for i, (lab, its) in enumerate(sorted(groups.items()))}
+    print(f"dropped {dropped} neighbour/background crops")
+    (out_dir / "groups.json").write_text(json.dumps(out, indent=1))
+    rows = [(gid, [g["proposed"], f"n={g['n']}"], [Image.fromarray(crops[it["index"]]) for it in g["items"]])
+            for gid, g in out.items()]
+    _sheet(rows, SHEET.parent / "phone_contact.jpg")
+    print(f"{len(items)} phone crops -> {SHEET.parent / 'phone_contact.jpg'}")
+    for gid, g in out.items():
+        print(f"  {gid}: {g['proposed']} n={g['n']}")
+
+
+def apply(labels_path: str, force: bool, phone: bool = False) -> None:
+    """
+    Write one Store view per crop of every labelled group.
+
+    Arm scan: source="arm_scan". Phone photos (--phone): source="phone"; rank() gives these a lower vote
+    weight because the oblique phone view differs from the top-down wrist camera.
+    """
     from sorter.store import Store
 
-    marker = SCAN / "applied.json"
+    base = SCAN / "phone" if phone else SCAN
+    marker = base / "applied.json"
     if marker.exists() and not force:
         sys.exit(f"labels already applied ({marker}); use --force to add them again")
     labels = json.loads(Path(labels_path).read_text())
-    groups = json.loads((SCAN / "groups.json").read_text())
-    emb = np.load(SCAN / "embeddings.npy")
+    groups = json.loads((base / "groups.json").read_text())
+    emb = np.load(base / "embeddings.npy")
     store = Store()
     written = {}
     for gid, names in labels.items():
         if gid not in groups or not names:
-            print(f"G{gid}: not in groups.json or no name, skipped")
+            print(f"{gid}: not in groups.json or no name, skipped")
             continue
         label, aliases = names[0], list(names[1:])
         ids = []
         for it in groups[gid]["items"]:
             jpeg = (SCAN / it["crop"]).read_bytes()
-            ids.append(store.add_view(label, emb[it["index"]], jpeg, {
-                "aliases": aliases, "source": "arm_scan", "group": int(gid), "frame": it["frame"],
-                "colour": it["colour"], "height_mm": it["height_mm"], "rect_fill": it["rect_fill"], "xy": it["xy"]}))
+            if phone:
+                meta = {"aliases": aliases, "source": "phone", "group": gid, "photo": it["photo"]}
+            else:
+                meta = {"aliases": aliases, "source": "arm_scan", "group": int(gid), "frame": it["frame"],
+                        "colour": it["colour"], "height_mm": it["height_mm"], "rect_fill": it["rect_fill"], "xy": it["xy"]}
+            ids.append(store.add_view(label, emb[it["index"]], jpeg, meta))
         written[gid] = {"label": label, "views": ids}
-        print(f"G{gid}: {len(ids)} views as {label!r} aliases={aliases}")
+        print(f"{gid}: {len(ids)} views as {label!r} aliases={aliases}")
     marker.write_text(json.dumps(written, indent=1))
-    print(f"store online={store.online}; skipped groups: {sorted(set(groups) - set(labels), key=int)}")
+    print(f"store online={store.online}; skipped groups: {sorted(set(groups) - set(labels))}")
 
 
 if __name__ == "__main__":
@@ -211,12 +326,15 @@ if __name__ == "__main__":
     ap.add_argument("--apply", help="labels.json: {group id: [label, alias, ...]}")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--scan-dir", help="read frames from here instead of data/scan (tests)")
+    ap.add_argument("--phone", help="photo directory: propose labels for phone close-ups (with --apply: apply them)")
     a = ap.parse_args()
     if a.scan_dir:
         SCAN = Path(a.scan_dir)
         SHEET = SCAN / "contact.jpg"
     if a.apply:
-        apply(a.apply, a.force)
+        apply(a.apply, a.force, phone=bool(a.phone))
+    elif a.phone:
+        phone_propose(Path(a.phone))
     else:
         fr = load_frames()
         its, cr, em = sightings(fr)

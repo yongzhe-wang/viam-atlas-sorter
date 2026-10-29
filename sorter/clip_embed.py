@@ -37,6 +37,8 @@ SHAPE_BONUS = 0.02  # "long"/"stick" vs footprint aspect; the only shape cue tha
 # view at 1.0 and a different object's view at 0.83-0.87 in the offline test.
 # [CONFIDENCE: SINGLE-SRC 55% — offline test only; calibrate on the arm scan]
 KNN_MIN = 0.90  # a view at least this close counts as "same object"
+# Vote weight by view source: phone close-ups are oblique, the wrist camera looks straight down
+SOURCE_WEIGHT = {"phone": 0.5}
 LABEL_BONUS = 0.15  # object recognised as something the query names
 LABEL_PENALTY = 0.10  # object recognised as something else
 # Below this the best crop is not really what was asked for. On frame t01 the correct objects scored
@@ -124,7 +126,7 @@ def recognise(emb: np.ndarray, store, k: int = 5) -> tuple:
     for v in store.search_views(emb, k=k):
         if v["score"] < KNN_MIN:
             continue
-        votes[v["label"]] = votes.get(v["label"], 0.0) + v["score"]
+        votes[v["label"]] = votes.get(v["label"], 0.0) + v["score"] * SOURCE_WEIGHT.get(v.get("source"), 1.0)
         names.setdefault(v["label"], {v["label"]}).update(v.get("aliases") or [])
     if not votes:
         return None, [], 0.0
