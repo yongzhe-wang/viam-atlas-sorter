@@ -144,22 +144,8 @@ def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm:
 
 
 def library_names(store) -> list:
-    """
-    [label + aliases] for every labelled object in the store, so best() knows which queries the library covers.
-
-    Uses Store.list_labels() when AGENT 2 adds it; until then Atlas distinct() online, or the offline views
-    file through Store._read_offline (no public listing yet).
-    """
-    if hasattr(store, "list_labels"):
-        return store.list_labels()
-    names = {}
-    if getattr(store, "db", None) is not None:
-        rows = store.db.views.find({}, {"label": 1, "aliases": 1, "_id": 0})
-    else:
-        rows = store._read_offline("views")
-    for r in rows:
-        names.setdefault(r["label"], {r["label"]}).update(r.get("aliases") or [])
-    return [sorted(v) for v in names.values()]
+    """[[label, *aliases], ...] for every labelled object, so best() knows which queries the library covers."""
+    return store.list_labels()
 
 
 def rank(objs: list, text: str, store=None) -> list:
