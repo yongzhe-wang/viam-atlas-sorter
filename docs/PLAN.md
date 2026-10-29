@@ -1,6 +1,6 @@
 # Full plan: a self-improving, language-driven sorter
 
-Hackathon: Viam x MongoDB, Oct 29-30 2026. Demo Friday 3:30 PM. Hardware on `sfhack4`: xArm6, ufactory gripper, wrist RealSense (color + depth), table at z = -123 mm in the arm base frame.
+Hackathon: Viam x MongoDB, Oct 29-30 2026. Demo Friday 3:30 PM. Hardware on `sfhack4`: xArm6, ufactory gripper, wrist RealSense (color + depth), table top at z ≈ 0 mm in the arm base frame (the `table` obstacle z = -123 is the centre of a 200 mm collision box; measured with depth).
 
 ## Demo story
 
