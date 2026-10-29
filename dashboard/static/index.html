@@ -77,6 +77,12 @@
   .kpi b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
   .kpi span { color: var(--muted); font-size: 12px; }
   svg text { fill: var(--muted); font-size: 11px; }
+  /* Table map labels: named objects in ink; can't-grab and remembered ones muted; "unknown" only on hover */
+  #tmap text.lbl { fill: var(--ink); }
+  #tmap text.lbl-mute { fill: var(--muted); }
+  /* pointer-events off: an invisible label lying over a neighbour's dot would swallow its click */
+  #tmap text.lbl-unk { opacity: 0; transition: opacity .12s; pointer-events: none; }
+  #tmap g:hover text.lbl-unk { opacity: 1; }
   .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 4px; }
   .sw { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 5px; }
   .full { grid-column: 1 / -1; }
@@ -158,7 +164,7 @@
     <div id="map-head" class="muted" style="font-size:13px;margin-bottom:6px">no table scan yet</div>
     <svg id="tmap" viewBox="0 0 560 300" width="100%" role="img" aria-label="top-down table map"></svg>
     <div class="legend"><span><i class="sw" style="background:var(--ok);height:8px;width:8px;border-radius:50%"></i>on the table scan</span>
-      <span>○ last sighting</span><span>colour = age: green &lt; 1 min, amber &lt; 5 min, grey older or not recognised</span><span>ring = last preview / grasp target</span><span>click an object to grasp it</span></div>
+      <span>○ last seen (memory, not on the current scan)</span><span>◌ dashed = can't grab (e.g. measuring cup)</span><span>colour = age: green &lt; 1 min, amber &lt; 5 min, grey older or not recognised (hover for "unknown")</span><span>ring = last preview / grasp target</span><span>click an object to grasp it</span></div>
   </section>
 
   <section class="card full" id="charts-card" hidden>
@@ -454,6 +460,48 @@ const MAP = {W: 560, H: 300, s: 0.4, base: [280, 290]};
 const mapXY = (x, y) => [MAP.base[0] - y * MAP.s, MAP.base[1] - x * MAP.s];
 const ageColour = (age) => age < 60 ? "var(--ok)" : age < 300 ? "var(--warn)" : "var(--muted)";
 const agoText = (s) => s < 90 ? `${Math.round(s)} s ago` : `${Math.round(s / 60)} min ago`;
+// Map labels without collisions: in priority order, each label takes the first spot around its marker (right,
+// left, above, below, diagonals) whose box hits no placed label, no other marker and stays inside the map; the
+// far rings get a leader line back to the marker. "unknown" labels are not placed: they show on hover only.
+// fixed: boxes already taken (the "arm" label); frames: rects whose border a label must not cross (drop square).
+function placeLabels(svg, mk, marks, labels, fixed = [], frames = []) {
+  const [W, H] = [MAP.W, MAP.H], boxes = [...fixed];
+  const meets = (b, o) => b.x0 < o.x1 && b.x1 > o.x0 && b.y0 < o.y1 && b.y1 > o.y0;
+  const hitsBox = (b) => boxes.some((o) => meets(b, o));
+  const crossesFrame = (b) => frames.some((f) => meets(b, f) && !(b.x0 >= f.x0 && b.x1 <= f.x1 && b.y0 >= f.y0 && b.y1 <= f.y1));
+  const hitsMark = (b, own) => marks.some((c) => c !== own && Math.hypot(Math.max(b.x0, Math.min(c.x, b.x1)) - c.x,
+                                                                         Math.max(b.y0, Math.min(c.y, b.y1)) - c.y) < c.r);
+  for (const L of labels.sort((a, b) => a.prio - b.prio)) {
+    const t = mk("text", {class: L.cls, x: L.x + 10, y: L.y + 4}, L.text);
+    L.g.appendChild(t);
+    if (L.cls === "lbl-unk") continue;
+    const own = marks.find((c) => c.x === L.x && c.y === L.y), w = t.getComputedTextLength() || L.text.length * 6.2;
+    let best = null;
+    for (const far of [0, 16, 34]) {
+      const spots = [[L.x + 11 + far, L.y + 4], [L.x - 11 - far - w, L.y + 4], [L.x - w / 2, L.y - 12 - far],
+                     [L.x - w / 2, L.y + 20 + far], [L.x + 8 + far, L.y - 9 - far], [L.x + 8 + far, L.y + 17 + far],
+                     [L.x - 8 - far - w, L.y - 9 - far], [L.x - 8 - far - w, L.y + 17 + far]];
+      for (const [tx, ty] of spots) {
+        const b = {x0: tx - 1, y0: ty - 10, x1: tx + w + 1, y1: ty + 3};
+        if (b.x0 < 0 || b.x1 > W || b.y0 < 0 || b.y1 > H || hitsBox(b) || hitsMark(b, own) || crossesFrame(b)) continue;
+        best = {tx, ty, b, far};
+        break;
+      }
+      if (best) break;
+    }
+    best = best || {tx: L.x + 11, ty: L.y + 4, b: {x0: L.x + 10, y0: L.y - 6, x1: L.x + 12 + w, y1: L.y + 7}, far: 0};
+    t.setAttribute("x", best.tx);
+    t.setAttribute("y", best.ty);
+    boxes.push(best.b);
+    if (best.far) {
+      // Leader line from the marker's edge to the nearest point of the label box
+      const nx = Math.max(best.b.x0, Math.min(L.x, best.b.x1)), ny = Math.max(best.b.y0, Math.min(L.y, best.b.y1));
+      const len = Math.hypot(nx - L.x, ny - L.y) || 1, r0 = (own && own.r) || 8;
+      L.g.insertBefore(mk("line", {x1: L.x + (nx - L.x) * r0 / len, y1: L.y + (ny - L.y) * r0 / len, x2: nx, y2: ny,
+                                   stroke: "var(--muted)", "stroke-width": 1}), t);
+    }
+  }
+}
 async function refreshMap() {
   const d = await api("/api/table_map");
   const svg = $("tmap"), ns = "http://www.w3.org/2000/svg";
@@ -465,41 +513,57 @@ async function refreshMap() {
     fill: "var(--chip)", stroke: "var(--line)"}));
   svg.appendChild(mk("rect", {x: bx - 10, y: by - 6, width: 20, height: 10, rx: 2, fill: "var(--muted)"}));
   svg.appendChild(mk("text", {x: bx + 14, y: by - 1}, "arm"));
-  const m = d.map;
+  const m = d.map, frames = [];
   if (m && m.square && m.square.xy) {
     // AGENT3: size_mm = [along x, along y] of the white inner area; x is up on screen, y is left
     const [sx, sy] = mapXY(...m.square.xy), size = [].concat(m.square.size_mm || [200, 200]);
     const w = (size[1] ?? size[0]) * MAP.s, h = size[0] * MAP.s;
     svg.appendChild(mk("rect", {x: sx - w / 2, y: sy - h / 2, width: w, height: h, fill: "none", stroke: "#2457d6", "stroke-width": 4}));
+    frames.push({x0: sx - w / 2 - 2, y0: sy - h / 2 - 2, x1: sx + w / 2 + 2, y1: sy + h / 2 + 2});
   }
   const pick = (label) => { if (label) { $("t").value = label; $("t").focus(); } };
-  const onMap = new Set();
+  const onMap = new Map();  // label -> its map dot's table xy
   const hl = d.highlight;
+  const marks = [], labels = [];  // marker circles (obstacles) and labels to place once every marker is known
   for (const o of (m && m.objects) || []) {
-    const [px, py] = mapXY(...o.xy), label = o.label || "unknown";
-    onMap.add(o.label);
-    const g = mk("g", {style: o.label ? "cursor:pointer" : ""});
+    const [px, py] = mapXY(...o.xy), named = !!o.label, label = o.label || "unknown";
+    // AGENT3 marks things the gripper must not try (the transparent measuring cups) with graspable: false
+    const grab = o.graspable !== false;
+    if (named) onMap.set(o.label, o.xy);
+    const g = mk("g", {style: named && grab ? "cursor:pointer" : ""});
     // Ring the object the last preview / grasp resolved to: same map position, else same label
     const hit = hl && (hl.xy ? Math.hypot(hl.xy[0] - o.xy[0], hl.xy[1] - o.xy[1]) < 40 : hl.label && hl.label === o.label);
     if (hit) g.appendChild(mk("circle", {cx: px, cy: py, r: 13, fill: "none", stroke: "var(--accent)", "stroke-width": 3}));
-    // Unrecognised objects (no library label) are grey, whatever their age
-    g.appendChild(mk("circle", {cx: px, cy: py, r: 7, fill: o.label ? ageColour(m.age_s) : "var(--muted)", stroke: "var(--panel)", "stroke-width": 2}));
-    g.appendChild(mk("text", {x: px + 10, y: py + 4, fill: "var(--ink)", style: o.label ? "fill:var(--ink)" : "fill:var(--muted)"}, label));
-    g.appendChild(mk("title", {}, `${label} · (${o.xy[0].toFixed(0)}, ${o.xy[1].toFixed(0)}) mm · score ${o.score}`));
-    g.addEventListener("click", () => pick(o.label));
+    if (grab) {
+      // Unrecognised objects (no library label) are grey, whatever their age
+      g.appendChild(mk("circle", {cx: px, cy: py, r: 7, fill: named ? ageColour(m.age_s) : "var(--muted)", stroke: "var(--panel)", "stroke-width": 2}));
+    } else {
+      g.appendChild(mk("circle", {cx: px, cy: py, r: 8, fill: "none", stroke: "var(--muted)", "stroke-width": 2, "stroke-dasharray": "3 2.5"}));
+    }
+    g.appendChild(mk("title", {}, `${label}${grab ? "" : " · can't grab"} · (${o.xy[0].toFixed(0)}, ${o.xy[1].toFixed(0)}) mm · score ${o.score}`));
+    if (named && grab) g.addEventListener("click", () => pick(o.label));
     svg.appendChild(g);
+    marks.push({x: px, y: py, r: hit ? 14 : 9});
+    labels.push({g, x: px, y: py, text: grab ? label : `${label} · can't grab`, prio: hit ? 0 : named ? 1 : 3,
+                 cls: !named ? "lbl-unk" : grab ? "lbl" : "lbl-mute"});
   }
-  // Last sightings (idle loop, looks): rings, so they read as "seen here" rather than "scanned here"
+  // Sightings are memory, not a current detection: a hollow ring + "last seen …", drawn only where they add
+  // something (no dot for that label on the scan, or seen somewhere else since the scan)
   for (const s of d.sightings || []) {
     if (!s.xy) continue;
-    const [px, py] = mapXY(...s.xy);
-    const g = mk("g", {style: "cursor:pointer"});
-    g.appendChild(mk("circle", {cx: px, cy: py, r: 6, fill: "none", stroke: ageColour(s.age_s), "stroke-width": 2.5}));
-    if (!onMap.has(s.label)) g.appendChild(mk("text", {x: px + 9, y: py - 6}, s.label));
-    g.appendChild(mk("title", {}, `${s.label} · seen ${agoText(s.age_s)} (${s.source})`));
-    g.addEventListener("click", () => pick(s.label));
+    const at = onMap.get(s.label);
+    if (at && (Math.hypot(at[0] - s.xy[0], at[1] - s.xy[1]) < 40 || (m && s.age_s >= m.age_s))) continue;
+    const [px, py] = mapXY(...s.xy), grab = s.graspable !== false;
+    const g = mk("g", {style: grab ? "cursor:pointer" : ""});
+    g.appendChild(mk("circle", {cx: px, cy: py, r: 7, fill: "none", stroke: ageColour(s.age_s), "stroke-width": 2.5,
+                                ...(grab ? {} : {"stroke-dasharray": "3 2.5"})}));
+    g.appendChild(mk("title", {}, `${s.label} · last seen ${agoText(s.age_s)} (${s.source}), not on the current scan`));
+    if (grab) g.addEventListener("click", () => pick(s.label));
     svg.appendChild(g);
+    marks.push({x: px, y: py, r: 9});
+    labels.push({g, x: px, y: py, text: `${s.label}${grab ? "" : " · can't grab"} · last seen ${agoText(s.age_s)}`, prio: 2, cls: "lbl-mute"});
   }
+  placeLabels(svg, mk, marks, labels, [{x0: bx - 12, y0: by - 12, x1: bx + 40, y1: by + 6}], frames);
   const head = d.sweep && d.sweep.n ? `scanning table… pose ${d.sweep.k}/${d.sweep.n}`
     : m ? `scanned ${agoText(m.age_s)} · ${(m.objects || []).length} objects` : "no table scan yet";
   $("map-head").textContent = head + ((d.sightings || []).length ? ` · ${(d.sightings || []).length} sightings` : "");
