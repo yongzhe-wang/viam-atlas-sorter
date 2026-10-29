@@ -5,9 +5,10 @@ WHY: the user asked for the arm to scan the objects instead of a person holding 
 also tell us where the table is free (the table is crowded, so a fixed reset rectangle no longer works)
 and where the yellow block is for the trials. No gripper commands; objects are never touched.
 
-Poses: grid GRID_X x GRID_Y at z=400 and z=470 (tool down, theta 0), then over every object seen at
-z=400, wrist theta +-35 deg. Each pose: settle (Rig.goto waits SETTLE_S), wait for intruders to leave
-(perception, max 30 s), save data/scan/<n>.jpg + <n>_depth.npy (uint16 mm, aligned) + <n>.json.
+Poses (AGENT3's label_scan.py spec): theta 0, z=400 only, an overlapping grid with ~90 mm steps so every
+object is fully in view in >= 3 frames; label_scan maps pixels to table x/y assuming theta 0. Each pose:
+settle (Rig.goto waits SETTLE_S), if a person is in view wait up to 10 s, save data/scan/<n>.jpg +
+<n>_depth.npy (uint16 mm, aligned) + <n>.json ({"pose": {x, y, z, theta}}).
 Then: data/scan/free_spots.json (flange x/y where an object can be put down) and data/scan/objects.json.
 Ends parked at HOME (250, 0, 400). Usage: python scripts/survey_scan.py
 """
@@ -28,10 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sorter import perception  # noqa: E402
 
 OUT = Path(__file__).resolve().parent.parent / "data" / "scan"
-GRID_X = (250.0, 380.0, 500.0)
-GRID_Y = (-300.0, -100.0, 100.0, 300.0)
-HIGH_Z = 470.0
-OBJ_THETAS = (35.0, -35.0)
+GRID_X = (220.0, 310.0, 400.0, 490.0)
+GRID_Y = (-330.0, -240.0, -150.0, -60.0, 30.0, 120.0, 210.0, 300.0)
 MERGE_MM = 60.0  # objects closer than this across frames are the same object
 FREE_STEP_PX = 40  # candidate spacing for free spots in each frame
 FREE_CLEAR_PX = 150.0  # ~60 mm at the table depth seen from z=400: object/paper clearance
@@ -72,22 +71,30 @@ def free_mask(rgb: np.ndarray, depth: np.ndarray) -> np.ndarray:
     return ok[: rgb.shape[0], : rgb.shape[1]]
 
 
+def person(seg) -> bool:
+    """
+    A person in view: skin-coloured blobs/holes. Static tall things (the ~110 mm transparent cups read
+    "blob 112 mm tall, skin 0%") are not people and must not stall the survey (it waited 30 s per pose).
+    """
+    return any("skin 0%" not in i["reason"] for i in seg.intruders)
+
+
 async def capture(rig, n: int, kind: str, extra: dict = None) -> tuple:
-    """Wait for intruders to leave (max 30 s), then save frame n; returns (rgb, depth, pose, seg)."""
+    """If a person is in view wait up to 10 s, then save frame n; returns (rgb, depth, pose, seg)."""
     t0 = time.monotonic()
     while True:
         rgb, depth = await rig.frame()
         seg = perception.segment_full(rgb, depth)
-        if not seg.intruders or time.monotonic() - t0 > 30:
+        if not person(seg) or time.monotonic() - t0 > 10:
             break
-        print(f"  intruder in view ({seg.intruders[0]['reason']}), waiting")
+        print(f"  person in view ({seg.intruders[0]['reason']}), waiting")
         await asyncio.sleep(1.0)
     p = await rig.pose()
     Image.fromarray(rgb).save(OUT / f"{n:03d}.jpg", quality=92)
     np.save(OUT / f"{n:03d}_depth.npy", np.clip(depth, 0, 65535).astype(np.uint16))
     meta = {"n": n, "kind": kind, "ts": time.time(), "pose": {"x": p.x, "y": p.y, "z": p.z, "theta": p.theta},
             "intrinsics": {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy},
-            "objects_seen": len(seg.objects), "intruder": bool(seg.intruders), **(extra or {})}
+            "objects_seen": len(seg.objects), "person_in_view": person(seg), **(extra or {})}
     (OUT / f"{n:03d}.json").write_text(json.dumps(meta, indent=1))
     return rgb, depth, p, seg
 
@@ -101,7 +108,7 @@ async def main() -> None:
     try:
         await ppa.apply_workspace_limits(rig)
         grid = [(x, y) for x in GRID_X for y in GRID_Y if ppa.allowed(x, y) and REACH[0] <= math.hypot(x, y) <= REACH[1]]
-        print(f"survey: {len(grid)} grid points x 2 heights")
+        print(f"survey: {len(grid)} grid points, theta 0, z {ppa.ALIGN_Z:.0f}")
         for x, y in grid:
             await ppa.travel(rig, x, y, theta=0.0)
             rgb, depth, p, seg = await capture(rig, n, "grid")
@@ -118,21 +125,18 @@ async def main() -> None:
                 for u in range(FREE_STEP_PX, rgb.shape[1] - FREE_STEP_PX, FREE_STEP_PX):
                     wx, wy = pixel_to_world(rig, p, u, v, table)
                     free_samples.append((wx, wy, bool(ok[v, u])))
-            await rig.goto(x, y, HIGH_Z)
-            await capture(rig, n, "grid_high")
-            n += 1
         # Merge objects seen from several grid points (prefer fully visible sightings)
         merged = []
         for o in sorted(objects, key=lambda o: o["edge"]):
             if all(math.hypot(o["x"] - m["x"], o["y"] - m["y"]) > MERGE_MM for m in merged):
                 merged.append(o)
-        merged = [m for m in merged if ppa.allowed(m["x"], m["y"]) and REACH[0] <= math.hypot(m["x"], m["y"]) <= REACH[1]]
-        print(f"survey: {len(merged)} distinct objects; wrist views over each")
-        for i, m in enumerate(merged):
-            for th in OBJ_THETAS:
-                await ppa.travel(rig, m["x"], m["y"], theta=th)
-                await capture(rig, n, "object", {"object": i, "object_xy": [m["x"], m["y"]], "colour": m["colour"]})
-                n += 1
+        for m in merged:
+            m["reach_mm"] = round(math.hypot(m["x"], m["y"]))
+            m["reachable"] = ppa.allowed(m["x"], m["y"]) and REACH[0] <= m["reach_mm"] <= REACH[1]
+        print(f"survey: {len(merged)} distinct objects")
+        for m in merged:
+            print(f"  {m['colour']:7s} at ({m['x']:.0f},{m['y']:.0f}) h={m['height_mm']} mm, {m['reach_mm']} mm from base"
+                  f"{'' if m['reachable'] else '  <- NOT reachable'}")
         # Free spots: free in some frame and not contradicted by any frame within 40 mm
         bad = np.array([(x, y) for x, y, f in free_samples if not f]) if free_samples else np.zeros((0, 2))
         spots = []
