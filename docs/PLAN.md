@@ -50,7 +50,7 @@ Parameters (all relative to the object, never absolute poses): `yaw_offset`, `z_
 **Choosing a grasp:**
 
 1. **Known object** (nearest neighbour similarity ≥ τ): candidates are that object's stored grasps. Overnight, choose with Thompson sampling on `Beta(n_ok+1, n_fail+1)` so it keeps exploring. At demo time choose the best mean (greedy).
-2. **Unknown object:** geometry rules pick the primitive; params come from the top-3 neighbours' best grasps. Optional: ask an LLM for a semantic prior from the zero-shot label ("mug → RIM"), used only as a tie-breaker.
+2. **Unknown object:** geometry rules pick the primitive; params come from the top-3 neighbours' best grasps.
 3. **After each attempt:** update `n_try / n_ok`. On failure, add a perturbed copy as a new candidate (yaw ±10°, z ±5 mm, width ±5 mm).
 
 **Success check (all three):** `grab()` result, the gripper's own holding bit (G2 `IsHoldingSomething`), and after the lift the depth at the original spot is back to table height.
@@ -91,8 +91,8 @@ Expected volume: ~12 h × (3600 / ~50 s per attempt) ≈ 850 attempts (cycle tim
 ## 6. Language commands
 
 1. Input: text box, optional mic (browser Web Speech API).
-2. Parse to `{object, place}`: template `put X into Y` first, LLM fallback for free-form sentences.
-3. Ground the object: CLIP text embedding of `"a photo of " + X` vs. each detected crop → argmax. `"this"` means the object nearest the pick-zone centre. Spatial words ("left one", "second") go to the LLM along with the detection list (positions + labels).
+2. Parse to `{object, place}` with templates only (no LLM): `put/move/place X in/into/on Y`, plus a Chinese template `把 X 放到/放进 Y`. Unmatched sentences are rejected with a message showing the supported forms.
+3. Ground the object: CLIP text embedding of `"a photo of " + X` vs. each detected crop → argmax. `"this"` means the object nearest the pick-zone centre. A small fixed set of spatial words is handled by rules on the detection list: `left/right` (image x), `nearest/farthest` (distance to the arm), `biggest/smallest` (footprint area); the rest of the phrase is still matched with CLIP among the remaining candidates.
 4. Ground the place: match against `places.aliases` / `text_emb`.
 5. If the top two candidates are close, highlight both in the UI and ask the user to choose. Text-image scores are lower than image-image, so compare candidates against each other rather than using a fixed threshold.
 6. Execute with the normal grasp pipeline; log to `commands`.
@@ -117,7 +117,7 @@ Live camera with detection boxes and the chosen grasp drawn on top · command bo
 ## Cut lines
 
 - `SIDE` grasp is stretch only.
-- LLM parsing → templates only. Mic → text box only.
+- Spatial-word rules → plain CLIP match only. Mic → text box only.
 - Depth segmentation not working by 1 PM → color-only objects.
 - Self-reset loop not stable by 8 PM → run the overnight loop on one known object at a fixed spot, just to get a reliable curve.
 
