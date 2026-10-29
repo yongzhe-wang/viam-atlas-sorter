@@ -164,7 +164,10 @@ async function refreshStatus() {
     // Picture pill follows whichever source the server picked (worker frame or our own camera)
     if (s.frame) setPill("p-cam", `Picture: ${s.frame.source} · ${s.frame.age_s} s`, s.frame.age_s < 10 ? "ok" : "warn");
     else setPill("p-cam", "No picture yet", "bad");
-    setPill("p-perc", c.perception ? `Perception · ${c.objects} objects` : "Perception off", c.perception ? "ok" : "warn");
+    // Targets are what the arm may pick; ignored = cut by the image edge / outside the workspace
+    if (!c.perception) setPill("p-perc", "Perception off", "warn");
+    else if (c.intruders) setPill("p-perc", "Hand in workspace · arm pauses", "bad");
+    else setPill("p-perc", `Perception · ${c.objects} target${c.objects === 1 ? "" : "s"}${c.excluded ? ` · ${c.excluded} ignored` : ""}`, "ok");
     const fromWorker = s.frame && s.frame.source.startsWith("worker");
     $("camnote").textContent = fromWorker ? "" : (c.error || c.perception_error || "");
     renderWorkers(s.workers);

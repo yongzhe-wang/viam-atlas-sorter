@@ -66,7 +66,9 @@ class CameraFeed:
         self.frame_ts = 0.0
         self.connected = False
         self.error = None
-        self.objects = []  # perception Obj list from the latest frame
+        self.objects = []  # perception Obj list from the latest frame: the only things the arm may target
+        self.excluded = []  # [(Obj, reason)]: cut by the image edge or outside the workspace, drawn grey
+        self.intruders = []  # [{"bbox", "reason"}]: e.g. a hand in the workspace (the arm pauses), drawn red
         self.table_depth = None
         self.perception = None
         self.perception_error = "not loaded yet"
@@ -78,7 +80,7 @@ class CameraFeed:
         return {"connected": self.connected, "error": self.error,
                 "frame_age_s": round(time.time() - self.frame_ts, 1) if self.frame_ts else None,
                 "perception": self.perception is not None, "perception_error": self.perception_error,
-                "objects": len(self.objects)}
+                "objects": len(self.objects), "excluded": len(self.excluded), "intruders": len(self.intruders)}
 
     def _load_perception(self) -> None:
         if self.perception is not None or time.time() - self._perception_tried < PERCEPTION_RETRY_S:
@@ -91,31 +93,50 @@ class CameraFeed:
             self.perception_error = f"{type(e).__name__}: {e}"[:200]
 
     def _segment(self, rgb, depth) -> None:
-        """Run perception if possible; accepts segment() returning (table, objs) or an object with .objects."""
+        """
+        Run perception: segment_full() for targets + excluded + intruders, else plain segment() (targets only).
+
+        Depth/colour alignment is perception's job (it checks once and falls back), so no shape guard here.
+        {AGENT3 53E4B75 "SEGMENT_FULL().EXCLUDED AS (OBJ, REASON) WITH NEGATIVE IDS"}
+        [CONFIDENCE: CONFIRMED 90% — Segmentation dataclass read in sorter/perception.py]
+        """
         self._load_perception()
         if self.perception is None or depth is None:
-            self.objects = []
-            return
-        if depth.shape[:2] != rgb.shape[:2]:
-            # Boxes would land in the wrong place on an unaligned depth grid
-            self.perception_error = "depth not aligned to colour (align_color_depth off)"
-            self.objects = []
+            self.objects, self.excluded, self.intruders = [], [], []
             return
         try:
-            res = self.perception.segment(rgb, depth)
-            if isinstance(res, tuple):
-                self.table_depth, self.objects = res[0], list(res[1])
+            if hasattr(self.perception, "segment_full"):
+                seg = self.perception.segment_full(rgb, depth)
+                self.table_depth = seg.table_depth_mm
+                self.objects, self.excluded, self.intruders = list(seg.objects), list(seg.excluded), list(seg.intruders)
             else:
-                self.table_depth, self.objects = getattr(res, "table_depth", None), list(res.objects)
+                res = self.perception.segment(rgb, depth)
+                self.table_depth, self.objects = res[0], list(res[1])
+                self.excluded, self.intruders = [], []
             self.perception_error = None
         except Exception as e:
             self.perception_error = f"segment failed: {type(e).__name__}: {e}"[:200]
-            self.objects = []
+            self.objects, self.excluded, self.intruders = [], [], []
 
     def _render(self, rgb) -> bytes:
-        """Colour frame with object boxes; the previewed target is drawn thick and green."""
+        """
+        Colour frame with boxes: excluded objects grey with the reason, intruders red, targets yellow, and the
+        previewed target thick and green. Drawn in that order so targets stay on top.
+        """
         im = Image.fromarray(rgb)
         draw = ImageDraw.Draw(im)
+
+        def tag(box, text, fill, outline, width):
+            u0, v0, u1, v1 = [int(x) for x in box]
+            draw.rectangle([u0, v0, u1, v1], outline=outline, width=width)
+            draw.rectangle([u0, max(v0 - 22, 0), u0 + 9 * len(text), max(v0 - 22, 0) + 22], fill=fill)
+            draw.text((u0 + 4, max(v0 - 20, 2)), text, fill=(0, 0, 0))
+
+        for o, reason in self.excluded:
+            short = "edge" if "edge" in reason else "outside" if "outside" in reason else reason[:16]
+            tag(o.bbox, f"ignored: {short}", (190, 190, 190), (150, 150, 150), 2)
+        for it in self.intruders:
+            tag(it["bbox"], "hand? arm paused", (255, 110, 100), (230, 50, 40), 4)
         hl = self.highlight if self.highlight and self.highlight["until"] > time.time() else None
         for o in self.objects:
             u0, v0, u1, v1 = [int(x) for x in o.bbox]
