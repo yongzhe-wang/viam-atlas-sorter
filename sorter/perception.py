@@ -230,9 +230,14 @@ def rect_fill(mask: np.ndarray) -> float:
     return float(hull.volume / best) if best > 0 else 1.0  # ConvexHull.volume is the area in 2-D
 
 
-def _geometry(mask: np.ndarray) -> tuple:
-    """(centroid, yaw_deg, length_px, width_px) from mask PCA; a w x l rectangle has variance l^2/12."""
+def _geometry(mask: np.ndarray, off: tuple = (0, 0)) -> tuple:
+    """
+    (centroid, yaw_deg, length_px, width_px) from mask PCA; a w x l rectangle has variance l^2/12.
+
+    `off` = (u, v) of the mask's top-left corner when `mask` is a sub-array, so the centroid is in full-image pixels.
+    """
     vs, us = np.nonzero(mask)
+    us, vs = us + off[0], vs + off[1]
     cu, cv = us.mean(), vs.mean()
     w_, vec = np.linalg.eigh(np.cov(np.vstack([us - cu, vs - cv])))
     yaw = math.degrees(math.atan2(-vec[1, 1], vec[0, 1])) % 180.0
@@ -317,39 +322,54 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
     H, W = d.shape
     poly = load_workspace()
     objs, excluded, intruders = [], [], []
+    # Work on each object's bounding sub-array: a full 1280x720 comparison per label (including hundreds of
+    # unseeded noise labels) made segmentation grow with clutter; find_objects gives None for absent labels
+    sl_d, sl_c = ndimage.find_objects(lab_d), ndimage.find_objects(lab_c)
     for i in range(1, n + 1):
-        m_d = lab_d == i
+        sd = sl_d[i - 1] if i - 1 < len(sl_d) else None
+        sc = sl_c[i - 1] if i - 1 < len(sl_c) else None
+        if sd is None or sc is None:
+            continue  # unseeded, or mapped outside the colour view / onto the fingertips
+        m_d = lab_d[sd] == i
         if m_d.sum() < MIN_AREA_PX:
             continue
-        m = lab_c == i
-        if m.sum() < MIN_AREA_PX // 2:
-            continue  # mapped outside the colour view or onto the fingertips
-        top_h = float(np.percentile(height[m_d], 90))
-        vs, us = np.nonzero(m)
-        bbox = (int(us.min()), int(vs.min()), int(us.max()), int(vs.max()))
+        m_s = lab_c[sc] == i
+        if m_s.sum() < MIN_AREA_PX // 2:
+            continue
+        cv0, cu0 = sc[0].start, sc[1].start
+        top_h = float(np.percentile(height[sd][m_d], 90))
+        vs, us = np.nonzero(m_s)
+        bbox = (int(cu0 + us.min()), int(cv0 + vs.min()), int(cu0 + us.max()), int(cv0 + vs.max()))
         # A tall blob, or a skin-coloured one (a hand resting on the table), is never a target
-        sk = skin_fraction(rgb, m)
+        sk = skin_fraction(rgb[sc], m_s)
         if top_h > MAX_OBJ_HEIGHT_MM or sk >= 0.5:
             # Never a target; an intruder only if it reaches into the workspace (else static scenery)
-            if _reaches_inside(bbox, m.shape):
-                intruders.append({"bbox": bbox, "area": int(m.sum()),
+            if _reaches_inside(bbox, (H, W)):
+                intruders.append({"bbox": bbox, "area": int(m_s.sum()),
                                   "reason": f"blob {top_h:.0f} mm tall, skin {sk:.0%}"})
             continue
         u0, v0, u1, v1 = bbox
         mu, mv = int((u1 - u0) * CROP_MARGIN) + 4, int((v1 - v0) * CROP_MARGIN) + 4
         crop = rgb[max(0, v0 - mv):min(H, v1 + mv + 1), max(0, u0 - mu):min(W, u1 + mu + 1)].copy()
-        cen, yaw, L, Wd = _geometry(m)
+        m = np.zeros((H, W), bool)
+        m[sc] = m_s
+        cen, yaw, L, Wd = _geometry(m_s, (cu0, cv0))
         # Top face on the colour grid (falls back to the whole mask for low, flat objects)
-        top_m = to_colour(m_d & (height >= top_h - TOP_BAND_MM), model) & m
-        if top_m.sum() < 200:
-            top_m = m
-        tvs, tus = np.nonzero(top_m)
+        if model == IDENTITY:
+            top_s = (lab_d[sc] == i) & (height[sc] >= top_h - TOP_BAND_MM) & m_s
+        else:
+            full_d = np.zeros((H, W), bool)
+            full_d[sd] = m_d & (height[sd] >= top_h - TOP_BAND_MM)
+            top_s = to_colour(full_d, model)[sc] & m_s
+        if top_s.sum() < 200:
+            top_s = m_s
+        tvs, tus = np.nonzero(top_s)
         e = EDGE_MARGIN_PX
         edge = u0 <= e or v0 <= e or u1 >= W - 1 - e or v1 >= H - 1 - e
         o = Obj(id=0, bbox=bbox, centroid_px=cen, yaw_deg=yaw, length_px=L, width_px=Wd, height_mm=top_h,
-                top_depth_mm=float(np.percentile(d[m_d], 10)), mask=m, crop=crop, touches_edge=edge,
-                colour=colour_name(rgb, m)[0], rect_fill=rect_fill(top_m),
-                top_centroid_px=(float(tus.mean()), float(tvs.mean())))
+                top_depth_mm=float(np.percentile(d[sd][m_d], 10)), mask=m, crop=crop, touches_edge=edge,
+                colour=colour_name(rgb[sc], m_s)[0], rect_fill=rect_fill(top_s),
+                top_centroid_px=(float(cu0 + tus.mean()), float(cv0 + tvs.mean())))
         # Only fully visible objects inside the workspace are targets; the rest is kept for display/debug
         if edge:
             excluded.append((o, "touches the image edge"))

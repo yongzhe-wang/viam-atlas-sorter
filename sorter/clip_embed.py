@@ -104,6 +104,17 @@ def clean_query(text: str) -> str:
     return " ".join(ALIASES.get(w, w) for w in q.split())
 
 
+_NAME_CACHE = {}
+
+
+def _name_emb(text: str) -> np.ndarray:
+    """embed_text(clean_query(text)) memoised: the same few queries repeat on every command (~15 ms each)."""
+    q = clean_query(text)
+    if q not in _NAME_CACHE:
+        _NAME_CACHE[q] = embed_text(q)
+    return _NAME_CACHE[q]
+
+
 def _words(text: str) -> set:
     return set(clean_query(text).split()) - FILLER
 
@@ -143,25 +154,52 @@ def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm:
     return lab, sorted(names[lab]), votes[lab] / k
 
 
+def recognise_all(rgb: np.ndarray, depth: np.ndarray, store=None, seg=None) -> list:
+    """
+    Every target in one frame with its library label: [{"obj", "label", "names", "score", "emb"}, ...].
+
+    WHY: the module's idle loop recognises the table about once a second, and a grasp command should not
+    embed the crops again. One CLIP batch covers all crops; pass the result to best(..., recognised=...).
+    `seg`: a perception.segment_full() result the caller already has (e.g. to check intruders first).
+    label/names are None/[] when the object is not recognised (or there is no store); score = vote confidence.
+    """
+    from sorter import perception
+
+    seg = seg if seg is not None else perception.segment_full(rgb, depth)
+    embs = embed_images([o.crop for o in seg.objects])
+    out = []
+    for o, e in zip(seg.objects, embs):
+        lab, names, conf = (recognise(e, store, colour=o.colour, height_mm=o.height_mm) if store is not None
+                            else (None, [], 0.0))
+        o.recognised, o.recognised_names = lab, names
+        out.append({"obj": o, "label": lab, "names": names, "score": conf, "emb": e})
+    return out
+
+
 def library_names(store) -> list:
     """[[label, *aliases], ...] for every labelled object, so best() knows which queries the library covers."""
     return store.list_labels()
 
 
-def rank(objs: list, text: str, store=None) -> list:
+def rank(objs: list, text: str, store=None, recognised: list = None) -> list:
     """
     [(Obj, score)] best first for a free-text description.
 
     score = CLIP(crop, "a photo of a {query}") + colour term + "long" term + library term.
     Library term (store given): +LABEL_BONUS if the object is recognised as something the query names,
     -LABEL_PENALTY if it is confidently recognised as something else. Sets obj.recognised / .recognised_names.
+    `recognised`: recognise_all() output for these objects; their embeddings and labels are reused.
     """
     if not objs:
         return []
     q = clean_query(text)
     words = set(q.split())
-    img = embed_images([o.crop for o in objs])
-    sims = img @ embed_text(q)
+    pre = {id(r["obj"]): r for r in recognised or []}
+    missing = [o for o in objs if id(o) not in pre]
+    emb_of = {id(o): e for o, e in zip(missing, embed_images([o.crop for o in missing]))} if missing else {}
+    emb_of.update({k: r["emb"] for k, r in pre.items()})
+    img = np.stack([emb_of[id(o)] for o in objs])
+    sims = img @ _name_emb(q)
     qcol = words & COLOURS
     out = []
     for o, emb, s in zip(objs, img, sims):
@@ -175,7 +213,10 @@ def rank(objs: list, text: str, store=None) -> list:
             score += SHAPE_BONUS if o.length_px / max(o.width_px, 1.0) > 2.0 else -SHAPE_BONUS
         o.recognised, o.recognised_names = None, []
         if store is not None:
-            lab, names, _ = recognise(emb, store, colour=o.colour, height_mm=o.height_mm)
+            if id(o) in pre:
+                lab, names = pre[id(o)]["label"], pre[id(o)]["names"]
+            else:
+                lab, names, _ = recognise(emb, store, colour=o.colour, height_mm=o.height_mm)
             o.recognised, o.recognised_names = lab, names
             if lab is not None:
                 score += LABEL_BONUS if name_matches(q, names) else -LABEL_PENALTY
@@ -183,16 +224,19 @@ def rank(objs: list, text: str, store=None) -> list:
     return sorted(out, key=lambda t: -t[1])
 
 
-def best(objs: list, text: str, store=None) -> dict:
+def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
     """
     The object to pick for `text`, or a reason not to pick anything.
 
     WHY: rank() always returns something, so "green square" with no green object on the table would grab a
     laptop key, and with only the green cylinder in view it would grab the cylinder. Refuses when the colour
     is wrong, when the library recognises the best candidate as a different object, or when the match is weak.
+    `recognised`: recognise_all() output; then objs may be None and no crop is embedded again.
     Returns {"obj", "score", "margin", "ambiguous", "reason", "recognised"}; obj is None when refusing.
     """
-    r = rank(objs, text, store)
+    if objs is None:
+        objs = [r["obj"] for r in recognised or []]
+    r = rank(objs, text, store, recognised)
     if not r:
         return {"obj": None, "score": 0.0, "margin": 0.0, "ambiguous": False, "reason": "no objects on the table",
                 "recognised": None}
