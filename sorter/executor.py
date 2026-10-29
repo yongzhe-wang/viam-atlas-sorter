@@ -265,10 +265,29 @@ async def recover(rig, doc: dict) -> None:
         doc["fail_reason"] = f"{doc.get('fail_reason')} | recovery failed: {e}"
 
 
+FREE_SPOTS_FILE = Path(__file__).resolve().parent.parent / "data" / "scan" / "free_spots.json"
+
+
+def candidate_spots(n: int = 8) -> list:
+    """
+    Drop candidates: free spots measured by the table survey (scripts/survey_scan.py), nearest-agnostic
+    shuffle; random points in RESET_X x RESET_Y only if no survey exists. Each is re-checked live anyway.
+    """
+    import json
+
+    try:
+        spots = [tuple(s) for s in json.loads(FREE_SPOTS_FILE.read_text())]
+    except (OSError, ValueError):
+        spots = []
+    random.shuffle(spots)
+    if spots:
+        return spots[: max(n, 12)]
+    return [(random.uniform(*RESET_X), random.uniform(*RESET_Y)) for _ in range(n)]
+
+
 async def drop_somewhere(rig, height: float, grip: float) -> tuple:
-    """Put the held object at a random free spot (not near the square, no object within ~90 mm); returns (x, y)."""
-    for _ in range(8):
-        x, y = random.uniform(*RESET_X), random.uniform(*RESET_Y)
+    """Put the held object at a free spot (not near the square, no object within ~90 mm); returns (x, y)."""
+    for x, y in candidate_spots():
         if not 150.0 <= math.hypot(x, y) <= 600.0 or not ppa.allowed(x, y):
             continue
         print(f"reset: trying ({x:.0f},{y:.0f})")

@@ -59,6 +59,24 @@ def in_square(rgb: np.ndarray, tracker=None):
     return bool(xs.min() <= blk[0] <= xs.max() and ys.min() <= blk[1] <= ys.max())
 
 
+def survey_block():
+    """
+    Flange x/y of the yellow block from data/scan/objects.json (scripts/survey_scan.py), or None.
+
+    The yellow cylinder lying on the table is ~45 mm tall, the block ~32 mm, so the shortest yellow wins.
+    """
+    try:
+        objs = json.loads((DATA / "scan" / "objects.json").read_text())
+    except (OSError, ValueError):
+        return None
+    yellow = [o for o in objs if o.get("colour") == "yellow" and 15 <= o.get("height_mm", 0) <= 40]
+    if not yellow:
+        return None
+    best = min(yellow, key=lambda o: abs(o["height_mm"] - 32.0))
+    print(f"survey: yellow block at ({best['x']:.0f},{best['y']:.0f}), {best['height_mm']} mm tall")
+    return best["x"], best["y"]
+
+
 def open_store():
     """sorter.store.Store if AGENT 2's module has landed, else None (JSONL fallback)."""
     sys.path.insert(0, str(ROOT))
@@ -152,7 +170,7 @@ async def main(n: int) -> None:
         # A previous process may have died holding the block: put it in the square first
         await executor.resume(rig, store)
         # Where the block is if the square starts empty (env BLOCK_XY="x,y", flange mm); else from the resets
-        block_xy = tuple(map(float, os.environ["BLOCK_XY"].split(","))) if os.environ.get("BLOCK_XY") else None
+        block_xy = tuple(map(float, os.environ["BLOCK_XY"].split(","))) if os.environ.get("BLOCK_XY") else survey_block()
         # Empty the square first, so trial 1 is a real pick-into-square
         cleared = await executor.clear_square(rig, store)
         print(f"reset: {cleared['status']} removed={cleared['removed']} wipes={cleared['wipes']} {cleared['duration_s']}s")
