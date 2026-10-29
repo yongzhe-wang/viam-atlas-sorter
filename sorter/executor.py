@@ -6,11 +6,11 @@ between runs without a person. The arm mechanics (servo, depth heights, reconnec
 square search) live in scripts/pick_place_auto.py; this module adds object choice and tracking for
 arbitrary objects, the in-square check, and the reset.
 
-Flow, execute(text, target=None, target_xy=None): object from a given frame (target), from one look at a
-table xy (target_xy, e.g. the table map), or found by looking around -> square from that same frame (else the
-last known square, else search while carrying) -> ObjTracker -> ppa.pick -> ppa.place_in_square ->
-objects_in_hole check -> Store.log_attempt -> back to the observe pose.
-sweep_table(): theta 0 frames over the whole reachable table for sorter.table_map (AGENT3) to build a map.
+Flow, execute(text, target=None, target_xy=None): object from a given frame (target), else search_and_find
+(current frame -> hint xy, e.g. the table map -> sweep poses nearest-first, stopping at the first frame that
+shows it) -> square from any frame seen so far (else the last known square, else search while carrying) ->
+ObjTracker -> ppa.pick -> ppa.place_in_square -> objects_in_hole check -> Store.log_attempt -> observe pose.
+sweep_table(): theta 0 frames over the whole reachable table, only for an explicit "scan the table" command.
 Flow, clear_square(): find square -> each object in the hole: pick (<= 2 tries) -> place_at random free spot;
 failed pick -> wipe (<= 2 passes) -> verify hole empty by depth -> Store.log_attempt(mode="reset").
 Contract: docs/EXEC_PLAN.md (Command flow, Reset).
@@ -37,8 +37,6 @@ MAX_OPEN_MM = 78.0  # jaws open ~84 mm; keep a margin so the fingers clear the s
 COLOUR_TOL = 60.0  # RGB distance that still counts as the object at close range (grey/black/white objects)
 HUE_TOL = 9  # PIL hue units (~13 deg) for saturated objects: hue barely changes when the block looks brighter up close
 SAT_REF = 90  # PIL saturation above which an object is "coloured" and tracked by hue
-# Where to look for objects, flange x/y mm: home first, then the square-search grid
-OBSERVE_XY = [ppa.HOME_XY] + ppa.SEARCH_XY
 # Random drop area for reset, flange x/y mm (see run_trials.RESET_*); place_at refuses occupied/square spots
 RESET_X = (230.0, 380.0)
 RESET_Y = (-220.0, 220.0)
@@ -87,9 +85,9 @@ def publish_frame(store, rgb: np.ndarray, seg, phase: str, scores: dict = None) 
 
 
 async def apply_limits(rig) -> None:
-    """Obstacle keep-outs (ppa.apply_workspace_limits) applied to OBSERVE_XY and the reset rectangle; logged."""
+    """Obstacle keep-outs (ppa.apply_workspace_limits) applied to the sweep/search poses and the reset rectangle; logged."""
     await ppa.apply_workspace_limits(rig)
-    OBSERVE_XY[:] = [q for q in OBSERVE_XY if ppa.allowed(*q)]
+    SWEEP_XY[:] = [q for q in SWEEP_XY if ppa.allowed(*q)]
     global RESET_X, RESET_Y
     for x0, x1, y0, y1 in ppa.KEEP_OUT:
         # A keep-out spanning the whole rectangle in one axis cuts the other axis; partial ones are point-checked
@@ -97,7 +95,7 @@ async def apply_limits(rig) -> None:
             RESET_X = (x1, RESET_X[1]) if x0 <= RESET_X[0] else (RESET_X[0], x0)
         if x0 <= RESET_X[0] and x1 >= RESET_X[1] and y1 > RESET_Y[0] and y0 < RESET_Y[1]:
             RESET_Y = (y1, RESET_Y[1]) if y0 <= RESET_Y[0] else (RESET_Y[0], y0)
-    print(f"  workspace: {len(OBSERVE_XY)} observe points, reset x[{RESET_X[0]:.0f},{RESET_X[1]:.0f}] "
+    print(f"  workspace: {len(SWEEP_XY)} search poses, reset x[{RESET_X[0]:.0f},{RESET_X[1]:.0f}] "
           f"y[{RESET_Y[0]:.0f},{RESET_Y[1]:.0f}]")
 
 
@@ -160,7 +158,14 @@ def square_from_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intrinsics
     """
     if depth is None or abs(float(pose.get("theta", 0.0))) > 1.0:
         return None
+    # find_square remembers the hole's pixel size for occluded views while carrying at ALIGN_Z; a search frame
+    # from z 580 sees the hole ~30% smaller, so keep the size it had unless this frame is at ALIGN_Z too
+    size = ppa.SQUARE_SIZE.get("wh")
     hit = ppa.find_square(rgb)
+    if abs(float(pose.get("z", ppa.ALIGN_Z)) - ppa.ALIGN_Z) > 15.0:
+        ppa.SQUARE_SIZE.pop("wh", None)
+        if size is not None:
+            ppa.SQUARE_SIZE["wh"] = size
     if hit is None:
         return None
     table, _ = ppa.table_and_near(depth)
@@ -408,36 +413,91 @@ async def look_here(rig, text: str, store, source: str = "demo") -> dict:
     return found
 
 
-async def find_target(rig, text: str, store) -> dict:
-    """
-    Look from the current pose, then OBSERVE_XY, for the object best matching `text` (outside the square).
+def hint_for(text: str, store):
+    """Table xy where the object memory last saw what `text` names (clip_embed.where_is), or None; never fails."""
+    try:
+        w = clip_embed.where_is(store, text)
+    except Exception as e:
+        print(f"  no last sighting: {e}")
+        return None
+    return tuple(w["xy"]) if w else None
 
-    Stops early when best() says the thing is not something the library knows ("searchable" False): looking
-    elsewhere cannot help. Returns look_here()'s dict plus "path" (current / grid); obj None if no match.
+
+async def search_and_find(rig, text: str, store, hint_xy=None) -> dict:
     """
+    Look for `text`, stopping at the FIRST frame whose best() accepts an object; no whole-table sweep first.
+
+    WHY: the user wants "just search, and if found just start the grasp; do NOT have an initial step". The old
+    module flow swept all 4 poses, built the map, then went back to look again before picking.
+    {VIAM CENTERAL 2026-10-29 "ON THE FIRST ACCEPTANCE STOP AND HAND THAT TARGET, WITH ITS FRAME POSE, STRAIGHT TO PICK"}
+    [CONFIDENCE: CONFIRMED 90% — user correction relayed by the coordinator]
+    Order: the current frame (no move) -> the hint (live map / last sighting, looked at from ALIGN_Z with it
+    near the image centre) -> SWEEP_XY at SWEEP_Z, each next pose the nearest to where the arm is. One frame
+    per pose; every frame still reaches the live map (Rig.frame -> on_map_frame). An ambiguous match stops at
+    once (another view does not make two equal matches unequal). "Not found" only after every pose was seen.
+    Returns look_here()'s dict + "path" (current / hint / sweep) and "views"; when the found frame has no
+    square but an earlier one did, "square" is that one and "square_from" is "search".
+    """
+    hint_xy = hint_xy if hint_xy is not None else hint_for(text, store)
+    poses = []
+    if hint_xy is not None:
+        fx, fy = perception.look_flange_xy(tuple(hint_xy))
+        # Same reach limits as every other look: keep-outs and the 120 mm base clearance
+        if ppa.allowed(fx, fy) and math.hypot(fx, fy) >= 120.0:
+            poses.append(("hint", fx, fy, ppa.ALIGN_Z))
+    left = [q for q in SWEEP_XY if ppa.allowed(*q) and 150.0 <= math.hypot(*q) <= 600.0]
     p = await rig.pose()
-    poses = [None] + sorted(OBSERVE_XY, key=lambda q: math.hypot(q[0] - p.x, q[1] - p.y))
-    last = {"obj": None, "reason": "nothing seen"}
-    for xy in poses:
-        if xy is not None:
-            await ppa.travel(rig, *xy, theta=0.0)
-        found = await look_here(rig, text, store)
-        found["path"] = "current" if xy is None else "grid"
+    at = (p.x, p.y) if not poses else poses[0][1:3]
+    while left:
+        # Greedy nearest-next: from the hint pose (or the current pose) to the closest unseen sweep pose
+        q = min(left, key=lambda c: math.hypot(c[0] - at[0], c[1] - at[1]))
+        left.remove(q)
+        poses.append(("sweep", q[0], q[1], SWEEP_Z))
+        at = q
+    square, views, last = None, 0, {"obj": None, "reason": "nothing seen"}
+    for path, x, y, z in [("current", None, None, None)] + poses:
+        if path != "current":
+            await ppa.travel(rig, x, y, theta=0.0, z=z)
+        found = await look_here(rig, text, store, source="look" if path == "hint" else "demo")
+        views += 1
+        found.update(path=path, views=views)
+        square = found.get("square") or square
         if found.get("obj") is not None:
+            if found.get("square") is None and square is not None:
+                found.update(square=square, square_from="search")
+            print(f"  search: found at view {views} ({path})")
             return found
         last = found
-        if found.get("searchable") is False:
-            break
+    last["reason"] = f"no {text!r} on the table after {views} views ({last.get('reason')})"
     return last
 
 
-async def look_at(rig, table_xy, text: str, store) -> dict:
-    """One look at a table x/y (e.g. from the table map): move so it is near the image centre, then look_here."""
-    fx, fy = perception.look_flange_xy(tuple(table_xy))
+async def approach(rig, found: dict, tracker) -> None:
+    """
+    Put the arm where ppa.pick starts (ALIGN_Z, theta 0) with the found object near the image centre, and move
+    the tracker's seed pixel with it; no new look.
+
+    WHY: pick() drops straight to ALIGN_Z at its current xy, but from a SWEEP_Z frame an object near the image
+    edge would leave the narrower ALIGN_Z view (~300 x 540 mm vs ~445 x 790 mm). So: table xy of the object's top
+    (perception.world_xy) -> flange that centres it (look_flange_xy) -> its pixel there (project_xy, camera
+    SWEEP_Z - ALIGN_Z closer). Nothing to do when the frame was already taken at ALIGN_Z, theta 0.
+    """
+    pose = found["pose"]
+    if abs(pose["z"] - ppa.ALIGN_Z) <= 15.0 and abs(pose["theta"]) <= 1.0:
+        return
+    obj, k = found["obj"], intr(rig)
+    u, v = obj.top_centroid_px or obj.centroid_px
+    xy = perception.world_xy(pose, k, u, v, obj.top_depth_mm)
+    fx, fy = perception.look_flange_xy(xy)
     if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
-        return {"obj": None, "reason": f"look pose ({fx:.0f},{fy:.0f}) is out of reach"}
+        fx, fy = pose["x"], pose["y"]  # centring pose out of reach: drop straight down from where it was seen
     await ppa.travel(rig, fx, fy, theta=0.0)
-    return await look_here(rig, text, store, source="look")
+    # Camera height above the object shrinks by the z change; the wrist angle does not change it
+    top = obj.top_depth_mm - (pose["z"] - ppa.ALIGN_Z)
+    seed = perception.project_xy({"x": fx, "y": fy, "z": ppa.ALIGN_Z, "theta": 0.0}, k, xy, top)
+    tracker.far_uv = tracker.uv = (float(seed[0]), float(seed[1]))
+    print(f"  approach: object at ({xy[0]:.0f},{xy[1]:.0f}) -> flange ({fx:.0f},{fy:.0f}) z {ppa.ALIGN_Z:.0f}, "
+          f"seed px ({seed[0]:.0f},{seed[1]:.0f})")
 
 
 def save_frame(out: Path, k: int, fr: dict) -> None:
@@ -455,6 +515,7 @@ def save_frame(out: Path, k: int, fr: dict) -> None:
 async def sweep_table(rig, progress=None) -> list:
     """
     Frames over the whole reachable table for sorter.table_map.map_from_frames (AGENT3); ends at observe.
+    Only for an explicit "scan the table" command: a grasp never sweeps first (search_and_find stops early).
 
     Each frame: {"id", "rgb", "depth" (uint16 mm, aligned), "pose", "intrinsics"} plus "square" when the hole
     is fully in view. progress(k, n) is called after each pose (dashboard: "scanning table... k/n").
@@ -492,9 +553,10 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
 
     target: clip_embed.best() dict + "rgb", "depth", "pose", "ts" from a frame the caller already took at the
       observe pose (theta within +-1 deg): no observe move, pick at once. Ignored if its theta is off.
-    target_xy: table x/y (e.g. from the table map): one look there, then pick; "not where the map said" if absent.
-    Neither: look around (find_target). The square comes from the same frame when visible, else LAST_SQUARE
-    (< SQUARE_CACHE_S old), else is searched while carrying. Always ends at the observe pose.
+    target_xy: a hint, table x/y where it was last seen (live map): search_and_find looks there right after the
+      current frame, then keeps searching if it is gone. None: the object memory's last sighting is the hint.
+    The square comes from the found frame, else any frame of this search, else LAST_SQUARE (< SQUARE_CACHE_S
+    old), else it is searched only while carrying. Always ends at the observe pose.
     Never raises for an ordinary failure: status is done / not_found / ambiguous / too_wide / failed.
     """
     doc = {"ts": time.time(), "mode": mode, "target_text": text, "success": False, "status": "failed",
@@ -515,16 +577,9 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
                 await ppa.travel(rig, tp["x"], tp["y"], theta=0.0, z=tp["z"])
             if found.get("square") is None:
                 found["square"] = square_from_frame(found["rgb"], found.get("depth"), tp, intr(rig))
-        elif target_xy is not None:
-            found = await look_at(rig, target_xy, text, store)
-            doc["find_path"] = "map"
-            if found.get("obj") is None:
-                doc.update(status="not_found", fail_phase="find",
-                           fail_reason=f"not where the map said ({found.get('reason')})")
-                return doc
         else:
-            found = await find_target(rig, text, store)
-            doc["find_path"] = found.get("path")
+            found = await search_and_find(rig, text, store, hint_xy=target_xy)
+            doc["find_path"], doc["find_views"] = found.get("path"), found.get("views")
         obj = found.get("obj")
         if obj is None:
             doc.update(status="not_found", fail_phase="find", fail_reason=found.get("reason"))
@@ -538,13 +593,15 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if width_mm(obj, rig.fx) > MAX_OPEN_MM:
             doc.update(status="too_wide", fail_phase="find", fail_reason=f"{width_mm(obj, rig.fx):.0f} mm across")
             return doc
-        # Where to put it: same frame, else the last known square, else search while carrying (offset servo)
+        # Where to put it: a frame of this search, else the last known square, else search while carrying
         square_xy, doc["square_path"] = None, "search"
         if found.get("square"):
-            square_xy, doc["square_path"] = tuple(found["square"]["xy"]), "frame"
+            square_xy, doc["square_path"] = tuple(found["square"]["xy"]), found.get("square_from", "frame")
         elif LAST_SQUARE["xy"] is not None and time.time() - LAST_SQUARE["ts"] < SQUARE_CACHE_S:
             square_xy, doc["square_path"] = LAST_SQUARE["xy"], "cache"
         tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store)
+        # Found from a sweep pose (z 580): centre it at ALIGN_Z, where pick starts, without another look
+        await approach(rig, found, tracker)
         height, grip = await ppa.pick(rig, times, tracker, verify=lambda: verify_target(rig, text, store))
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy)
