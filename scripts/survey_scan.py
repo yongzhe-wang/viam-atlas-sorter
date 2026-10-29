@@ -35,6 +35,7 @@ MERGE_MM = 60.0  # objects closer than this across frames are the same object
 FREE_STEP_PX = 40  # candidate spacing for free spots in each frame
 FREE_CLEAR_PX = 150.0  # ~60 mm at the table depth seen from z=400: object/paper clearance
 REACH = (150.0, 600.0)  # flange distance from the base the arm has used safely
+VETO_MM = 15.0  # a "not free" sample this close to a free one (another frame, same place) vetoes it
 
 
 def pixel_to_world(rig, pose, u: float, v: float, depth: float) -> tuple:
@@ -79,6 +80,60 @@ def person(seg) -> bool:
     return any("skin 0%" not in i["reason"] for i in seg.intruders)
 
 
+def frame_free_samples(rig, pose, rgb: np.ndarray, depth: np.ndarray, table: float) -> list:
+    """
+    (x, y, free?) samples on a pixel grid, only where the whole clearance window lies inside the frame.
+
+    WHY: windows reaching past the border were counted as occupied (outside = "bad"), and every such edge
+    sample vetoed free samples from neighbouring frames: the first survey found 0 free spots.
+    """
+    ok = free_mask(rgb, depth)
+    m = int(FREE_CLEAR_PX) + 4
+    out = []
+    for v in range(m, ppa.FINGER_ROW - m, FREE_STEP_PX):
+        for u in range(m, rgb.shape[1] - m, FREE_STEP_PX):
+            wx, wy = pixel_to_world(rig, pose, u, v, table)
+            out.append((wx, wy, bool(ok[v, u])))
+    return out
+
+
+def merge_free(samples: list) -> list:
+    """
+    Spots free in some frame, not vetoed by another frame at the same place (VETO_MM), in reach, >= 50 mm apart.
+
+    The 60 mm clearance is already inside each sample; a 40 mm veto on top of it demanded ~100 mm and left
+    1 spot on the crowded table. The veto only has to catch frames that disagree about the same place.
+    """
+    bad = np.array([(x, y) for x, y, f in samples if not f]) if samples else np.zeros((0, 2))
+    spots = []
+    for x, y, f in samples:
+        if not f or not ppa.allowed(x, y) or not REACH[0] <= math.hypot(x, y) <= REACH[1]:
+            continue
+        if len(bad) and np.min(np.hypot(bad[:, 0] - x, bad[:, 1] - y)) < VETO_MM:
+            continue
+        if all(math.hypot(x - s[0], y - s[1]) > 50.0 for s in spots):
+            spots.append((round(x), round(y)))
+    return spots
+
+
+def recompute_free() -> list:
+    """Free spots from the saved frames in data/scan (no arm needed); rewrites free_spots.json."""
+    from types import SimpleNamespace
+
+    samples = []
+    for meta_file in sorted(OUT.glob("[0-9][0-9][0-9].json")):
+        meta = json.loads(meta_file.read_text())
+        rgb = np.asarray(Image.open(meta_file.with_suffix(".jpg")).convert("RGB"))
+        depth = np.load(str(meta_file.with_suffix("")) + "_depth.npy").astype(float)
+        rig = SimpleNamespace(**meta["intrinsics"])
+        table, _ = ppa.table_and_near(depth)
+        samples += frame_free_samples(rig, SimpleNamespace(**meta["pose"]), rgb, depth, table)
+    spots = merge_free(samples)
+    (OUT / "free_spots.json").write_text(json.dumps(spots))
+    print(f"free spots: {len(spots)} from {len(samples)} samples ({sum(f for *_, f in samples)} free)")
+    return spots
+
+
 async def capture(rig, n: int, kind: str, extra: dict = None) -> tuple:
     """If a person is in view wait up to 10 s, then save frame n; returns (rgb, depth, pose, seg)."""
     t0 = time.monotonic()
@@ -120,11 +175,7 @@ async def main() -> None:
                 objects.append({"x": wx, "y": wy, "colour": o.colour, "height_mm": round(o.height_mm, 1),
                                 "edge": bool(o.touches_edge), "frame": n - 1})
             # Free-spot samples on a pixel grid
-            ok = free_mask(rgb, depth)
-            for v in range(FREE_STEP_PX, ppa.FINGER_ROW, FREE_STEP_PX):
-                for u in range(FREE_STEP_PX, rgb.shape[1] - FREE_STEP_PX, FREE_STEP_PX):
-                    wx, wy = pixel_to_world(rig, p, u, v, table)
-                    free_samples.append((wx, wy, bool(ok[v, u])))
+            free_samples += frame_free_samples(rig, p, rgb, depth, table)
         # Merge objects seen from several grid points (prefer fully visible sightings)
         merged = []
         for o in sorted(objects, key=lambda o: o["edge"]):
@@ -137,16 +188,7 @@ async def main() -> None:
         for m in merged:
             print(f"  {m['colour']:7s} at ({m['x']:.0f},{m['y']:.0f}) h={m['height_mm']} mm, {m['reach_mm']} mm from base"
                   f"{'' if m['reachable'] else '  <- NOT reachable'}")
-        # Free spots: free in some frame and not contradicted by any frame within 40 mm
-        bad = np.array([(x, y) for x, y, f in free_samples if not f]) if free_samples else np.zeros((0, 2))
-        spots = []
-        for x, y, f in free_samples:
-            if not f or not ppa.allowed(x, y) or not REACH[0] <= math.hypot(x, y) <= REACH[1]:
-                continue
-            if len(bad) and np.min(np.hypot(bad[:, 0] - x, bad[:, 1] - y)) < 40.0:
-                continue
-            if all(math.hypot(x - s[0], y - s[1]) > 50.0 for s in spots):
-                spots.append((round(x), round(y)))
+        spots = merge_free(free_samples)
         (OUT / "free_spots.json").write_text(json.dumps(spots))
         (OUT / "objects.json").write_text(json.dumps(merged, indent=1))
         print(f"survey: {len(spots)} free drop spots -> {OUT / 'free_spots.json'}")
@@ -162,4 +204,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # --free-only: recompute free_spots.json from the saved frames without moving the arm
+    if "--free-only" in sys.argv:
+        recompute_free()
+    else:
+        asyncio.run(main())
