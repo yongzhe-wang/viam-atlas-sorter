@@ -23,6 +23,10 @@ from scipy import ndimage
 MIN_HEIGHT_MM = 8.0  # objects stand at least this far above the fitted table plane
 MAX_OBJ_HEIGHT_MM = 100.0  # taller is not a graspable object (blocks are < 80 mm): hand or arm
 MIN_AREA_PX = 800  # ~12x12 mm at the 378 mm observe depth (about 2.4 px/mm)
+# Pixel-area thresholds are tuned at the z=400 observe pose (table ~376 mm away). Higher sweep poses (z 480-550,
+# table ~460-530 mm) shrink every object by (depth ratio)^2, so areas scale with the measured table depth;
+# capped at 1 so z=400 frames are processed exactly as before.
+REF_TABLE_DEPTH_MM = 380.0
 CROP_MARGIN = 0.15  # crop = bbox grown by this fraction on each side
 # depth -> colour pixel model: colour = scale * (depth - centre) + centre + (tu, tv)
 IDENTITY = (1.0, 0.0, 0.0)  # align_color_depth on
@@ -105,6 +109,7 @@ class Obj:
     colour: str = ""  # dominant colour word of the mask, see colour_name()
     rect_fill: float = 1.0  # top face hull / min-area rectangle: square/rectangle ~1.0, disc ~0.81
     top_centroid_px: tuple = ()  # centroid of the top face: above the object's axis from any view angle
+    colours: dict = field(default_factory=dict)  # share of each saturated colour family in the mask (>= 2%)
 
 
 @dataclass
@@ -261,7 +266,12 @@ def skin_fraction(rgb: np.ndarray, mask: np.ndarray) -> float:
     return float(((cr > 140) & (cr < 175) & (cb > 85) & (cb < 125) & (y > 60)).mean())
 
 
-def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple) -> list:
+def area_scale(table_depth_mm: float) -> float:
+    """Factor for pixel-area thresholds at this table depth: 1 at the observe pose, ~0.5 at z 550."""
+    return min(1.0, (REF_TABLE_DEPTH_MM / max(table_depth_mm, 1.0)) ** 2)
+
+
+def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple, scale: float = 1.0) -> list:
     """
     Hands/arms: large invalid-depth regions that are skin-coloured.
 
@@ -280,7 +290,7 @@ def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple) -> list:
     for i in range(1, n + 1):
         m = lab == i
         area = int(m.sum())
-        if area < INTRUDER_MIN_AREA_PX:
+        if area < INTRUDER_MIN_AREA_PX * scale:
             continue
         vs, us = np.nonzero(m)
         bbox = (int(us.min()), int(vs.min()), int(us.max()), int(vs.max()))
@@ -320,6 +330,9 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
     lab_c = to_colour(lab_d, model)
     _mask_fingers(lab_c)
     H, W = d.shape
+    table_depth = float(a * W / 2 + b * H / 2 + c)
+    ascale = area_scale(table_depth)
+    min_area = MIN_AREA_PX * ascale
     poly = load_workspace()
     objs, excluded, intruders = [], [], []
     # Work on each object's bounding sub-array: a full 1280x720 comparison per label (including hundreds of
@@ -331,10 +344,10 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         if sd is None or sc is None:
             continue  # unseeded, or mapped outside the colour view / onto the fingertips
         m_d = lab_d[sd] == i
-        if m_d.sum() < MIN_AREA_PX:
+        if m_d.sum() < min_area:
             continue
         m_s = lab_c[sc] == i
-        if m_s.sum() < MIN_AREA_PX // 2:
+        if m_s.sum() < min_area // 2:
             continue
         cv0, cu0 = sc[0].start, sc[1].start
         top_h = float(np.percentile(height[sd][m_d], 90))
@@ -361,7 +374,7 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
             full_d = np.zeros((H, W), bool)
             full_d[sd] = m_d & (height[sd] >= top_h - TOP_BAND_MM)
             top_s = to_colour(full_d, model)[sc] & m_s
-        if top_s.sum() < 200:
+        if top_s.sum() < 200 * ascale:
             top_s = m_s
         tvs, tus = np.nonzero(top_s)
         e = EDGE_MARGIN_PX
@@ -369,7 +382,8 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         o = Obj(id=0, bbox=bbox, centroid_px=cen, yaw_deg=yaw, length_px=L, width_px=Wd, height_mm=top_h,
                 top_depth_mm=float(np.percentile(d[sd][m_d], 10)), mask=m, crop=crop, touches_edge=edge,
                 colour=colour_name(rgb[sc], m_s)[0], rect_fill=rect_fill(top_s),
-                top_centroid_px=(float(cu0 + tus.mean()), float(cv0 + tvs.mean())))
+                top_centroid_px=(float(cu0 + tus.mean()), float(cv0 + tvs.mean())),
+                colours=colour_fractions(rgb[sc], m_s))
         # Only fully visible objects inside the workspace are targets; the rest is kept for display/debug
         if edge:
             excluded.append((o, "touches the image edge"))
@@ -380,8 +394,8 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
             objs.append(o)
     for k, (o, _) in enumerate(excluded):
         o.id = -1 - k  # negative ids never collide with targets
-    intruders += find_intruders(rgb, valid, model)
-    return Segmentation(table_depth_mm=float(a * W / 2 + b * H / 2 + c), objects=objs, excluded=excluded,
+    intruders += find_intruders(rgb, valid, model, ascale)
+    return Segmentation(table_depth_mm=table_depth, objects=objs, excluded=excluded,
                         intruders=intruders, align=model, plane=(a, b, c))
 
 
@@ -436,6 +450,38 @@ def segment(rgb: np.ndarray, depth: np.ndarray) -> tuple:
     return s.table_depth_mm, s.objects
 
 
+HUE_BINS = [(0, 15, "red"), (15, 40, "orange"), (40, 70, "yellow"), (70, 165, "green"),
+            (165, 200, "cyan"), (200, 260, "blue"), (260, 330, "purple"), (330, 361, "red")]
+
+
+def _hue_sat(rgb: np.ndarray, mask: np.ndarray) -> tuple:
+    """(hue degrees, saturated?, max channel) per masked pixel, 0-1 scale."""
+    px = rgb[mask].astype(float) / 255.0
+    mx, mn = px.max(1), px.min(1)
+    d = np.maximum(mx - mn, 1e-6)
+    s = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0)
+    r, g, b = px[:, 0], px[:, 1], px[:, 2]
+    hue = np.where(mx == r, ((g - b) / d) % 6, np.where(mx == g, (b - r) / d + 2, (r - g) / d + 4)) * 60.0
+    # Dark pixels carry a faint hue from white balance; a black charger read "blue" before this
+    return hue, (s > 0.35) & (mx > 0.3), mx
+
+
+def colour_fractions(rgb: np.ndarray, mask: np.ndarray) -> dict:
+    """
+    Share of the mask in each saturated colour family (only families >= 2%).
+
+    WHY: the dominant colour of both screwdrivers is "black" (handles), so only the secondary colour tells the
+    blue one (blue 0.33-0.38) from the red one (red 0.31, blue 0.00); stray hue on black objects stays <= 0.06.
+    """
+    if not mask.any():
+        return {}
+    hue, sat, _ = _hue_sat(rgb, mask)
+    out = {}
+    for lo, hi, nm in HUE_BINS:
+        out[nm] = out.get(nm, 0.0) + float((sat & (hue >= lo) & (hue < hi)).mean())
+    return {k: round(v, 3) for k, v in out.items() if v >= 0.02}
+
+
 def colour_name(rgb: np.ndarray, mask: np.ndarray) -> tuple:
     """
     Dominant colour word of the masked pixels and the fraction of pixels that have it.
@@ -443,22 +489,14 @@ def colour_name(rgb: np.ndarray, mask: np.ndarray) -> tuple:
     Saturated pixels vote by hue (degrees); low saturation splits into white / grey / black by value.
     Hue bins chosen by eye on sfhack4 frames (the yellow block is ~55 deg, the blue tape ~210 deg).
     """
-    px = rgb[mask].astype(float) / 255.0
-    if len(px) == 0:
+    if not mask.any():
         return "unknown", 0.0
-    mx, mn = px.max(1), px.min(1)
-    d = np.maximum(mx - mn, 1e-6)
-    s = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0)
-    r, g, b = px[:, 0], px[:, 1], px[:, 2]
-    hue = np.where(mx == r, ((g - b) / d) % 6, np.where(mx == g, (b - r) / d + 2, (r - g) / d + 4)) * 60.0
-    names = np.full(len(px), "grey", dtype=object)
-    # Dark pixels carry a faint hue from white balance; a black charger read "blue" before this
-    sat = (s > 0.35) & (mx > 0.3)
+    hue, sat, mx = _hue_sat(rgb, mask)
+    names = np.full(len(hue), "grey", dtype=object)
     names[~sat & (mx > 0.8)] = "white"
     names[mx <= 0.3] = "black"
-    for lo, hi, nm in [(0, 15, "red"), (15, 40, "orange"), (40, 70, "yellow"), (70, 165, "green"),
-                       (165, 200, "cyan"), (200, 260, "blue"), (260, 330, "purple"), (330, 361, "red")]:
+    for lo, hi, nm in HUE_BINS:
         names[sat & (hue >= lo) & (hue < hi)] = nm
     vals, counts = np.unique(names, return_counts=True)
     k = int(np.argmax(counts))
-    return str(vals[k]), float(counts[k] / len(px))
+    return str(vals[k]), float(counts[k] / len(hue))

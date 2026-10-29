@@ -54,9 +54,24 @@ AMBIGUOUS_MARGIN = 0.02  # top-1 minus top-2 below this: let the user confirm in
 _model = _preprocess = _tokenizer = None
 
 
+COLOUR_PRESENT_FRAC = 0.10  # blue screwdriver 0.33-0.38 blue, red one 0.31 red; stray hue on black objects <= 0.06
+
+
 def colour_ok(query_colours: set, obj_colour: str) -> bool:
     """True if the object's colour is one a person could call by any of the query's colour words."""
     return any(obj_colour in COMPATIBLE.get(c, {c}) for c in query_colours)
+
+
+def colour_present(query_colours: set, obj) -> bool:
+    """
+    The query's colour is the object's dominant colour, or makes up >= COLOUR_PRESENT_FRAC of it.
+
+    WHY: both screwdrivers are dominantly "black" (handles); only the secondary colour tells "blue screwdriver"
+    from "red screwdriver". Objects without colour shares (older records) fall back to the dominant colour.
+    """
+    shares = getattr(obj, "colours", None) or {}
+    return colour_ok(query_colours, obj.colour) or any(
+        f >= COLOUR_PRESENT_FRAC and colour_ok(query_colours, c) for c, f in shares.items())
 
 
 def _load():
@@ -261,7 +276,7 @@ def rank(objs: list, text: str, store=None, recognised: list = None) -> list:
     for o, emb, s in zip(objs, img, sims):
         score = float(s)
         if qcol:
-            if colour_ok(qcol, o.colour):
+            if colour_present(qcol, o):
                 score += COLOUR_BONUS
             elif o.colour in COLOURS - {"grey", "white", "black"}:
                 score -= COLOUR_PENALTY
@@ -307,9 +322,9 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
     # The library knows this query ("candy" is an alias of the KIND bar): then only an object recognised as it
     # may be picked. Without this, "candy" with the bar out of view picked an unrecognised cup fragment.
     named = o.recognised is not None and name_matches(text, o.recognised_names)
-    # Recognised as exactly what was named beats the dominant-colour heuristic: the blue screwdriver's handle is
-    # mostly black, and "blue screwdriver" was refused with "no blue object found" while recognised at 0.98
-    if qcol and not colour_ok(qcol, o.colour) and not named:
+    # Colour by presence, not dominance: the blue screwdriver is dominantly black but 0.38 blue, and the red one
+    # (0.31 red, no blue) once got recognised as "blue screwdriver" on the table map; presence rejects that one
+    if qcol and not colour_present(qcol, o):
         out["reason"] = f"no {'/'.join(sorted(qcol))} object found"
     elif o.recognised is not None and not named:
         out["reason"] = f"best candidate is recognised as {o.recognised!r}"
