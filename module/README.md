@@ -92,6 +92,16 @@ DASH_COMMAND_PATH=module VIAM_MACHINE_ADDRESS=... VIAM_API_KEY_ID=... VIAM_API_K
 4. Optional: `data/workspace.json`, a polygon `[[u, v], ...]` in colour pixels, limits where objects may be
    picked from.
 
+## Object library (what "green square" is matched against)
+
+`build.sh` bundles `data/views.jsonl` (labelled CLIP embeddings from `scripts/capture_views.py` /
+`scripts/label_scan.py`) and the crop images they reference into `library/` in the archive. Without Atlas, the
+module copies that library into `$VIAM_MODULE_DATA/data` at startup, but only when it is missing or the
+bundle's content hash changed. That folder also holds everything the module writes (attempts, commands,
+status), so redeploys never lose run data. `{"status": true}` reports `"library": {"labels": N, "views": M}`; check it
+after a deploy. With `MONGODB_URI` set, the library is read from Atlas instead (run `atlas_setup.py` and flush
+the views from the scanning machine first).
+
 ## Atlas (optional)
 
 ```bash

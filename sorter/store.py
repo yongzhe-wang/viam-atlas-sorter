@@ -238,6 +238,11 @@ class Store:
             names.setdefault(label, set()).update(a for a in (r.get("aliases") or []) if a and a != label)
         return [[label, *sorted(names[label])] for label in sorted(names)]
 
+    def library_stats(self) -> dict:
+        """{"labels": N, "views": M} for the object library, so a deployment can show it loaded."""
+        views = self.db.views.count_documents({}) if self.online else len(self._read_offline("views"))
+        return {"labels": len(self.list_labels()), "views": views}
+
     def add_command(self, text: str) -> str:
         """Queue a dashboard command ("grasp green square"); status starts as pending."""
         now = time.time()

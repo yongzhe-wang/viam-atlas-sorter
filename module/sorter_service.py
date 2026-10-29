@@ -24,8 +24,12 @@ Config attributes (all optional except where the defaults don't match your machi
 Arm logic is AGENT1's (scripts/pick_place_auto.py Rig, sorter/executor.py); this file only adapts it.
 """
 import asyncio
+import hashlib
+import os
+import shutil
 import time
 import uuid
+from pathlib import Path
 from typing import Any, ClassVar, Dict, Mapping, Optional, Sequence, Tuple
 
 from typing_extensions import Self
@@ -45,6 +49,34 @@ NAMESPACE = "sorter-team"  # must match "module_id" in meta.json; change both to
 LOGGER = getLogger(__name__)
 SUPPORTED_SQUARES = ("blue",)  # executor/pick_place_auto find the drop square by blue tape
 HEARTBEAT_S = 5.0  # dashboard marks a worker offline after 15 s (agreed with AGENT1)
+# Object library shipped in the archive by module/build.sh (views.jsonl + img/); read-only, versioned
+BUNDLE_DIR = Path(__file__).resolve().parent.parent / "library"
+
+
+def seed_library(bundle: Path, data: Path) -> str:
+    """
+    Copy the bundled object library into the writable data dir if it is missing or the bundle changed.
+
+    WHY: without Atlas the module's Store on the robot would have no views, so "green square" could not tell
+    the cube from the green cylinder. The writable dir ($VIAM_MODULE_DATA/data) survives redeploys and holds
+    the module's attempts/commands/status; only views.jsonl and its images are replaced, and only when the
+    bundle's content hash differs from the one seeded last time. Image paths ("img/<id>.jpg") stay valid.
+    """
+    src = bundle / "views.jsonl"
+    if not src.exists():
+        return "no bundled library"
+    digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+    marker, dst = data / ".library_hash", data / "views.jsonl"
+    if dst.exists() and marker.exists() and marker.read_text().strip() == digest:
+        return f"library {digest} already seeded"
+    (data / "img").mkdir(parents=True, exist_ok=True)
+    for img in (bundle / "img").glob("*.jpg"):
+        shutil.copy2(img, data / "img" / img.name)
+    tmp = data / "views.jsonl.seeding"
+    shutil.copyfile(src, tmp)
+    tmp.replace(dst)  # atomic: a reader never sees half a library
+    marker.write_text(digest)
+    return f"seeded library {digest}"
 SUMMARY_KEYS = ("_id", "status", "label", "score", "height_mm", "duration_s", "fail_phase", "fail_reason")
 
 
@@ -108,7 +140,14 @@ class GraspByDescription(Generic, EasyResource):
         self.arm = dependencies[Arm.get_resource_name(attrs.get("arm", "arm"))]
         self.gripper = dependencies[Gripper.get_resource_name(attrs.get("gripper", "gripper"))]
         self.camera = dependencies[Camera.get_resource_name(attrs.get("camera", "cam"))]
-        self.store = Store(uri=attrs.get("mongodb_uri"))
+        # Writable data under $VIAM_MODULE_DATA (kept across versions); with Atlas the library lives there instead
+        uri = attrs.get("mongodb_uri") or os.environ.get("MONGODB_URI") or ""
+        module_data = os.environ.get("VIAM_MODULE_DATA")
+        data_dir = Path(module_data) / "data" if module_data else None
+        if not uri and data_dir is not None:
+            LOGGER.info(f"{config.name}: {seed_library(BUNDLE_DIR, data_dir)} into {data_dir}")
+        self.store = Store(uri=uri, data_dir=str(data_dir) if data_dir else None)
+        self.library = self.store.library_stats()  # fixed for this instance: the library only changes on redeploy
         self.worker_id = f"module:{config.name}"
         self.rig = None
         self.job: Optional[asyncio.Task] = None
@@ -118,6 +157,7 @@ class GraspByDescription(Generic, EasyResource):
         if attrs.get("consume_dashboard_commands", False):
             self.tasks.append(asyncio.get_event_loop().create_task(self._command_loop()))
         LOGGER.info(f"{config.name}: store {'Atlas' if self.store.online else 'local JSONL'}, "
+                    f"library {self.library['labels']} labels / {self.library['views']} views, "
                     f"dashboard commands {'on' if attrs.get('consume_dashboard_commands') else 'off'}")
         return self
 
@@ -195,7 +235,8 @@ class GraspByDescription(Generic, EasyResource):
     def _status(self) -> Dict[str, ValueTypes]:
         busy = self.job is not None and not self.job.done()
         return {"busy": busy, "running": dict(self.job_info) if busy else {}, "last": dict(self.last),
-                "store": "atlas" if self.store.online else "jsonl", "worker_id": self.worker_id}
+                "store": "atlas" if self.store.online else "jsonl", "worker_id": self.worker_id,
+                "library": dict(self.library)}
 
     async def do_command(self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None,
                          **kwargs) -> Mapping[str, ValueTypes]:
