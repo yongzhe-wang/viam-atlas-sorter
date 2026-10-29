@@ -373,7 +373,10 @@ RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)  # waits before each reconnect attempt
 CONNECT_TIMEOUT_S = 30.0  # one connect attempt; a timeout counts as a dropped link and is retried
 # Per-call limits (s). A trial hung > 10 min inside one SDK call after a release; a timeout now counts as a
 # dropped link (retryable), so call() reconnects and repeats it. Moves are absolute, so repeating is safe.
-MAP_ONLY_THETA0 = True  # flip once the theta_test frames confirm perception.THETA_SIGN on the arm
+# Wrist-turned frames feed the live map too: AGENT3 confirmed perception.THETA_SIGN on theta_test 077/079
+# {A93820E "WITH -1 THE FOUR OBJECTS OF THETA_TEST 079 (THETA -90) LAND ON THEIR 077 (THETA 0) POSITIONS"}
+# [CONFIDENCE: SINGLE-SRC 85% — one theta pair, residuals <= 2.5 mm after TOOL_AXIS_MM; 078 (+90) not fitted]
+MAP_ONLY_THETA0 = False
 CALL_TIMEOUT_S = {"move": 45.0, "get images": 10.0, "get pose": 10.0, "open": 15.0, "grab": 15.0,
                   "holding": 10.0, "frame system": 15.0, "geometries": 15.0}
 
