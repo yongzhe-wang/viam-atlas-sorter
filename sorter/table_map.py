@@ -143,6 +143,180 @@ def map_from_frames(frames: list, store=None) -> dict:
     return doc
 
 
+# ---- dynamic map: every frame the arm takes updates it ------------------------------------------------------
+SKIP_S = 0.5  # a frame this soon after the last one at the same pose adds nothing: skip (saves the CLIP batch)
+SAME_POSE_MM, SAME_POSE_DEG = 5.0, 2.0
+MOVE_CONF = 0.5  # a confident sighting of a label seen elsewhere moves that object (one of each on the table)
+MISSES_TO_DROP = 2  # expected in view, not detected, this many frames in a row -> removed from the map
+FOOT_MARGIN_PX = 60  # an entry projected closer than this to the image border is not expected to be detected
+XY_ALPHA = 0.5  # weight of a new sighting in the entry's xy (objects that move should follow quickly)
+
+
+def empty_map() -> dict:
+    return {"ts": time.time(), "objects": [], "next_id": 0, "last_update": None}
+
+
+def _same_pose(a: dict, b: dict) -> bool:
+    return (math.dist((a["x"], a["y"], a["z"]), (b["x"], b["y"], b["z"])) <= SAME_POSE_MM
+            and abs(float(a.get("theta", 0)) - float(b.get("theta", 0))) <= SAME_POSE_DEG)
+
+
+def _expected_visible(e: dict, pose: dict, intr: dict, seg, depth: np.ndarray, xy=None) -> bool:
+    """
+    Should this map entry be clearly detected in this frame? Its whole extent projects inside the view (minus a
+    margin), with valid depth at its centre (not the blind range, not the held object), not under the fingertips.
+
+    The whole extent, not just the centre: the 17 cm KIND bar and the 19x14 cm square had their centres inside the
+    view while their bodies were cut by the edge, were not detected as whole, and got wrongly dropped.
+    """
+    H, W = depth.shape
+    z = max(seg.table_depth_mm - e.get("height_mm", 0.0), 50.0)
+    cx, cy = xy or e["xy"]
+    r = 0.5 * max(e.get("size_mm") or [0.0, 0.0])
+    m = FOOT_MARGIN_PX
+    for px, py in ((cx, cy), (cx - r, cy - r), (cx - r, cy + r), (cx + r, cy - r), (cx + r, cy + r)):
+        pu, pv = perception.project_xy(pose, intr, (px, py), z)
+        if not (m <= pu < W - m and m <= pv < H - m):
+            return False
+    u, v = perception.project_xy(pose, intr, (cx, cy), z)
+    if any(u0 <= u < u1 and v0 <= v < v1 for u0, v0, u1, v1 in perception.FINGER_BOXES):
+        return False
+    win = depth[int(v) - 7:int(v) + 8, int(u) - 7:int(u) + 8]
+    return bool(win.size and (win > 0).mean() >= 0.5)
+
+
+def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = None, store=None,
+               source: str = "frame", now: float = None) -> dict:
+    """
+    Fold one camera frame into the dynamic table map (in place; returns it).
+
+    WHY: the user wants every picture the arm takes to keep the map current, so a pick request can be answered
+    without a fresh sweep and moved or removed objects disappear. Per frame:
+      1. detections (recognise_all) -> table xy with the full pose (theta included)
+      2. each detection updates the entry it matches (same label nearby, or same look for unknowns), or moves the
+         one entry of that label if seen confidently elsewhere (one of each object on the table), or adds one
+      3. negative evidence: an entry that should be clearly visible here but was not detected gets a miss;
+         MISSES_TO_DROP misses in a row remove it. Partly visible (edge) objects reset misses without moving the
+         entry; a frame with a hand in view gives no negative evidence.
+      4. the drop square is updated the same way.
+    A frame < SKIP_S after the last one at the same pose is skipped. tmap["last_update"] records what happened.
+    """
+    now = time.time() if now is None else now
+    last = tmap.get("last_update")
+    if last and not last.get("skipped") and now - last["ts"] < SKIP_S and _same_pose(last["pose"], pose):
+        tmap["last_update"] = {**last, "skipped": True, "skip_ts": now}
+        return tmap
+    t0 = time.perf_counter()
+    intr = {**perception.INTRINSICS, **(intr or {})}
+    seg = perception.segment_full(rgb, depth)
+    recs = clip_embed.recognise_all(rgb, depth, store, seg=seg, include_partial=True)
+    objs = tmap["objects"]
+    touched = set()
+
+    def det_of(o, r):
+        xy = perception.world_xy(pose, intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+        mm_px = o.top_depth_mm / intr["fx"]
+        return {"label": r["label"], "names": r["names"], "xy": xy, "height_mm": o.height_mm, "score": r["score"],
+                "colour": o.colour, "colours": dict(o.colours or {}), "emb": r["emb"],
+                "size_mm": (o.length_px * mm_px, o.width_px * mm_px)}
+
+    def new_entry(d, partial):
+        e = {"id": tmap["next_id"], "label": d["label"], "names": list(d["names"]), "xy": list(d["xy"]), "n_seen": 0,
+             "height_mm": d["height_mm"], "score": 0.0, "colour": d["colour"], "colours": {}, "frame_ids": [],
+             "size_mm": [0.0, 0.0], "emb": d["emb"].tolist(), "partial": partial}
+        tmap["next_id"] += 1
+        objs.append(e)
+        return e
+
+    def seen(e, d):
+        e["score"] = round(max(e["score"] * 0.95, d["score"]), 3)
+        e.update(last_seen=now, misses=0, source=source, n_seen=e["n_seen"] + 1)
+        e["frame_ids"] = (e["frame_ids"] + [source + "@" + str(round(now, 1))])[-20:]
+        touched.add(e["id"])
+
+    for r in (r for r in recs if not r["partial"]):
+        d = det_of(r["obj"], r)
+        e = next((e for e in objs if e["id"] not in touched and _same(d, {**e, "emb": np.asarray(e["emb"])})), None)
+        if e is None and d["label"] and d["score"] >= MOVE_CONF:
+            e = next((e for e in objs if e["label"] == d["label"] and e["id"] not in touched), None)  # it moved
+        if e is None:
+            e = new_entry(d, partial=False)
+        else:
+            far = math.dist(e["xy"], d["xy"]) > MERGE_XY_MM  # moved: jump, do not average two places
+            a = 1.0 if far else XY_ALPHA
+            e["xy"] = [(1 - a) * e["xy"][0] + a * d["xy"][0], (1 - a) * e["xy"][1] + a * d["xy"][1]]
+            e["height_mm"] = (1 - XY_ALPHA) * e["height_mm"] + XY_ALPHA * d["height_mm"]
+            emb = 0.8 * np.asarray(e["emb"]) + 0.2 * d["emb"]
+            e["emb"] = (emb / np.linalg.norm(emb)).tolist()
+        if d["label"] and not e["label"]:
+            e["label"], e["names"] = d["label"], list(d["names"])
+        e["xy"] = [round(e["xy"][0], 1), round(e["xy"][1], 1)]
+        e["height_mm"] = round(float(e["height_mm"]), 1)
+        e["score"] = round(max(e["score"] * 0.95, d["score"]), 3)
+        e["colour"] = d["colour"]
+        for c, f in d["colours"].items():
+            e["colours"][c] = round(max(e["colours"].get(c, 0.0), f), 3)
+        e["size_mm"] = [round(float(x), 1) for x in d["size_mm"]]
+        e["partial"] = False  # seen whole: geometry is now reliable
+        seen(e, d)
+
+    # Partly visible (edge-cut) objects. Their xy is biased, so they never move a whole entry that is fine:
+    # - an entry nearby: still there (reset misses, no xy update)
+    # - recognised, and the label has no entry, or its entry should be visible here but is not: the object moved
+    #   to this edge spot; keep it as a "partial" entry (approximate xy) so the executor knows where to look
+    for r in (r for r in recs if r["partial"]):
+        d = det_of(r["obj"], r)
+        e = next((e for e in objs if e["id"] not in touched and math.dist(e["xy"], d["xy"]) <= 1.5 * MERGE_XY_MM
+                  and abs(e["height_mm"] - d["height_mm"]) <= MERGE_DH_MM
+                  and (not d["label"] or not e["label"] or e["label"] == d["label"])), None)
+        if e is not None:
+            e["misses"] = 0
+            touched.add(e["id"])
+            continue
+        if not d["label"] or d["score"] < MOVE_CONF:
+            continue
+        e = next((e for e in objs if e["label"] == d["label"] and e["id"] not in touched), None)
+        if e is None:
+            e = new_entry(d, partial=True)
+        elif e.get("partial") or _expected_visible(e, pose, intr, seg, depth):
+            e.update(xy=[round(float(d["xy"][0]), 1), round(float(d["xy"][1]), 1)], partial=True)
+        else:
+            continue  # its whole entry is out of view here and may well be right: do not move it on a partial view
+        seen(e, d)
+
+    dropped = []
+    if not seg.intruders:
+        for e in objs:
+            if e["id"] not in touched and _expected_visible(e, pose, intr, seg, depth):
+                e["misses"] = e.get("misses", 0) + 1
+        dropped = [e for e in objs if e.get("misses", 0) >= MISSES_TO_DROP]
+        tmap["objects"] = [e for e in objs if e.get("misses", 0) < MISSES_TO_DROP]
+
+    sq = perception.find_drop_square(rgb, depth, plane=seg.plane)
+    if sq:
+        u0, v0, u1, v1 = sq["bbox"]
+        mm_px = sq["depth_mm"] / intr["fx"]
+        xy = perception.world_xy(pose, intr, *sq["centroid_px"], sq["depth_mm"])
+        old = tmap.get("square")
+        a = 1.0 if not old or math.dist(old["xy"], xy) > MERGE_XY_MM else XY_ALPHA
+        oxy = old["xy"] if old else xy
+        tmap["square"] = {"xy": [round((1 - a) * oxy[0] + a * xy[0], 1), round((1 - a) * oxy[1] + a * xy[1], 1)],
+                          "size_mm": [round((v1 - v0) * mm_px, 1), round((u1 - u0) * mm_px, 1)],
+                          "last_seen": now, "misses": 0}
+    elif tmap.get("square") and not seg.intruders and _expected_visible(
+            {"height_mm": 0.0, "size_mm": tmap["square"]["size_mm"]}, pose, intr, seg, depth, xy=tmap["square"]["xy"]):
+        tmap["square"]["misses"] = tmap["square"].get("misses", 0) + 1
+        if tmap["square"]["misses"] >= MISSES_TO_DROP:
+            tmap.pop("square")
+
+    tmap["ts"] = now
+    tmap["last_update"] = {"ts": now, "pose": dict(pose), "source": source, "skipped": False,
+                           "ms": round((time.perf_counter() - t0) * 1000), "detected": len(recs),
+                           "dropped": [e["label"] or f"unknown#{e['id']}" for e in dropped],
+                           "hand_in_view": bool(seg.intruders)}
+    return tmap
+
+
 def best_on_map(table_map: dict, text: str, store=None) -> dict:
     """
     clip_embed.best() on the map's objects; adds "xy" and "map_obj" so the executor can go there.
@@ -150,15 +324,18 @@ def best_on_map(table_map: dict, text: str, store=None) -> dict:
     On a fresh whole-table map, searchable=True means "known to the library but not on the table".
     """
     recs = []
-    for m in table_map["objects"]:
-        ns = SimpleNamespace(id=m["id"], colour=m["colour"], colours=m.get("colours", {}),
+    for k, m in enumerate(table_map["objects"]):
+        # id = list position: dynamic-map ids are stable and stop matching positions once entries are dropped
+        ns = SimpleNamespace(id=k, colour=m["colour"], colours=m.get("colours", {}),
                              length_px=m["size_mm"][0], width_px=m["size_mm"][1],
                              height_mm=m["height_mm"], crop=None, recognised=m["label"], recognised_names=m["names"])
         recs.append({"obj": ns, "label": m["label"], "names": m["names"] or [], "score": m["score"],
                      "emb": np.asarray(m["emb"], dtype=np.float32)})
     b = clip_embed.best(None, text, store, recognised=recs)
     pick = table_map["objects"][b["obj"].id] if b["obj"] is not None else None
-    return {**b, "obj": None, "map_obj": pick, "xy": tuple(pick["xy"]) if pick else None}
+    # look_first: the entry comes from an edge-cut sighting (approximate xy): go there, re-observe, then grasp
+    return {**b, "obj": None, "map_obj": pick, "xy": tuple(pick["xy"]) if pick else None,
+            "look_first": bool(pick and pick.get("partial"))}
 
 
 def load_scan_frames(ids: list, scan_dir: Path = None) -> list:

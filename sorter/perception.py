@@ -427,6 +427,15 @@ def world_xy(pose: dict, intr: dict, u: float, v: float, depth_mm: float) -> tup
     return (pose["x"] + dx * math.cos(t) - dy * math.sin(t), pose["y"] + dx * math.sin(t) + dy * math.cos(t))
 
 
+def project_xy(pose: dict, intr: dict, table_xy, depth_mm: float) -> tuple:
+    """Pixel (u, v) where a table point appears at camera distance depth_mm: the inverse of world_xy()."""
+    t = math.radians(THETA_SIGN * float(pose.get("theta", 0.0)))
+    wx, wy = table_xy[0] - pose["x"], table_xy[1] - pose["y"]
+    dx, dy = wx * math.cos(t) + wy * math.sin(t), -wx * math.sin(t) + wy * math.cos(t)  # rotate by -t
+    yc, xc = JAW_IN_CAM_MM[1] - dx, JAW_IN_CAM_MM[0] - dy
+    return intr["cx"] + xc * intr["fx"] / depth_mm, intr["cy"] + yc * intr["fy"] / depth_mm
+
+
 LOOK_MIN_REACH_MM = 150.0  # the executor refuses flange xy closer than 120 mm to the base; keep a margin
 
 
@@ -448,7 +457,7 @@ def look_flange_xy(table_xy: tuple) -> tuple:
 SQUARE_MIN_AREA_PX = 15000  # the white interior is ~290x300 px at the observe pose; scaled with depth like objects
 
 
-def find_drop_square(rgb: np.ndarray, depth: np.ndarray) -> dict:
+def find_drop_square(rgb: np.ndarray, depth: np.ndarray, plane: tuple = None) -> dict:
     """
     The drop zone: white interior enclosed by the blue tape, fully in view. {centroid_px, bbox, area, depth_mm} or None.
 
@@ -467,7 +476,7 @@ def find_drop_square(rgb: np.ndarray, depth: np.ndarray) -> dict:
         return None
     border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
     d = depth.astype(float)
-    a, b, c = fit_table(d)
+    a, b, c = plane or fit_table(d)  # reuse segment_full's plane when the caller has it
     H, W = d.shape
     min_area = SQUARE_MIN_AREA_PX * area_scale(float(a * W / 2 + b * H / 2 + c))
     best = None

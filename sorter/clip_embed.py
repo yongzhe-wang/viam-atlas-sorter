@@ -170,25 +170,28 @@ def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm:
     return lab, sorted(names[lab]), votes[lab] / k
 
 
-def recognise_all(rgb: np.ndarray, depth: np.ndarray, store=None, seg=None) -> list:
+def recognise_all(rgb: np.ndarray, depth: np.ndarray, store=None, seg=None, include_partial: bool = False) -> list:
     """
-    Every target in one frame with its library label: [{"obj", "label", "names", "score", "emb"}, ...].
+    Every target in one frame with its library label: [{"obj", "label", "names", "score", "emb", "partial"}, ...].
 
     WHY: the module's idle loop recognises the table about once a second, and a grasp command should not
     embed the crops again. One CLIP batch covers all crops; pass the result to best(..., recognised=...).
     `seg`: a perception.segment_full() result the caller already has (e.g. to check intruders first).
+    `include_partial`: also recognise objects cut by the image edge (partial=True; never grasp candidates, but the
+    dynamic map uses them: a moved KIND bar was only ever seen cut at the edge and otherwise fell off the map).
     label/names are None/[] when the object is not recognised (or there is no store); score = vote confidence.
     """
     from sorter import perception
 
     seg = seg if seg is not None else perception.segment_full(rgb, depth)
-    embs = embed_images([o.crop for o in seg.objects])
+    objs = [(o, False) for o in seg.objects] + ([(o, True) for o, _ in seg.excluded] if include_partial else [])
+    embs = embed_images([o.crop for o, _ in objs])
     out = []
-    for o, e in zip(seg.objects, embs):
+    for (o, partial), e in zip(objs, embs):
         lab, names, conf = (recognise(e, store, colour=o.colour, height_mm=o.height_mm) if store is not None
                             else (None, [], 0.0))
         o.recognised, o.recognised_names = lab, names
-        out.append({"obj": o, "label": lab, "names": names, "score": conf, "emb": e})
+        out.append({"obj": o, "label": lab, "names": names, "score": conf, "emb": e, "partial": partial})
     return out
 
 
@@ -309,7 +312,9 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
     object found" and "best candidate is recognised as 'yellow cylinder'" are both searchable refusals.
     """
     if objs is None:
-        objs = [r["obj"] for r in recognised or []]
+        # Partly visible (edge-cut) objects are never grasp candidates: their geometry is incomplete
+        recognised = [r for r in recognised or [] if not r.get("partial")]
+        objs = [r["obj"] for r in recognised]
     known = store is not None and any(name_matches(text, n) for n in library_names(store))
     r = rank(objs, text, store, recognised)
     if not r:
