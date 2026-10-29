@@ -361,6 +361,7 @@ async def add_command(body: TextIn):
         entry.update(status="error", fail_reason=e.detail)
         raise
     entry["decide_ms"] = res.get("decide_ms")
+    _set_map_highlight(res, text)
     if res.get("accepted"):
         target = res.get("target") or {}
         entry.update(status="running", job=res.get("job"),
@@ -399,6 +400,7 @@ async def preview(body: TextIn):
             t = res["target"]
             (CAM_DIR / "module_highlight.json").write_text(json.dumps(
                 {"id": t.get("id"), "text": text, "score": t.get("score"), "until": time.time() + PREVIEW_HIGHLIGHT_S}))
+        _set_map_highlight(res, text)
         return {"module": res}
     try:
         objs = [SimpleNamespace(**o) for o in pickle.loads((CAM_DIR / "objs.pkl").read_bytes())]
@@ -418,6 +420,20 @@ async def preview(body: TextIn):
     hl = {"id": best.id, "text": text, "score": float(score), "until": time.time() + PREVIEW_HIGHLIGHT_S}
     (CAM_DIR / "highlight.json").write_text(json.dumps(hl))
     return [{"id": o.id, "score": float(s)} for o, s in ranked]
+
+
+MAP_HIGHLIGHT_S = 20.0
+_map_highlight = {}  # {"text", "label", "xy", "until"}: the object the last preview / grasp resolved to
+
+
+def _set_map_highlight(res: dict, text: str) -> None:
+    """Remember what a module answer pointed at (map xy or recognised label), to ring it on the table map."""
+    target = res.get("target") or {}
+    xy, label = res.get("target_xy"), res.get("label") or target.get("label")
+    # Every new answer replaces the ring: a miss ("ghost" not found) must not leave the previous hit ringed
+    _map_highlight.clear()
+    if res.get("ok") is not False and (xy or label):
+        _map_highlight.update(text=text, label=label, xy=xy, until=time.time() + MAP_HIGHLIGHT_S)
 
 
 @app.get("/api/table_map")
@@ -444,7 +460,8 @@ def table_map():
         m["age_s"] = round(robot_now - (m.get("ts") or robot_now), 1)
     for s in sightings:
         s["age_s"] = round(robot_now - (s.get("ts") or robot_now), 1)
-    return {"map": m, "sightings": sightings, "sweep": sweep, "reach_mm": [120, 650]}
+    hl = dict(_map_highlight) if _map_highlight.get("until", 0) > time.time() else None
+    return {"map": m, "sightings": sightings, "sweep": sweep, "reach_mm": [120, 650], "highlight": hl}
 
 
 @app.get("/api/labels")

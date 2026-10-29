@@ -158,7 +158,7 @@
     <div id="map-head" class="muted" style="font-size:13px;margin-bottom:6px">no table scan yet</div>
     <svg id="tmap" viewBox="0 0 560 300" width="100%" role="img" aria-label="top-down table map"></svg>
     <div class="legend"><span><i class="sw" style="background:var(--ok);height:8px;width:8px;border-radius:50%"></i>on the table scan</span>
-      <span>○ last sighting</span><span>colour = age: green &lt; 1 min, amber &lt; 5 min, grey older</span><span>click an object to grasp it</span></div>
+      <span>○ last sighting</span><span>colour = age: green &lt; 1 min, amber &lt; 5 min, grey older or not recognised</span><span>ring = last preview / grasp target</span><span>click an object to grasp it</span></div>
   </section>
 
   <section class="card full" id="charts-card" hidden>
@@ -465,17 +465,24 @@ async function refreshMap() {
   svg.appendChild(mk("text", {x: bx + 14, y: by - 1}, "arm"));
   const m = d.map;
   if (m && m.square && m.square.xy) {
-    const [sx, sy] = mapXY(...m.square.xy), half = (m.square.size_mm || 200) * MAP.s / 2;
-    svg.appendChild(mk("rect", {x: sx - half, y: sy - half, width: 2 * half, height: 2 * half, fill: "none", stroke: "#2457d6", "stroke-width": 4}));
+    // AGENT3: size_mm = [along x, along y] of the white inner area; x is up on screen, y is left
+    const [sx, sy] = mapXY(...m.square.xy), size = [].concat(m.square.size_mm || [200, 200]);
+    const w = (size[1] ?? size[0]) * MAP.s, h = size[0] * MAP.s;
+    svg.appendChild(mk("rect", {x: sx - w / 2, y: sy - h / 2, width: w, height: h, fill: "none", stroke: "#2457d6", "stroke-width": 4}));
   }
   const pick = (label) => { if (label) { $("t").value = label; $("t").focus(); } };
   const onMap = new Set();
+  const hl = d.highlight;
   for (const o of (m && m.objects) || []) {
     const [px, py] = mapXY(...o.xy), label = o.label || "unknown";
     onMap.add(o.label);
     const g = mk("g", {style: o.label ? "cursor:pointer" : ""});
-    g.appendChild(mk("circle", {cx: px, cy: py, r: 7, fill: ageColour(m.age_s), stroke: "var(--panel)", "stroke-width": 2}));
-    g.appendChild(mk("text", {x: px + 10, y: py + 4, fill: "var(--ink)", style: "fill:var(--ink)"}, label));
+    // Ring the object the last preview / grasp resolved to: same map position, else same label
+    const hit = hl && (hl.xy ? Math.hypot(hl.xy[0] - o.xy[0], hl.xy[1] - o.xy[1]) < 40 : hl.label && hl.label === o.label);
+    if (hit) g.appendChild(mk("circle", {cx: px, cy: py, r: 13, fill: "none", stroke: "var(--accent)", "stroke-width": 3}));
+    // Unrecognised objects (no library label) are grey, whatever their age
+    g.appendChild(mk("circle", {cx: px, cy: py, r: 7, fill: o.label ? ageColour(m.age_s) : "var(--muted)", stroke: "var(--panel)", "stroke-width": 2}));
+    g.appendChild(mk("text", {x: px + 10, y: py + 4, fill: "var(--ink)", style: o.label ? "fill:var(--ink)" : "fill:var(--muted)"}, label));
     g.appendChild(mk("title", {}, `${label} · (${o.xy[0].toFixed(0)}, ${o.xy[1].toFixed(0)}) mm · score ${o.score}`));
     g.addEventListener("click", () => pick(o.label));
     svg.appendChild(g);
