@@ -33,16 +33,6 @@ from sorter import clip_embed, perception  # noqa: E402
 
 SCAN = ROOT / "data" / "scan"
 SHEET = ROOT / "docs" / "scan" / "contact.jpg"
-# Measured with get_properties() on sfhack4 2026-10-29; a frame's own "intrinsics" overrides these
-INTRINSICS = {"fx": 909.93, "fy": 909.36, "cx": 645.48, "cy": 365.37}
-# Jaw (flange) axis relative to the camera axis, camera coordinates, from the hand-measured fingertip pixel
-# (864, 685) at 137 mm: ((864-645.5)*137/909.9, (685-365.4)*137/909.4). Config cam offset is 3-4 cm off.
-# {PICK_PLACE_AUTO.PY "JAW_TIP_PX = (864.0, 685.0)" "TIP_BELOW_CAM = 155.0 - CAM_T[2]"}
-# [CONFIDENCE: CONFIRMED 80% — fingertip pixel measured by AGENT1; constant errors cancel when grouping]
-JAW_IN_CAM_MM = (32.9, 48.1)
-# Image +u is world -y and image +v is world -x at theta 0 (arm +y moved the scene +u, arm +x moved it +v).
-# Wrist rotation direction is not verified on hardware: keep theta constant across a survey if possible.
-THETA_SIGN = -1.0
 LINK_XY_MM = 40.0  # two sightings closer than this on the table can be the same object
 LINK_DH_MM = 15.0  # ... if their heights agree within this
 LINK_COS = 0.70  # ... and their CLIP crops are at least this similar
@@ -69,22 +59,8 @@ def load_frames():
             continue
         rgb = np.asarray(Image.open(img).convert("RGB"))
         depth = np.load(dnp) if dnp.exists() else np.asarray(Image.open(dpng)).astype(np.uint16)
-        out.append((stem.name, rgb, depth, pose, {**INTRINSICS, **meta.get("intrinsics", {})}))
+        out.append((stem.name, rgb, depth, pose, {**perception.INTRINSICS, **meta.get("intrinsics", {})}))
     return out
-
-
-def world_xy(pose: dict, intr: dict, u: float, v: float, depth_mm: float) -> tuple:
-    """
-    Table xy (arm base frame, mm) of the point seen at pixel (u, v) at camera distance depth_mm.
-
-    Pinhole back-projection to camera coordinates, then the offset from the jaw axis rotated into the
-    world; a point exactly on the jaw axis maps to the flange xy.
-    """
-    xc = (u - intr["cx"]) * depth_mm / intr["fx"]
-    yc = (v - intr["cy"]) * depth_mm / intr["fy"]
-    dx, dy = JAW_IN_CAM_MM[1] - yc, JAW_IN_CAM_MM[0] - xc  # world offset at theta 0
-    t = math.radians(THETA_SIGN * float(pose.get("theta", 0.0)))
-    return (pose["x"] + dx * math.cos(t) - dy * math.sin(t), pose["y"] + dx * math.sin(t) + dy * math.cos(t))
 
 
 def sightings(frames: list) -> tuple:
@@ -94,7 +70,7 @@ def sightings(frames: list) -> tuple:
         seg = perception.segment_full(rgb, depth, align=perception.IDENTITY)
         for o in seg.objects:
             # Top-face centroid sits above the object's axis from any view; the full mask drifts with its sides
-            xy = world_xy(pose, intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+            xy = perception.world_xy(pose, intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
             items.append({"frame": name, "obj": o.id, "bbox": list(o.bbox), "xy": [round(xy[0], 1), round(xy[1], 1)],
                           "colour": o.colour, "height_mm": round(o.height_mm, 1), "rect_fill": round(o.rect_fill, 3)})
             crops.append(o.crop)
@@ -368,7 +344,7 @@ def carry(labels_path: str) -> None:
         print(f"  {title}: {' | '.join(lines)}")
 
 
-def apply(labels_path: str, force: bool, phone: bool = False, only_new: bool = False) -> None:
+def apply(labels_path: str, force: bool, phone: bool = False, only_new: bool = False, min_frame: str = None) -> None:
     """
     Write one Store view per crop of every labelled group.
 
@@ -402,7 +378,7 @@ def apply(labels_path: str, force: bool, phone: bool = False, only_new: bool = F
         ids = []
         for it in groups[gid]["items"]:
             key = f"{it.get('frame', it.get('photo'))}|{it.get('obj', it['index'])}"
-            if key in done:
+            if key in done or (min_frame and it.get("frame", "") < min_frame):
                 continue
             items_done[key] = label
             jpeg = (SCAN / it["crop"]).read_bytes()
@@ -426,6 +402,8 @@ if __name__ == "__main__":
     ap.add_argument("--phone", help="photo directory: propose labels for phone close-ups (with --apply: apply them)")
     ap.add_argument("--carry", help="after a re-shoot: the labels.json applied before; regroup and carry labels over")
     ap.add_argument("--only-new", action="store_true", help="with --apply after --carry: add only new sightings")
+    ap.add_argument("--min-frame", help="with --apply: skip sightings from frames before this one (e.g. 040: before "
+                                        "the user separated touching objects)")
     a = ap.parse_args()
     if a.scan_dir:
         SCAN = Path(a.scan_dir)
@@ -433,7 +411,7 @@ if __name__ == "__main__":
     if a.carry:
         carry(a.carry)
     elif a.apply:
-        apply(a.apply, a.force, phone=bool(a.phone), only_new=a.only_new)
+        apply(a.apply, a.force, phone=bool(a.phone), only_new=a.only_new, min_frame=a.min_frame)
     elif a.phone:
         phone_propose(Path(a.phone))
     else:

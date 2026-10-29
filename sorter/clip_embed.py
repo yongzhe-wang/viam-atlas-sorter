@@ -176,6 +176,29 @@ def recognise_all(rgb: np.ndarray, depth: np.ndarray, store=None, seg=None) -> l
     return out
 
 
+def where_is(store, text: str) -> dict:
+    """
+    Where the library last saw the object a query names: {"label", "xy", "frame", "look_flange_xy"} or None.
+
+    WHY: the observe pose sees only part of the table (frame 076: the green cube, yellow block and KIND bar were
+    all outside or cut by the edge, so best() correctly refused). The arm-scan views carry table xy and the
+    survey frame they came from; frames are numbered in time order, so the highest frame is the latest sighting.
+    look_flange_xy centres that spot in the camera (theta 0, z 400); look there, recognise_all, best() again.
+    """
+    from sorter import perception
+
+    entry = next((n for n in library_names(store) if name_matches(text, n)), None)
+    if entry is None:
+        return None
+    label = entry[0]
+    views = [v for v in store.search_views(_name_emb(label), k=1000, label=label) if v.get("xy") and v.get("frame")]
+    if not views:
+        return None
+    v = max(views, key=lambda v: v["frame"])
+    return {"label": label, "xy": tuple(v["xy"]), "frame": v["frame"],
+            "look_flange_xy": perception.look_flange_xy(v["xy"])}
+
+
 def library_names(store) -> list:
     """[[label, *aliases], ...] for every labelled object, so best() knows which queries the library covers."""
     return store.list_labels()

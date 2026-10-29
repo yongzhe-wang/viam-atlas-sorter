@@ -385,6 +385,51 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
                         intruders=intruders, align=model, plane=(a, b, c))
 
 
+# ---- pixel <-> table geometry (wrist camera looking straight down) ----------------------------------------
+# Measured with get_properties() on sfhack4 2026-10-29; a frame's own "intrinsics" overrides these
+INTRINSICS = {"fx": 909.93, "fy": 909.36, "cx": 645.48, "cy": 365.37}
+# Jaw (flange) axis relative to the camera axis, camera coordinates, from the hand-measured fingertip pixel
+# (864, 685) at 137 mm: ((864-645.5)*137/909.9, (685-365.4)*137/909.4). Config cam offset is 3-4 cm off.
+# {PICK_PLACE_AUTO.PY "JAW_TIP_PX = (864.0, 685.0)" "TIP_BELOW_CAM = 155.0 - CAM_T[2]"}
+# [CONFIDENCE: CONFIRMED 80% — independent check: AGENT1's own pixel->world conversion agrees within 1-15 mm]
+JAW_IN_CAM_MM = (32.9, 48.1)
+# Image +u is world -y and image +v is world -x at theta 0 (arm +y moved the scene +u, arm +x moved it +v).
+# Wrist rotation direction is not verified on hardware: use theta 0 for surveys and look poses.
+THETA_SIGN = -1.0
+
+
+def world_xy(pose: dict, intr: dict, u: float, v: float, depth_mm: float) -> tuple:
+    """
+    Table xy (arm base frame, mm) of the point seen at pixel (u, v) at camera distance depth_mm.
+
+    Pinhole back-projection to camera coordinates, then the offset from the jaw axis rotated into the
+    world; a point exactly on the jaw axis maps to the flange xy.
+    """
+    xc = (u - intr["cx"]) * depth_mm / intr["fx"]
+    yc = (v - intr["cy"]) * depth_mm / intr["fy"]
+    dx, dy = JAW_IN_CAM_MM[1] - yc, JAW_IN_CAM_MM[0] - xc  # world offset at theta 0
+    t = math.radians(THETA_SIGN * float(pose.get("theta", 0.0)))
+    return (pose["x"] + dx * math.cos(t) - dy * math.sin(t), pose["y"] + dx * math.sin(t) + dy * math.cos(t))
+
+
+LOOK_MIN_REACH_MM = 150.0  # the executor refuses flange xy closer than 120 mm to the base; keep a margin
+
+
+def look_flange_xy(table_xy: tuple) -> tuple:
+    """
+    Flange xy (theta 0) that puts the table point `table_xy` near the image centre.
+
+    The image centre sees the point JAW_IN_CAM_MM away from the jaw axis, i.e. flange + (48.1, 32.9) at theta 0.
+    Too close to the base (the green cube needed (100, 78), 127 mm) is pushed radially out to LOOK_MIN_REACH_MM;
+    at z 400 the view spans ~+-150 mm in x, so the point stays in frame (AGENT1 shot the cube from (150, 110)).
+    """
+    fx, fy = table_xy[0] - JAW_IN_CAM_MM[1], table_xy[1] - JAW_IN_CAM_MM[0]
+    r = math.hypot(fx, fy)
+    if 0 < r < LOOK_MIN_REACH_MM:
+        fx, fy = fx * LOOK_MIN_REACH_MM / r, fy * LOOK_MIN_REACH_MM / r
+    return fx, fy
+
+
 def segment(rgb: np.ndarray, depth: np.ndarray) -> tuple:
     """(table_depth_mm, objects), the EXEC_PLAN contract. Use segment_full() for intruders and alignment."""
     s = segment_full(rgb, depth)
