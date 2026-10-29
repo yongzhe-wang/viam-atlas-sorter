@@ -209,15 +209,15 @@ async def recover(rig, doc: dict) -> None:
         doc["fail_reason"] = f"{doc.get('fail_reason')} | recovery failed: {e}"
 
 
-async def drop_somewhere(rig, height: float, grip: float) -> None:
-    """Put the held object at a random free spot (not near the square, no object within ~90 mm)."""
+async def drop_somewhere(rig, height: float, grip: float) -> tuple:
+    """Put the held object at a random free spot (not near the square, no object within ~90 mm); returns (x, y)."""
     for _ in range(8):
         x, y = random.uniform(*RESET_X), random.uniform(*RESET_Y)
         if not 150.0 <= math.hypot(x, y) <= 600.0:
             continue
         print(f"reset: trying ({x:.0f},{y:.0f})")
         if await ppa.place_at(rig, x, y, height, grip):
-            return
+            return x, y
     raise RuntimeError("no free spot to drop the object; still holding it")
 
 
@@ -279,7 +279,7 @@ async def clear_square(rig, store) -> dict:
                 for _try in range(2):
                     try:
                         height, grip = await ppa.pick(rig, None, ObjTracker(rig, obj, rgb))
-                        await drop_somewhere(rig, height, grip)
+                        doc.setdefault("dropped_at", []).append(list(await drop_somewhere(rig, height, grip)))
                         picked = True
                         doc["removed"] += 1
                         break

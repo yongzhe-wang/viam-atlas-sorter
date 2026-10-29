@@ -5,17 +5,15 @@ WHY: one success says nothing about reliability. N runs give a success rate, per
 failure modes, and every place also yields jaw-calibration samples (pick_place_auto.observe_release).
 
 Each trial: pick the block wherever it is -> place it in the blue square -> go home and check with the
-camera that the block is inside the hole. Between trials the block is picked out of the square and put
-back at a random free spot inside RESET_X x RESET_Y, so the next trial starts somewhere new.
+camera that the block is inside the hole. Before the first trial and after every trial, sorter.executor.clear_square() empties the square
+(block -> random free spot), so trials loop unattended and each starts somewhere new.
 
 Logs one `attempts`-style document per trial (docs/EXEC_PLAN.md) to sorter.store.Store when that module
 exists, else to data/trials.jsonl. Usage: python scripts/run_trials.py [N]   (default 10)
 Run it with a hand near the e-stop.
 """
 import asyncio
-import io
 import json
-import random
 import sys
 import time
 from pathlib import Path
@@ -26,19 +24,15 @@ from scipy import ndimage
 
 import pick_place_auto as ppa
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from sorter import executor  # noqa: E402  square clearing (reset) shared with the dashboard's Clear button
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 LOG = DATA / "trials.jsonl"
-# Random reset area, flange x/y in mm: beside the tape square on the -y side, where the block started.
-# A yellow cylinder now sits near (346, -138), so the area is shifted toward the base; place_at also
-# refuses any spot with an object within ~90 mm.
-RESET_X = (230.0, 330.0)
-RESET_Y = (-200.0, -60.0)
 # Top of the block is ~347 mm from the camera at ALIGN_Z; the jaw axis meets it near this pixel, which is
 # where a block right under the arm appears. Seeds the Tracker.
 SEED_DEPTH = 347.0
-# Flange x/y where the square servo converged (run 2, 2026-10-29); from here the whole hole is in view
-SQUARE_XY = (387.0, 56.0)
 
 
 def in_square(rgb: np.ndarray, tracker=None):
@@ -141,22 +135,6 @@ async def trial(rig, store, run_id: str, i: int) -> dict:
     return doc
 
 
-async def reset(rig) -> float:
-    """
-    Move the block out of the square to a random free spot. Returns seconds taken; raises if impossible.
-
-    Called with the arm above the square (where the trial ended), so the block is in view.
-    """
-    t0 = time.monotonic()
-    height, grip = await ppa.pick(rig, None, seed_tracker(rig))
-    for _ in range(6):
-        x, y = random.uniform(*RESET_X), random.uniform(*RESET_Y)
-        print(f"reset: trying ({x:.0f},{y:.0f})")
-        if await ppa.place_at(rig, x, y, height, grip):
-            return round(time.monotonic() - t0, 1)
-    raise RuntimeError("no free reset spot found; block still held")
-
-
 async def main(n: int) -> None:
     run_id = time.strftime("%Y%m%d-%H%M%S")
     store = open_store()
@@ -164,24 +142,24 @@ async def main(n: int) -> None:
     await rig.connect()
     results = []
     try:
-        await ppa.travel(rig, *SQUARE_XY, theta=0.0)
-        # Start from outside the square so trial 1 is a real pick-into-square
-        if in_square((await rig.frame())[0], seed_tracker(rig)):
-            print("block starts in the square: resetting first")
-            await reset(rig)
+        # Empty the square first, so trial 1 is a real pick-into-square
+        cleared = await executor.clear_square(rig, store)
+        print(f"reset: {cleared['status']} removed={cleared['removed']} wipes={cleared['wipes']} {cleared['duration_s']}s")
         for i in range(1, n + 1):
+            if not cleared["success"]:
+                print(f"square not empty ({cleared['fail_reason']}); parked, not starting trial {i}")
+                break
             print(f"=== trial {i}/{n} ===")
+            if cleared.get("dropped_at"):
+                # The reset leaves the arm over the (now empty) square; the block is where it was dropped
+                await ppa.travel(rig, *cleared["dropped_at"][-1], theta=0.0)
             doc = await trial(rig, store, run_id, i)
             results.append(doc)
             print(f"trial {i}: success={doc['success']} {doc['duration_s']}s phases={doc['phase_times']} "
                   f"fail={doc['fail_phase']} {doc['fail_reason'] or ''}")
-            if i < n:
-                try:
-                    print(f"reset took {await reset(rig)}s")
-                except Exception as e:
-                    print(f"reset failed ({type(e).__name__}: {e}); stopping")
-                    await rig.lift()
-                    break
+            # Clear the square after every trial (also after a failed one) so the next starts the same way
+            cleared = await executor.clear_square(rig, store)
+            print(f"reset: {cleared['status']} removed={cleared['removed']} wipes={cleared['wipes']} {cleared['duration_s']}s")
         await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
     finally:
         await rig.close()
