@@ -599,10 +599,12 @@ async function refreshMap() {
   const nSeen = (d.sightings || []).length;
   // Every frame folded into the map is kept as an observation (the map is rebuilt from them after a crash)
   const nObs = d.observations;
+  // The paper may be moved at any time (user): a square seen only in part is a state, never a request to move it
+  const sqNote = m && m.square && m.square.partial ? " · square partial — looking for full view" : "";
   // A dead map must be visible: every update failing (sfhack4: KeyError 'next_id' on every frame)
   const lv = d.live, dead = lv && lv.failing ? `⚠ map not updating (${lv.errors} failed: ${lv.last_error}) · ` : "";
   $("map-head").textContent = dead + head + (nSeen ? ` · ${nSeen} sighting${nSeen === 1 ? "" : "s"}` : "")
-    + (nObs ? ` · ${nObs} observation${nObs === 1 ? "" : "s"} stored` : "");
+    + sqNote + (nObs ? ` · ${nObs} observation${nObs === 1 ? "" : "s"} stored` : "");
 }
 
 // Known objects from the view library: shows the audience what it can ask for; a click fills the box

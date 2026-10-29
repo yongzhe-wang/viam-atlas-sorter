@@ -48,6 +48,7 @@ import base64
 import hashlib
 import inspect
 import io
+import json
 import os
 import shutil
 import time
@@ -77,6 +78,8 @@ SUPPORTED_SQUARES = ("blue",)  # executor/pick_place_auto find the drop square b
 HEARTBEAT_S = 5.0  # dashboard marks a worker offline after 15 s (agreed with AGENT1)
 # Object library shipped in the archive by module/build.sh (views.jsonl + img/); read-only, versioned
 BUNDLE_DIR = Path(__file__).resolve().parent.parent / "library"
+# build.sh writes which commit an archive holds; status reports it, so everyone can see what the robot runs
+BUILD_INFO_PATH = Path(__file__).resolve().parent.parent / "BUILD_INFO.json"
 # find_path / square_path (AGENT1 0d3c817): how the executor really found the object and the square, for status.last
 SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "duration_s", "fail_phase", "fail_reason",
                 "find_path", "find_views", "square_path", "objects")
@@ -127,6 +130,14 @@ def seed_library(bundle: Path, data: Path) -> str:
     tmp.replace(dst)  # atomic: a reader never sees half a library
     marker.write_text(digest)
     return f"seeded library {digest}"
+
+
+def _build_info() -> dict:
+    """{commit, dirty, built_at} of this archive (module/build.sh), or a note when running from a checkout."""
+    try:
+        return json.loads(BUILD_INFO_PATH.read_text())
+    except (FileNotFoundError, ValueError):
+        return {"commit": None, "note": "not a built archive (no BUILD_INFO.json)"}
 
 
 def _runtime():
@@ -959,7 +970,7 @@ class GraspByDescription(Generic, EasyResource):
                 "library": dict(self.library), "warm": self.warm, "warm_ms": self.warm_ms,
                 "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats(),
                 "map": self.live.summary() if self.live is not None else {"live": False},
-                "observations": self.store.observation_stats()}
+                "observations": self.store.observation_stats(), "build": _build_info()}
 
     async def do_command(self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None,
                          **kwargs) -> Mapping[str, ValueTypes]:

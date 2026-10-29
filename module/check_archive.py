@@ -95,6 +95,13 @@ def check(archive: Path) -> list:
                 problems.append(f"entrypoint {entry.name!r} is not executable")
         if not (root / "requirements.txt").is_file():
             problems.append("requirements.txt missing (run.sh installs from it)")
+        info = root / "BUILD_INFO.json"
+        if not info.is_file():
+            problems.append("BUILD_INFO.json missing (which commit is this?)")
+        else:
+            b = json.loads(info.read_text())
+            print(f"check_archive: commit {b.get('commit')}" + (f", DIRTY: {len(b['dirty'])} uncommitted files"
+                                                                 if b.get("dirty") else ""))
         junk = [str(p.relative_to(root)) for p in root.rglob("._*")]
         if junk:
             problems.append(f"{len(junk)} macOS ._ metadata files (tar without COPYFILE_DISABLE=1), e.g. {junk[0]}")
