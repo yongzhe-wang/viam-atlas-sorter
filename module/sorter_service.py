@@ -68,7 +68,9 @@ SUPPORTED_SQUARES = ("blue",)  # executor/pick_place_auto find the drop square b
 HEARTBEAT_S = 5.0  # dashboard marks a worker offline after 15 s (agreed with AGENT1)
 # Object library shipped in the archive by module/build.sh (views.jsonl + img/); read-only, versioned
 BUNDLE_DIR = Path(__file__).resolve().parent.parent / "library"
-SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "duration_s", "fail_phase", "fail_reason")
+# find_path / square_path (AGENT1 0d3c817): how the executor really found the object and the square, for status.last
+SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "duration_s", "fail_phase", "fail_reason",
+                "find_path", "square_path")
 WATCH_PERIOD_S = 1.0  # idle perception: one frame about every second
 SLOW_WATCH_PERIOD_S = 2.0  # ... every 2 s when one look takes longer than SLOW_LOOP_MS, so jobs are not starved
 SLOW_LOOP_MS = 800
