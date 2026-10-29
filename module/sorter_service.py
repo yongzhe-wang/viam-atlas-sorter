@@ -80,6 +80,10 @@ BUNDLE_DIR = Path(__file__).resolve().parent.parent / "library"
 # find_path / square_path (AGENT1 0d3c817): how the executor really found the object and the square, for status.last
 SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "duration_s", "fail_phase", "fail_reason",
                 "find_path", "find_views", "square_path", "objects")
+# A grasp that fails by accident (slipped, closed on air) is tried this many times in all, each from a fresh
+# search {USER 2026-10-29 "I ALSO WANT RETRY WHEN FAIL"} [CONFIDENCE: SINGLE-SRC 90% — 3 is my pick: a 4th
+# try past ~45 s of retries loses the demo minute anyway]
+GRASP_ATTEMPTS = 3
 WATCH_PERIOD_S = 1.0  # idle perception: one frame about every second
 SLOW_WATCH_PERIOD_S = 2.0  # ... every 2 s when one look takes longer than SLOW_LOOP_MS, so jobs are not starved
 SLOW_LOOP_MS = 800
@@ -788,10 +792,59 @@ class GraspByDescription(Generic, EasyResource):
         chosen: {"label", "colour"} of the object decided on (map path); the frame path fills it here.
         The summary's "label" is that recognised library name and "colour" its colour, because the executor's
         own "label" falls back to the colour (VIAM CENTERAL: a blue screwdriver came back as "label": "black").
+        Retries (_retryable): up to GRASP_ATTEMPTS in all, each later one searching afresh; job_info["attempt"]
+        says which try is running, and the summary's "attempts" lists every try when there was more than one.
         """
-        via = "scan" if kind == "scan" else "search"
         if target is not None:
             chosen = {"label": target.get("recognised"), "colour": getattr(target.get("obj"), "colour", None)}
+        tries = GRASP_ATTEMPTS if kind == "grasp" else 1
+        attempts: list = []
+        for n in range(1, tries + 1):
+            self.job_info.update(attempt=n, attempts_max=tries)
+            summary, run_via = await self._once(kind, text, target, target_xy)
+            # The first attempt's path names the job (frame / map / search); retries always search
+            via = run_via if n == 1 else via
+            if n == tries or not self._retryable(kind, summary):
+                break
+            attempts.append({k: summary.get(k) for k in ("status", "fail_phase", "fail_reason", "duration_s")})
+            LOGGER.info(f"grasp {text!r} attempt {n}/{tries} failed ({summary.get('fail_reason')}): retrying")
+            # The failed try moved things (a slipped object lands somewhere else): search again from the
+            # observe pose instead of reusing the old frame or map position
+            target = target_xy = None
+        if attempts:
+            summary["attempts"] = attempts + [{k: summary.get(k) for k in ("status", "fail_phase", "fail_reason",
+                                                                           "duration_s")}]
+        if kind == "grasp":
+            summary.update(fast_path=via == "frame", via=via, decide_ms=decide_ms)
+            # Something was picked (or found): name it by the decided library label, keep the colour apart
+            if summary.get("label") is not None and chosen:
+                summary.update(label=chosen.get("label") or summary["label"],
+                               colour=summary.get("colour") or chosen.get("colour"))
+        # job id lets a DoCommand caller (the dashboard in module mode) match this result to its request
+        self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
+        return summary
+
+    @staticmethod
+    def _retryable(kind: str, summary: dict) -> bool:
+        """
+        Whether another grasp attempt can fix this failure.
+
+        WHY: the user asked for it after the green cylinder slipped out during the carry and the job just ended
+        {USER 2026-10-29 "I ALSO WANT RETRY WHEN FAIL"}. Retried: status "failed" while picking or carrying
+        (slipped, closed on air, the standoff check saw something else). Not retried: every other status (not
+        found, ambiguous, too wide, too close, square full are answers, not accidents); a refused move or a dead
+        link (the same move fails again); a failed release check (the object may already be in the square, and
+        a retry would take it back out); a failed recovery (it may still be holding something).
+        """
+        if kind != "grasp" or summary.get("status") != "failed" or summary.get("fail_phase") == "check":
+            return False
+        reason = str(summary.get("fail_reason") or "")
+        return not any(s in reason for s in ("MoveRefused", "link", "recovery failed", "still holding"))
+
+    async def _once(self, kind: str, text: Optional[str], target: Optional[dict],
+                    target_xy: Optional[list]) -> tuple:
+        """One grasp attempt, reset or table scan -> (summary, via); never raises (an exception becomes "error")."""
+        via = "scan" if kind == "scan" else "search"
         try:
             rt = _runtime()
             rig = await self._get_rig()
@@ -829,15 +882,7 @@ class GraspByDescription(Generic, EasyResource):
                         await _runtime().executor.back_to_observe(self.rig)
             except Exception:
                 pass
-        if kind == "grasp":
-            summary.update(fast_path=via == "frame", via=via, decide_ms=decide_ms)
-            # Something was picked (or found): name it by the decided library label, keep the colour apart
-            if summary.get("label") is not None and chosen:
-                summary.update(label=chosen.get("label") or summary["label"],
-                               colour=summary.get("colour") or chosen.get("colour"))
-        # job id lets a DoCommand caller (the dashboard in module mode) match this result to its request
-        self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
-        return summary
+        return summary, via
 
     async def _start(self, kind: str, text: Optional[str], wait: bool, target: Optional[dict] = None,
                      decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
