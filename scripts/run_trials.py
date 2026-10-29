@@ -147,6 +147,8 @@ async def main(n: int) -> None:
     await rig.start()
     results = []
     try:
+        # Obstacles (walls) shrink the search grid and reset area; ranges are printed for the log
+        await executor.apply_limits(rig)
         # A previous process may have died holding the block: put it in the square first
         await executor.resume(rig, store)
         # Where the block is if the square starts empty (env BLOCK_XY="x,y", flange mm); else from the resets

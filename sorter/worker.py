@@ -43,6 +43,8 @@ async def main() -> None:
     beater = asyncio.create_task(beat(store, rig, current))
     print(f"worker: connected, store {'online' if store.online else 'offline (JSONL)'}; waiting for commands")
     try:
+        # Obstacles (walls) shrink the search grid and reset area; ranges are printed for the log
+        await executor.apply_limits(rig)
         # A previous process may have died mid-carry: finish that first
         await executor.resume(rig, store)
         while True:

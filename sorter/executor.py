@@ -66,6 +66,21 @@ def publish_frame(store, rgb: np.ndarray, seg, phase: str, scores: dict = None) 
         print(f"put_frame failed: {e}")
 
 
+async def apply_limits(rig) -> None:
+    """Obstacle keep-outs (ppa.apply_workspace_limits) applied to OBSERVE_XY and the reset rectangle; logged."""
+    await ppa.apply_workspace_limits(rig)
+    OBSERVE_XY[:] = [q for q in OBSERVE_XY if ppa.allowed(*q)]
+    global RESET_X, RESET_Y
+    for x0, x1, y0, y1 in ppa.KEEP_OUT:
+        # A keep-out spanning the whole rectangle in one axis cuts the other axis; partial ones are point-checked
+        if y0 <= RESET_Y[0] and y1 >= RESET_Y[1] and x1 > RESET_X[0] and x0 < RESET_X[1]:
+            RESET_X = (x1, RESET_X[1]) if x0 <= RESET_X[0] else (RESET_X[0], x0)
+        if x0 <= RESET_X[0] and x1 >= RESET_X[1] and y1 > RESET_Y[0] and y0 < RESET_Y[1]:
+            RESET_Y = (y1, RESET_Y[1]) if y0 <= RESET_Y[0] else (RESET_Y[0], y0)
+    print(f"  workspace: {len(OBSERVE_XY)} observe points, reset x[{RESET_X[0]:.0f},{RESET_X[1]:.0f}] "
+          f"y[{RESET_Y[0]:.0f},{RESET_Y[1]:.0f}]")
+
+
 class ObjTracker:
     """
     Finder (rgb -> (u, v, yaw, area) or None) that follows one object of any colour.
@@ -254,7 +269,7 @@ async def drop_somewhere(rig, height: float, grip: float) -> tuple:
     """Put the held object at a random free spot (not near the square, no object within ~90 mm); returns (x, y)."""
     for _ in range(8):
         x, y = random.uniform(*RESET_X), random.uniform(*RESET_Y)
-        if not 150.0 <= math.hypot(x, y) <= 600.0:
+        if not 150.0 <= math.hypot(x, y) <= 600.0 or not ppa.allowed(x, y):
             continue
         print(f"reset: trying ({x:.0f},{y:.0f})")
         if await ppa.place_at(rig, x, y, height, grip):

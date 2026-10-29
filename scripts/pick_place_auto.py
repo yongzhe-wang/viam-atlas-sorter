@@ -854,6 +854,60 @@ SEARCH_XY = [(x, y) for x in (250.0, 380.0, 500.0) for y in (-300.0, -150.0, 0.0
 SQUARE_CLEAR_PX = 145.0  # ~60 mm at the 378 mm observe depth (~2.4 px/mm)
 
 
+# Horizontal reach of the tool around the flange axis: camera body ~85 mm out (cam frame -83, 14) plus its
+# housing, open claws ~70 mm each side; plus a 30 mm margin. Used to grow obstacle boxes into keep-out zones.
+TOOL_REACH_MM = 135.0 + 30.0
+WORK_Z = (0.0, 600.0)  # world z band the tool occupies (table top ~0 .. above ALIGN_Z + camera)
+KEEP_OUT = []  # [(x0, x1, y0, y1)] flange xy forbidden by obstacles, filled by apply_workspace_limits()
+
+
+def allowed(x: float, y: float) -> bool:
+    """True if a flange at (x, y) keeps the tool clear of every obstacle keep-out zone."""
+    return not any(x0 <= x <= x1 and y0 <= y <= y1 for x0, x1, y0, y1 in KEEP_OUT)
+
+
+async def apply_workspace_limits(rig: Rig) -> list:
+    """
+    Read obstacle boxes from the frame system, turn them into keep-out zones, drop SEARCH_XY points inside.
+
+    WHY: obstacles (wall-back, wall-left) were added to the machine as safety limits; move_to_position is
+    collision-checked, so a pose inside one is refused mid-trial. Checking up front turns that into a
+    smaller search grid instead of a failed run. Only world-parented boxes that reach into WORK_Z count
+    (the table box tops out at z=-23, the ceiling starts at 1000). Rotated boxes use their bounding cube.
+    """
+    from viam.components.gripper import Gripper
+
+    fs = await rig.call("frame system", lambda: rig.robot.get_frame_system_config())
+    KEEP_OUT.clear()
+    for f in fs:
+        fr = f.frame
+        pose = fr.pose_in_observer_frame
+        if pose.reference_frame != "world" or fr.reference_frame == "arm":
+            continue
+        try:
+            geoms = await rig.call("geometries", lambda n=fr.reference_frame: Gripper.from_robot(rig.robot, n).get_geometries())
+        except Exception:
+            continue  # not an obstacle-like resource
+        t = pose.pose
+        rotated = abs(t.o_z - 1.0) > 1e-3 or abs(t.theta) > 0.5
+        for g in geoms:
+            if not g.HasField("box"):
+                continue
+            d = g.box.dims_mm
+            hx, hy, hz = (max(d.x, d.y, d.z) / 2,) * 3 if rotated else (d.x / 2, d.y / 2, d.z / 2)
+            cx, cy, cz = t.x + g.center.x, t.y + g.center.y, t.z + g.center.z
+            if cz + hz < WORK_Z[0] or cz - hz > WORK_Z[1]:
+                continue
+            m = TOOL_REACH_MM
+            KEEP_OUT.append((cx - hx - m, cx + hx + m, cy - hy - m, cy + hy + m))
+            print(f"  obstacle {fr.reference_frame}: keep flange out of x[{cx - hx - m:.0f},{cx + hx + m:.0f}] "
+                  f"y[{cy - hy - m:.0f},{cy + hy + m:.0f}]")
+    before = len(SEARCH_XY)
+    SEARCH_XY[:] = [q for q in SEARCH_XY if allowed(*q)]
+    print(f"  search grid: {len(SEARCH_XY)}/{before} points allowed")
+    return KEEP_OUT
+
+
 def near_square(rgb: np.ndarray, uv, radius: float = SQUARE_CLEAR_PX) -> bool:
     """
     True if blue tape or the white paper under it is within `radius` px of pixel `uv`.
@@ -931,6 +985,8 @@ async def search_square(rig: Rig) -> None:
 
 async def travel(rig: Rig, x: float, y: float, theta: float = None) -> None:
     """Move at ALIGN_Z to (x, y) in legs short enough for the MAX_STEP_MM guard."""
+    if not allowed(x, y):
+        raise RuntimeError(f"refusing ({x:.0f},{y:.0f}): inside an obstacle keep-out zone")
     p = await rig.pose()
     if p.z < ALIGN_Z - 1:
         await rig.goto(p.x, p.y, ALIGN_Z)
