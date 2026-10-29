@@ -143,6 +143,25 @@ def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm:
     return lab, sorted(names[lab]), votes[lab] / k
 
 
+def library_names(store) -> list:
+    """
+    [label + aliases] for every labelled object in the store, so best() knows which queries the library covers.
+
+    Uses Store.list_labels() when AGENT 2 adds it; until then Atlas distinct() online, or the offline views
+    file through Store._read_offline (no public listing yet).
+    """
+    if hasattr(store, "list_labels"):
+        return store.list_labels()
+    names = {}
+    if getattr(store, "db", None) is not None:
+        rows = store.db.views.find({}, {"label": 1, "aliases": 1, "_id": 0})
+    else:
+        rows = store._read_offline("views")
+    for r in rows:
+        names.setdefault(r["label"], {r["label"]}).update(r.get("aliases") or [])
+    return [sorted(v) for v in names.values()]
+
+
 def rank(objs: list, text: str, store=None) -> list:
     """
     [(Obj, score)] best first for a free-text description.
@@ -194,10 +213,15 @@ def best(objs: list, text: str, store=None) -> dict:
     (o, s), margin = r[0], (r[0][1] - r[1][1]) if len(r) > 1 else 1.0
     out = {"obj": None, "score": s, "margin": margin, "ambiguous": False, "reason": "", "recognised": o.recognised}
     qcol = set(clean_query(text).split()) & COLOURS
+    # The library knows this query ("candy" is an alias of the KIND bar): then only an object recognised as it
+    # may be picked. Without this, "candy" with the bar out of view picked an unrecognised cup fragment.
+    known = store is not None and any(name_matches(text, n) for n in library_names(store))
     if qcol and not colour_ok(qcol, o.colour):
         out["reason"] = f"no {'/'.join(sorted(qcol))} object found"
     elif o.recognised is not None and not name_matches(text, o.recognised_names):
         out["reason"] = f"best candidate is recognised as {o.recognised!r}"
+    elif known and o.recognised is None:
+        out["reason"] = f"no {clean_query(text)!r} recognised on the table"
     elif s < MIN_SCORE:
         out["reason"] = f"best match only {s:.2f}"
     else:
