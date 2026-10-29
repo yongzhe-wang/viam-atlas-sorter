@@ -80,11 +80,12 @@ def _with_date(doc: dict) -> dict:
     return doc
 
 
-def _cosine01(matrix: np.ndarray, q: np.ndarray) -> np.ndarray:
-    """Cosine similarity mapped to [0, 1] as (1 + cos) / 2, the same scale Atlas reports for cosine indexes."""
-    m = matrix / np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
-    q = q / max(float(np.linalg.norm(q)), 1e-12)
-    return (1.0 + m @ q) / 2.0
+def _normalised(rows: list):
+    """Embeddings as an (N, d) float32 matrix with unit-length rows, or None when there are none."""
+    if not rows:
+        return None
+    m = np.asarray(rows, dtype=np.float32)
+    return m / np.maximum(np.linalg.norm(m, axis=1, keepdims=True), 1e-12)
 
 
 class Store:
@@ -96,7 +97,8 @@ class Store:
         (self.data / "img").mkdir(parents=True, exist_ok=True)
         uri = uri if uri is not None else os.environ.get("MONGODB_URI")
         self.db = None
-        self._views_cache = None  # ((mtime_ns, size), views, matrix) for offline search_views
+        self._views_cache = None  # ((mtime_ns, size), views, normalised matrix) for offline search_views
+        self._online_lib = None  # (normalised matrix, labels) loaded once from Atlas by library_matrix()
         if uri:
             from pymongo import MongoClient
 
@@ -192,10 +194,11 @@ class Store:
 
     def _views_offline(self) -> tuple:
         """
-        (views, embedding matrix) from data/views.jsonl, re-read only when the file changes.
+        (views, L2-normalised embedding matrix) from data/views.jsonl, re-read only when the file changes.
 
         WHY: the module's idle perception searches the library for every object about once a second; parsing
-        the ~1 MB file each time was most of that cost. Keyed on (mtime, size), so appends invalidate it.
+        the ~1 MB file and normalising each time was most of that cost. Keyed on (mtime, size), so appends
+        invalidate it.
         """
         path = self._file("views")
         try:
@@ -205,9 +208,24 @@ class Store:
         key = (st.st_mtime_ns, st.st_size)
         if self._views_cache is None or self._views_cache[0] != key:
             views = self._read_offline("views")
-            matrix = np.array([v["embedding"] for v in views], dtype=float) if views else None
-            self._views_cache = (key, views, matrix)
+            self._views_cache = (key, views, _normalised([v["embedding"] for v in views]))
         return self._views_cache[1], self._views_cache[2]
+
+    def library_matrix(self) -> tuple:
+        """
+        (N x 512 L2-normalised float32 matrix, [label per row]) of the object library, held in memory.
+
+        Offline it is the same cache search_views uses; online it is loaded from Atlas once per Store (search
+        itself still uses $vectorSearch). The module's warm-up calls this so the library is resident before
+        the first command.
+        """
+        if self.online:
+            if self._online_lib is None:
+                rows = list(self.db.views.find({}, {"embedding": 1, "label": 1, "_id": 0}))
+                self._online_lib = (_normalised([r["embedding"] for r in rows]), [r.get("label") for r in rows])
+            return self._online_lib
+        views, matrix = self._views_offline()
+        return matrix, [v.get("label") for v in views]
 
     def search_views(self, embedding, k: int = 5, label: str = None) -> list:
         """
@@ -233,7 +251,8 @@ class Store:
             views, matrix = [views[i] for i in keep], (matrix[keep] if keep else None)
         if not views:
             return []
-        scores = _cosine01(matrix, q)
+        # Rows are already unit length; (1 + cos) / 2 is the scale Atlas reports for cosine indexes
+        scores = (1.0 + matrix @ (q / max(float(np.linalg.norm(q)), 1e-12))) / 2.0
         out = []
         for i in np.argsort(-scores)[:k]:
             v = {key: val for key, val in views[i].items() if key not in ("embedding", "jpeg")}

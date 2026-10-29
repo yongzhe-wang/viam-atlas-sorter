@@ -67,9 +67,13 @@ await sorter.do_command({"reset": True})                    # empty the square (
 ```
 
 - Leading verbs are ignored ("grasp", "pick up", "get", ...); the destination is always the square.
-- **Always ready:** CLIP and the object library load in the background at startup (`"warm": true` in status).
+- **Always ready:** `run.sh` downloads the CLIP weights during install into `$VIAM_MODULE_DATA/cache` (kept
+  across redeploys). At startup a background task loads CLIP (eval, all CPU threads) and the object library
+  into memory and runs one dummy pass (`"warm": true`, `"warm_ms"` in status); until then a grasp answers
+  `{"ok": false, "status": "warming_up"}` at once. `{"preview": "..."}` gives the same decision without moving.
   While idle with the arm at the observe pose (`home_xy`, z 400), the service looks at the table about once a
-  second and caches what it recognises (`"seen"` in status: labels, confidence, boxes, intruders). If that
+  second (every 2 s if a look takes over 800 ms) and caches what it recognises (`"seen"` in status: labels,
+  confidence, boxes, intruders, per-step timings `"seen_ms"`). If that
   frame is at most 1.5 s old, a grasp decides from it at once (`"decide_ms"`). It either starts moving with
   that target or answers immediately `{"ok": false, "status": "not_found", "reason": "no 'pumpkin' on the table"}`.
   Otherwise, for example right after a move, it falls back to the executor's own observe (`"why_slow"`).

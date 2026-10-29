@@ -128,11 +128,12 @@ def _cam_state() -> dict:
     return {**state, "process": camproc}
 
 
-def _render_worker_frame(data: bytes, doc: dict) -> bytes:
+def _render_worker_frame(data: bytes, doc: dict, highlight: dict = None) -> bytes:
     """
     Worker frame with the worker's boxes (already in this image's pixels), same colours as the direct camera:
     ignored objects grey, intruders red, targets yellow on top. Shape agreed with AGENT1: meta.objects with
-    "ignored": true for excluded ones, meta.intruders as a separate list.
+    "ignored": true for excluded ones, meta.intruders as a separate list. `highlight` {"id", "text", "score"}
+    draws that object thick and green: what a Preview says the arm would pick.
     """
     from PIL import Image, ImageDraw
 
@@ -154,6 +155,9 @@ def _render_worker_frame(data: bytes, doc: dict) -> bytes:
             continue
         if o.get("ignored"):
             tag(o["bbox"], "ignored", (170, 170, 170), 1)
+            continue
+        if highlight and o.get("id") is not None and o.get("id") == highlight.get("id"):
+            tag(o["bbox"], f"{highlight['text']} {float(highlight.get('score') or 0):.2f}", (40, 220, 90), 4)
             continue
         label = str(o.get("label") or f"#{o.get('id', '')}")
         if o.get("score") is not None:
@@ -179,12 +183,17 @@ def _module_frame():
     except (FileNotFoundError, ValueError):
         return None
     age = time.time() - meta_path.stat().st_mtime  # laptop clock: the module's own ts may be skewed
-    key = ("module", meta.get("ts"))
+    try:
+        hl = json.loads((CAM_DIR / "module_highlight.json").read_text())
+        hl = hl if hl.get("until", 0) > time.time() else None
+    except (FileNotFoundError, ValueError):
+        hl = None
+    key = ("module", meta.get("ts"), hl and (hl.get("id"), hl.get("until")))
     if _worker_render["key"] != key:
-        objs = [{"bbox": o["bbox"], "label": o.get("label") or "unknown",
+        objs = [{"id": o.get("id"), "bbox": o["bbox"], "label": o.get("label") or "unknown",
                  "score": o.get("confidence")} for o in meta.get("objects") or []]
         _worker_render.update(key=key, jpeg=_render_worker_frame(data, {"meta": {"objects": objs,
-                                                                                 "intruders": meta.get("intruders")}}))
+                                                                                 "intruders": meta.get("intruders")}}, hl))
     return _worker_render["jpeg"], age
 
 
@@ -379,10 +388,18 @@ async def preview(body: TextIn):
     """
     Rank the objects currently in view against the text (no arm motion) and highlight the best one.
 
-    Shows the audience which object "green square" resolves to before the arm moves. Uses the crops the
-    camera process saved for the latest frame (objs.pkl).
+    Shows the audience which object "green square" resolves to before the arm moves. Module mode asks the
+    module ({"preview": text}: its cached frame, CLIP already loaded on the robot), so this laptop never loads
+    CLIP. Queue mode ranks the crops our own camera process saved for the latest frame (objs.pkl).
     """
     text = _clean(body.text)
+    if MODULE_MODE:
+        res = await module_call({"preview": text})
+        if res.get("ok") and res.get("target"):
+            t = res["target"]
+            (CAM_DIR / "module_highlight.json").write_text(json.dumps(
+                {"id": t.get("id"), "text": text, "score": t.get("score"), "until": time.time() + PREVIEW_HIGHLIGHT_S}))
+        return {"module": res}
     try:
         objs = [SimpleNamespace(**o) for o in pickle.loads((CAM_DIR / "objs.pkl").read_bytes())]
     except FileNotFoundError:

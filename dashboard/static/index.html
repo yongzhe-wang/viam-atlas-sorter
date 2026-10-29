@@ -339,7 +339,13 @@ $("b-prev").addEventListener("click", async () => {
   if (!text) { $("msg").textContent = "type what to grasp first"; return; }
   try {
     const r = await api("/api/preview", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text})});
-    $("msg").textContent = "best match: " + r.slice(0, 3).map((o) => `#${o.id} ${o.score.toFixed(2)}`).join(", ");
+    if (r.module) {
+      // Module mode: the robot's own decision from its cached frame; the target is boxed green in the picture
+      const m = r.module, ms = m.decide_ms != null ? ` (decided in ${m.decide_ms} ms)` : "";
+      $("msg").textContent = m.ok ? `would pick ${m.target.label || "#" + m.target.id} · ${Number(m.target.score).toFixed(2)}${ms}` : `${m.reason}${ms}`;
+    } else {
+      $("msg").textContent = "best match: " + r.slice(0, 3).map((o) => `#${o.id} ${o.score.toFixed(2)}`).join(", ");
+    }
     refreshCam();
   } catch (err) { $("msg").textContent = "preview: " + err.message; }
 });

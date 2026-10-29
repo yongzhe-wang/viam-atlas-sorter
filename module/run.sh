@@ -1,13 +1,18 @@
 #!/bin/sh
 # Module entrypoint (meta.json "entrypoint"). viam-server runs it with the module socket path as $1.
 #
-# The virtualenv lives in $VIAM_MODULE_DATA (set by viam-server, kept across module versions), not next to
-# this script: every `viam module reload-local` unpacks into a new versioned directory, so a local venv meant
-# reinstalling CPU torch (~10 min on sfhack4) on each redeploy. The install marker is keyed on a hash of
-# requirements.txt + the torch install method, so it reinstalls only when dependencies change.
+# Everything slow happens here, once, and is kept in $VIAM_MODULE_DATA (set by viam-server, kept across module
+# versions), so redeploys start fast:
+#   venv/   Python deps, CPU-only torch. Reinstalled only when requirements.txt changes (marker keyed on its hash).
+#   cache/  model caches (HF_HOME, TORCH_HOME, XDG_CACHE_HOME), so the ~600 MB CLIP weights are downloaded here
+#           during install, not on the first command. Fetched again only when the CLIP model line changes.
 set -e
 cd "$(dirname "$0")"
-VENV="${VIAM_MODULE_DATA:-$(pwd)}/venv"
+BASE="${VIAM_MODULE_DATA:-$(pwd)}"
+VENV="$BASE/venv"
+CACHE="$BASE/cache"
+mkdir -p "$CACHE"
+export HF_HOME="$CACHE/huggingface" TORCH_HOME="$CACHE/torch" XDG_CACHE_HOME="$CACHE"
 TORCH_INSTALL="torch --index-url https://download.pytorch.org/whl/cpu"
 if command -v sha256sum >/dev/null 2>&1; then HASH_CMD="sha256sum"; else HASH_CMD="shasum -a 256"; fi
 DEPS_HASH=$( (cat requirements.txt; echo "$TORCH_INSTALL") | $HASH_CMD | cut -c1-16)
@@ -20,5 +25,13 @@ if [ ! -f "$MARKER" ]; then
   "$VENV/bin/pip" install --quiet -r requirements.txt
   rm -f "$VENV"/.installed-*
   touch "$MARKER"
+fi
+# CLIP weights: keyed on the model/pretrained line in sorter/clip_embed.py, so a model change downloads again
+MODEL_KEY=$(grep -E '^MODEL, PRETRAINED *=' sorter/clip_embed.py | $HASH_CMD | cut -c1-16)
+WEIGHTS_MARKER="$CACHE/.clip-weights-$MODEL_KEY"
+if [ ! -f "$WEIGHTS_MARKER" ]; then
+  "$VENV/bin/python" -c "from sorter import clip_embed; clip_embed.embed_text('download the weights')"
+  rm -f "$CACHE"/.clip-weights-*
+  touch "$WEIGHTS_MARKER"
 fi
 exec "$VENV/bin/python" -m module.main "$@"

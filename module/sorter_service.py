@@ -6,15 +6,19 @@ WHY: other robot builders should get our whole pipeline (perception + CLIP choic
 inside viam-server also removes the laptop <-> robot WebRTC link that dropped repeatedly during our trials:
 the arm, gripper and camera are reached through viam-server's local connections.
 
-Always ready: CLIP and the object library load in the background at startup ("warm" in status). While idle
-with the arm at the observe pose, the service looks at the table about once a second and caches what it
-recognises ("seen"). A grasp then decides from that cached frame in milliseconds ("decide_ms") and either
-starts moving at once or answers at once that the object is not on the table.
+Always ready: run.sh installs deps and downloads the CLIP weights before the module starts. At startup a
+background task loads torch, CLIP (eval, all CPU threads), perception and the object library into memory
+and runs one dummy image + text pass ("warm" in status); until then a grasp answers "warming up" at once.
+While idle with the arm at the observe pose, the service looks at the table about once a second (every 2 s
+when a look takes over 800 ms) and caches what it recognises ("seen", with per-step "seen_ms"). A grasp then
+decides from that cached frame in milliseconds ("decide_ms") and either starts moving at once or answers at
+once that the object is not on the table.
 
 DoCommand:
   {"grasp": "green square"}          decide + start in the background -> {"ok": true, "accepted": true, "job": id,
                                      "decide_ms": ..., "target": {...}} or {"ok": false, "reason": "no ... on the table"}
   {"grasp": "...", "wait": true}     same, but block until done -> the attempt summary
+  {"preview": "green square"}        the same decision without moving: what would be picked, or why not
   {"reset": true}                    clear the square (pick-out, wipe fallback, verify empty)
   {"status": true}                   busy / running / last / warm / seen / library / store mode
   {"seen_image": true}               last idle frame as base64 JPEG (<= 640 px) with the seen boxes scaled to it
@@ -65,9 +69,13 @@ HEARTBEAT_S = 5.0  # dashboard marks a worker offline after 15 s (agreed with AG
 BUNDLE_DIR = Path(__file__).resolve().parent.parent / "library"
 SUMMARY_KEYS = ("_id", "status", "label", "score", "height_mm", "duration_s", "fail_phase", "fail_reason")
 WATCH_PERIOD_S = 1.0  # idle perception: one frame about every second
+SLOW_WATCH_PERIOD_S = 2.0  # ... every 2 s when one look takes longer than SLOW_LOOP_MS, so jobs are not starved
+SLOW_LOOP_MS = 800
 SEEN_FRESH_S = 1.5  # a grasp decides from the cached frame only when it is at most this old (VIAM CENTERAL)
-OBSERVE_TOL_MM = 15.0  # the arm counts as "at the observe pose" within this of HOME_XY / ALIGN_Z
+OBSERVE_TOL_MM = 15.0  # the arm counts as "at the observe pose" within this of HOME_XY / ALIGN_Z ...
+OBSERVE_TOL_DEG = 1.0  # ... and theta 0: AGENT1's pixel->world mapping for a target holds only there
 SEEN_IMAGE_WIDTH = 640
+WARM_RETRY_S = 30.0
 
 
 def seed_library(bundle: Path, data: Path) -> str:
@@ -99,7 +107,7 @@ def seed_library(bundle: Path, data: Path) -> str:
 def _runtime():
     """
     The arm/perception stack, imported on first use so viam-server can start the module and validate config
-    quickly (warm-up then loads CLIP in the background). One place, so tests can swap it for stubs.
+    quickly (warm-up then loads everything in the background). One place, so tests can swap it for stubs.
     """
     from sorter import clip_embed, executor, perception, worker
 
@@ -115,6 +123,10 @@ def _check_xy(attrs: dict, key: str) -> None:
 
 def _box(b) -> list:
     return [round(float(x), 1) for x in b]
+
+
+def _ms(t0: float) -> int:
+    return round((time.monotonic() - t0) * 1000)
 
 
 class GraspByDescription(Generic, EasyResource):
@@ -168,15 +180,16 @@ class GraspByDescription(Generic, EasyResource):
         if not uri and data_dir is not None:
             LOGGER.info(f"{config.name}: {seed_library(BUNDLE_DIR, data_dir)} into {data_dir}")
         self.store = Store(uri=uri, data_dir=str(data_dir) if data_dir else None)
-        self.library = self.store.library_stats()  # fixed for this instance: the library only changes on redeploy
+        self.library = self.store.library_stats()
         self.worker_id = f"module:{config.name}"
         self.rig = None
         self.job: Optional[asyncio.Task] = None
         self.job_info: Dict[str, Any] = {}
         self.last: Dict[str, Any] = {}
-        self.warm, self.warm_s, self.warm_error = False, None, None
+        self.warm, self.warm_ms, self.warm_error = False, None, None
+        self.watch_period = WATCH_PERIOD_S
         self.seen: Dict[str, Any] = {}  # summary of the latest idle look, for status / dashboard
-        self._seen_raw = None  # {"ts", "objs", "rgb", "depth", "pose"} behind self.seen, for a fast grasp
+        self._seen_raw = None  # {"ts", "recs", "objs", "rgb", "depth", "pose"} behind self.seen, for a fast grasp
         self._jpeg_cache = (None, None, 1.0)  # (frame ts, base64 jpeg, scale) for seen_image
         self._no_target_warned = False
         loop = asyncio.get_event_loop()
@@ -232,51 +245,84 @@ class GraspByDescription(Generic, EasyResource):
     def _busy(self) -> bool:
         return self.job is not None and not self.job.done()
 
+    def _warm_sync(self) -> None:
+        """
+        Everything the first command would otherwise pay for: imports, CLIP in eval mode on every CPU thread,
+        the object library as one normalised in-memory matrix, and one dummy image + text pass (first-call
+        allocation). The weights themselves were downloaded by run.sh into $VIAM_MODULE_DATA/cache.
+        """
+        import numpy as np
+        import open_clip  # noqa: F401  a missing package should fail warm-up, not the first command
+        import torch
+
+        rt = _runtime()
+        rt.clip_embed.embed_images([np.zeros((64, 64, 3), np.uint8)])  # loads the model (eval) on first call
+        torch.set_num_threads(os.cpu_count() or 1)  # after the load, which sets its own thread count
+        rt.clip_embed.embed_images([np.zeros((224, 224, 3), np.uint8)])
+        rt.clip_embed.embed_text("warm up")
+        self.store.library_matrix()
+        self.library = self.store.library_stats()
+
     async def _warmup(self) -> None:
-        """Load CLIP and the view library right after start, so the first grasp pays for neither."""
-        t0 = time.monotonic()
-        try:
-            rt = await asyncio.to_thread(_runtime)
-            await asyncio.to_thread(rt.clip_embed.embed_text, "warm up")  # loads the CLIP weights
-            # Parses (and, offline, caches) the library; a unit vector because cosine search rejects zero vectors
-            await asyncio.to_thread(self.store.search_views, [1.0] + [0.0] * 511, 1)
-            self.warm, self.warm_s = True, round(time.monotonic() - t0, 1)
-            LOGGER.info(f"{self.name}: warm in {self.warm_s} s")
-        except Exception as e:
-            self.warm_error = f"{type(e).__name__}: {e}"[:300]
-            LOGGER.error(f"{self.name}: warm-up failed: {self.warm_error}")
+        """Run _warm_sync in the background right after start; retry every WARM_RETRY_S until it succeeds."""
+        while not self.warm:
+            t0 = time.monotonic()
+            try:
+                await asyncio.to_thread(self._warm_sync)
+                self.warm, self.warm_ms, self.warm_error = True, _ms(t0), None
+                LOGGER.info(f"{self.name}: warm in {self.warm_ms} ms ({self.library['views']} library views)")
+            except Exception as e:
+                self.warm_error = f"{type(e).__name__}: {e}"[:300]
+                LOGGER.error(f"{self.name}: warm-up failed, retrying in {WARM_RETRY_S:.0f} s: {self.warm_error}")
+                await asyncio.sleep(WARM_RETRY_S)
 
     def _perceive(self, rt, rgb, depth) -> tuple:
         """
-        Targets in one frame plus what the library recognises each as: (objs, [summaries], [intruders]).
+        Targets in one frame with their library labels: (recs, [summaries], [intruders], step timings ms).
 
+        recs = clip_embed.recognise_all() output (one CLIP batch for all crops), reused by best() at grasp time.
         Same filter as executor.find_target: nothing cut by the image border, nothing already in the square.
         """
+        ms = {}
+        t = time.monotonic()
         seg = rt.perception.segment_full(rgb, depth)
+        ms["segment"] = _ms(t)
+        t = time.monotonic()
         hole = rt.executor.hole_mask(rgb)
-        objs = [o for o in seg.objects
-                if not o.touches_edge and (hole is None or (o.mask & hole).sum() < 0.5 * o.mask.sum())]
-        embs = rt.clip_embed.embed_images([o.crop for o in objs])
-        objects = []
-        for o, emb in zip(objs, embs):
-            lab, names, conf = rt.clip_embed.recognise(emb, self.store, colour=o.colour, height_mm=o.height_mm)
-            objects.append({"id": int(o.id), "label": lab, "aliases": [n for n in names if n != lab],
-                            "confidence": round(float(conf), 3), "colour": o.colour,
-                            "height_mm": round(float(o.height_mm), 1), "bbox": _box(o.bbox)})
+        ms["square"] = _ms(t)
+        t = time.monotonic()
+        if hasattr(rt.clip_embed, "recognise_all"):
+            recs = rt.clip_embed.recognise_all(rgb, depth, self.store, seg=seg)
+        else:  # older clip_embed without the batched call
+            objs = list(seg.objects)
+            recs = []
+            for o, emb in zip(objs, rt.clip_embed.embed_images([o.crop for o in objs])):
+                lab, names, conf = rt.clip_embed.recognise(emb, self.store, colour=o.colour, height_mm=o.height_mm)
+                recs.append({"obj": o, "label": lab, "names": names, "score": conf, "emb": emb})
+        recs = [r for r in recs if not r["obj"].touches_edge
+                and (hole is None or (r["obj"].mask & hole).sum() < 0.5 * r["obj"].mask.sum())]
+        ms["clip"] = _ms(t)
+        objects = [{"id": int(r["obj"].id), "label": r["label"],
+                    "aliases": [n for n in (r.get("names") or []) if n != r["label"]],
+                    "confidence": round(float(r.get("score") or 0.0), 3), "colour": r["obj"].colour,
+                    "height_mm": round(float(r["obj"].height_mm), 1), "bbox": _box(r["obj"].bbox)} for r in recs]
         intruders = [{"bbox": _box(i["bbox"]), "reason": i.get("reason", "")} for i in seg.intruders]
-        return objs, objects, intruders
+        return recs, objects, intruders, ms
 
     async def _pose(self, rt) -> tuple:
         """(pose dict, at_observe) from the arm's current end position."""
         p = await self.arm.get_end_position()
         hx, hy = rt.ppa.HOME_XY
-        at = max(abs(p.x - hx), abs(p.y - hy), abs(p.z - rt.ppa.ALIGN_Z)) <= OBSERVE_TOL_MM
-        return {"x": round(p.x, 1), "y": round(p.y, 1), "z": round(p.z, 1), "theta": round(p.theta, 1)}, at
+        dtheta = abs(((p.theta + 180.0) % 360.0) - 180.0)
+        at = (max(abs(p.x - hx), abs(p.y - hy), abs(p.z - rt.ppa.ALIGN_Z)) <= OBSERVE_TOL_MM
+              and dtheta <= OBSERVE_TOL_DEG)
+        return {"x": round(p.x, 1), "y": round(p.y, 1), "z": round(p.z, 1), "theta": round(p.theta, 2)}, at
 
     async def _look(self) -> None:
         """
         One idle look: only from the observe pose and only if the arm did not move while we looked (another
-        driver may be using it), so a cached frame always matches where the arm is.
+        driver may be using it), so a cached frame always matches where the arm is. Records step timings and
+        slows the loop to SLOW_WATCH_PERIOD_S when a look takes over SLOW_LOOP_MS.
         """
         rt = _runtime()
         pose, at = await self._pose(rt)
@@ -285,25 +331,28 @@ class GraspByDescription(Generic, EasyResource):
             self.seen = {"ts": time.time(), "at_observe": False, "pose": pose, "objects": [], "intruders": [],
                          "reason": "arm is not at the observe pose"}
             return
+        t_all = time.monotonic()
         t_cap = time.time()
         res = await self.camera.get_images()
         rgb, depth = rt.ppa.decode(res[0] if isinstance(res, tuple) else res)
+        frame_ms = _ms(t_all)
         if rgb is None or depth is None:
             raise RuntimeError("camera returned no colour + depth frame")
-        t0 = time.monotonic()
-        objs, objects, intruders = await asyncio.to_thread(self._perceive, rt, rgb, depth)
-        perceive_ms = round((time.monotonic() - t0) * 1000)
+        recs, objects, intruders, ms = await asyncio.to_thread(self._perceive, rt, rgb, depth)
+        ms = {"frame": frame_ms, **ms, "total": _ms(t_all)}
+        self.watch_period = SLOW_WATCH_PERIOD_S if ms["total"] > SLOW_LOOP_MS else WATCH_PERIOD_S
         pose2, still = await self._pose(rt)
         if self._busy() or not still or max(abs(pose2[k] - pose[k]) for k in ("x", "y", "z")) > 2.0:
             return  # arm moved meanwhile: this frame says nothing reliable about where things are now
-        self._seen_raw = {"ts": t_cap, "objs": objs, "rgb": rgb, "depth": depth, "pose": pose}
+        self._seen_raw = {"ts": t_cap, "recs": recs, "objs": [r["obj"] for r in recs], "rgb": rgb, "depth": depth,
+                          "pose": pose}
         self.seen = {"ts": t_cap, "at_observe": True, "pose": pose, "objects": objects, "intruders": intruders,
-                     "perceive_ms": perceive_ms}
+                     "seen_ms": ms, "watch_period_s": self.watch_period}
 
     async def _watch_loop(self) -> None:
-        """Idle perception, about once a second, once warm and while no job runs."""
+        """Idle perception, every watch_period, once warm and while no job runs."""
         while True:
-            await asyncio.sleep(WATCH_PERIOD_S)
+            await asyncio.sleep(self.watch_period)
             if not self.warm or self._busy():
                 continue
             try:
@@ -333,6 +382,64 @@ class GraspByDescription(Generic, EasyResource):
         return {"ok": True, "ts": ts, "jpeg_b64": b64, "scale": scale,
                 "objects": [{**o, "bbox": [x * scale for x in o["bbox"]]} for o in seen["objects"]],
                 "intruders": [{**i, "bbox": [x * scale for x in i["bbox"]]} for i in seen["intruders"]]}
+
+    # ---- deciding --------------------------------------------------------------------------------------
+
+    def _not_ready(self) -> Optional[Dict[str, ValueTypes]]:
+        """Immediate answer while warm-up has not finished, so a command never blocks on loading CLIP."""
+        if self.warm:
+            return None
+        reason = "warming up: loading CLIP and the object library"
+        if self.warm_error:
+            reason += f" (last attempt failed: {self.warm_error}; retrying)"
+        return {"ok": False, "accepted": False, "status": "warming_up", "reason": reason}
+
+    async def _decide(self, text: str) -> tuple:
+        """
+        clip_embed.best() on the cached idle frame: (pick, decide_ms, raw), or (None, None, raw) when there is no
+        fresh frame. Reuses the frame's recognise_all() output, so no crop is embedded again.
+        """
+        raw = self._seen_raw
+        if raw is None or time.time() - raw["ts"] > SEEN_FRESH_S:
+            return None, None, raw
+        rt = _runtime()
+        t0 = time.monotonic()
+        if "recognised" in inspect.signature(rt.clip_embed.best).parameters:
+            pick = await asyncio.to_thread(rt.clip_embed.best, None, text, self.store, recognised=raw["recs"])
+        else:
+            pick = await asyncio.to_thread(rt.clip_embed.best, raw["objs"], text, self.store)
+        return pick, _ms(t0), raw
+
+    @staticmethod
+    def _refusal(pick: dict, text: str) -> Optional[tuple]:
+        """(status, reason) when the decision is not to pick anything, else None."""
+        if pick.get("obj") is None:
+            return "not_found", f"no {text!r} on the table" + (f" ({pick['reason']})" if pick.get("reason") else "")
+        if pick.get("ambiguous"):
+            return "ambiguous", f"two objects match {text!r} about equally; be more specific"
+        return None
+
+    @staticmethod
+    def _target_summary(pick: dict) -> dict:
+        o = pick["obj"]
+        return {"id": int(o.id), "label": pick.get("recognised"), "score": round(float(pick.get("score", 0.0)), 3),
+                "bbox": _box(o.bbox)}
+
+    async def _preview(self, text: str) -> Dict[str, ValueTypes]:
+        """What a grasp for `text` would pick from the cached frame, without moving (dashboard Preview)."""
+        busy_or_cold = self._not_ready()
+        if busy_or_cold:
+            return busy_or_cold
+        pick, decide_ms, raw = await self._decide(text)
+        if pick is None:
+            why = "no fresh frame from the observe pose" if raw is None else "the cached frame is too old"
+            return {"ok": False, "reason": why, "decided_from_cache": False}
+        refusal = self._refusal(pick, text)
+        if refusal:
+            return {"ok": False, "status": refusal[0], "reason": refusal[1], "decide_ms": decide_ms,
+                    "decided_from_cache": True}
+        return {"ok": True, "target": self._target_summary(pick), "decide_ms": decide_ms, "decided_from_cache": True,
+                "frame_ts": raw["ts"]}
 
     # ---- jobs --------------------------------------------------------------------------------------
 
@@ -387,35 +494,31 @@ class GraspByDescription(Generic, EasyResource):
         """
         if self._busy():
             return {"ok": False, "accepted": False, "error": "busy", "running": dict(self.job_info)}
-        raw = self._seen_raw
-        age = time.time() - raw["ts"] if raw else None
-        if raw is None or age > SEEN_FRESH_S:
-            why = "no fresh frame from the observe pose" if raw is None else f"cached frame is {age:.1f} s old"
+        cold = self._not_ready()
+        if cold:
+            return cold
+        pick, decide_ms, raw = await self._decide(text)
+        if pick is None:
+            why = ("no fresh frame from the observe pose" if raw is None
+                   else f"cached frame is {time.time() - raw['ts']:.1f} s old")
             res = await self._start("grasp", text, wait)
             return {**res, "ok": bool(res.get("accepted")), "decided_from_cache": False, "fast_path": False,
                     "decide_ms": None, "why_slow": why}
-        rt = _runtime()
-        t0 = time.monotonic()
-        pick = await asyncio.to_thread(rt.clip_embed.best, raw["objs"], text, self.store)
-        decide_ms = round((time.monotonic() - t0) * 1000)
-        obj = pick.get("obj")
-        if obj is None or pick.get("ambiguous"):
-            status = "not_found" if obj is None else "ambiguous"
-            reason = (f"no {text!r} on the table" + (f" ({pick['reason']})" if pick.get("reason") else "")
-                      if obj is None else f"two objects match {text!r} about equally; be more specific")
+        refusal = self._refusal(pick, text)
+        if refusal:
+            status, reason = refusal
             self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": status,
                          "fail_phase": "find", "fail_reason": reason, "decide_ms": decide_ms, "decided_from_cache": True}
             return {"ok": False, "accepted": False, "status": status, "reason": reason, "decide_ms": decide_ms,
                     "decided_from_cache": True}
         target = {**pick, "rgb": raw["rgb"], "depth": raw["depth"], "pose": raw["pose"], "ts": raw["ts"]}
         # fast_path: the executor will skip its own first observe (needs AGENT1's execute(..., target=...))
-        fast = "target" in inspect.signature(rt.executor.execute).parameters
+        fast = "target" in inspect.signature(_runtime().executor.execute).parameters
         res = await self._start("grasp", text, wait, target=target, decide_ms=decide_ms)
         if not res.get("accepted"):
             return {**res, "ok": False}  # became busy while deciding
         return {**res, "ok": True, "decided_from_cache": True, "fast_path": fast, "decide_ms": decide_ms,
-                "target": {"id": int(obj.id), "label": pick.get("recognised"),
-                           "score": round(float(pick.get("score", 0.0)), 3), "bbox": _box(obj.bbox)}}
+                "target": self._target_summary(pick)}
 
     def _status(self) -> Dict[str, ValueTypes]:
         seen = dict(self.seen)
@@ -423,7 +526,7 @@ class GraspByDescription(Generic, EasyResource):
             seen["age_s"] = round(time.time() - seen["ts"], 1)
         return {"busy": self._busy(), "running": dict(self.job_info) if self._busy() else {}, "last": dict(self.last),
                 "store": "atlas" if self.store.online else "jsonl", "worker_id": self.worker_id,
-                "library": dict(self.library), "warm": self.warm, "warm_s": self.warm_s,
+                "library": dict(self.library), "warm": self.warm, "warm_ms": self.warm_ms,
                 "warm_error": self.warm_error, "seen": seen}
 
     async def do_command(self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None,
@@ -432,15 +535,16 @@ class GraspByDescription(Generic, EasyResource):
             return self._status()
         if command.get("seen_image"):
             return self._seen_image()
-        if "grasp" in command:
-            text = _runtime().clean(str(command.get("grasp") or ""))
-            if not text:
-                return {"ok": False, "accepted": False, "error": "say what to grasp, e.g. {\"grasp\": \"green square\"}"}
-            return await self._grasp(text, bool(command.get("wait")))
+        for key in ("grasp", "preview"):
+            if key in command:
+                text = _runtime().clean(str(command.get(key) or ""))
+                if not text:
+                    return {"ok": False, "accepted": False, "error": f"say what to {key}, e.g. {{\"{key}\": \"green square\"}}"}
+                return await (self._grasp(text, bool(command.get("wait"))) if key == "grasp" else self._preview(text))
         if command.get("reset"):
             return await self._start("reset", None, bool(command.get("wait")))
-        return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"reset\": true}, {\"status\": true} "
-                         "or {\"seen_image\": true}"}
+        return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"preview\": \"<description>\"}, "
+                         "{\"reset\": true}, {\"status\": true} or {\"seen_image\": true}"}
 
     # ---- background loops --------------------------------------------------------------------------
 
