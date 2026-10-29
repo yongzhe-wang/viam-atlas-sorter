@@ -55,6 +55,9 @@ SANITY_MIN_Z = 120.0  # absolute flange floor; Viam's own collision check refuse
 HOME_XY = (250.0, 0.0)
 MAX_STEP_MM = 250.0
 TOL_PX = 7.0
+# While carrying, align the square here relative to the axis pixel: up-left, away from the held object that
+# hangs into the bottom-right (it hid the hole twice on 2026-10-29); then one J^-1 step to the real target
+CARRY_OFFSET_PX = (-276.0, -232.0)
 GRAB_TRIES = 3  # first grab + 2 retries
 SETTLE_S = 1.0  # wait after every move before trusting a camera frame
 # Jaw-axis model fitted from released blocks (data/jaw_calib.json); None until `jaw_calib.py fit` has run
@@ -520,15 +523,20 @@ class Rig:
         p = await self.pose()
         await self.goto(p.x, p.y, ALIGN_Z)
 
-    async def servo(self, finder, use_top: bool, label: str, plane_at=None) -> None:
+    async def servo(self, finder, use_top: bool, label: str, plane_at=None, offset=(0.0, 0.0)) -> None:
         """
         Bring the target found by `finder` onto the gripper axis, closed loop.
 
         Before: target anywhere in view. After: its pixel is within TOL_PX of where the gripper axis
         projects at the target's measured depth (object top if use_top, else the table). Each round
         probes two small moves to measure the pixel Jacobian, so axis/sign conventions are never assumed.
+
+        `offset` (px): servo the target to axis pixel + offset instead, then make one open-loop move of
+        J^-1 (-offset) with the last measured Jacobian. Used while carrying: the held object covers the
+        bottom-right of the image, where the axis pixel is, so the square is aligned somewhere visible.
         """
-        for it in range(6):
+        J = None
+        for it in range(8):
             p = await self.pose()
             rgb, depth = await self.frame()
             hit = finder(rgb)
@@ -541,9 +549,15 @@ class Rig:
                 table, top = table_and_near(depth, hit if use_top else None)
                 plane = top if (use_top and top is not None) else table
             tu, tv = axis_pixel(self.fx, self.fy, self.cx, self.cy, plane)
+            tu, tv = tu + offset[0], tv + offset[1]
             e = np.array([hit[0] - tu, hit[1] - tv])
             print(f"  {label} iter {it}: px=({hit[0]:.0f},{hit[1]:.0f}) want=({tu:.0f},{tv:.0f}) depth={plane:.0f} err={np.linalg.norm(e):.0f}px")
-            if np.linalg.norm(e) < TOL_PX:
+            if np.linalg.norm(e) < TOL_PX and (J is not None or not any(offset)):
+                if any(offset):
+                    # Final blind step from the visible alignment point onto the real axis pixel
+                    move = np.linalg.solve(J, -np.array(offset, float))
+                    print(f"  {label}: offset step ({move[0]:.0f},{move[1]:.0f}) mm")
+                    await self.goto(p.x + move[0], p.y + move[1], p.z)
                 return
             # Probe +15 mm along arm x then y, record how the target moves in the image
             probe = 15.0
@@ -748,14 +762,14 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
         await travel(rig, *square_xy)
         if find_square((await rig.frame())[0]):
             try:
-                await rig.servo(find_square, False, "square")
+                await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX)
             except RuntimeError as e:
                 print(f"  refine skipped ({e}); placing at the located square")
                 await travel(rig, *square_xy)
     else:
         # The square is on paper that people move around: never assume where it is
         await search_square(rig)
-        await rig.servo(find_square, False, "square")
+        await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX)
     t = mark(times, "carry", t)
 
     if not await rig.holding():
