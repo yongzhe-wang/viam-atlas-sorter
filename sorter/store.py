@@ -300,9 +300,11 @@ class Store:
         """
         data, scale = _small_jpeg_scaled(bytes(jpeg))
         meta = dict(meta or {})
-        if scale != 1.0 and meta.get("objects"):
-            meta["objects"] = [{**o, "bbox": [float(x) * scale for x in o["bbox"]]} if o.get("bbox") else o
-                               for o in meta["objects"]]
+        # objects (targets + {"ignored": true}) and intruders both carry boxes in source-image pixels
+        for key in ("objects", "intruders"):
+            if scale != 1.0 and meta.get(key):
+                meta[key] = [{**o, "bbox": [float(x) * scale for x in o["bbox"]]} if o.get("bbox") else o
+                             for o in meta[key]]
         doc = {"_id": worker, "worker": worker, "ts": time.time(), "meta": meta}
         if self.online:
             from bson import Binary

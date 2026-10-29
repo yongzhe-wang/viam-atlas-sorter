@@ -113,24 +113,39 @@ def _cam_state() -> dict:
 
 
 def _render_worker_frame(data: bytes, doc: dict) -> bytes:
-    """Worker frame with the worker's object boxes drawn on it (bboxes are already in this image's pixels)."""
+    """
+    Worker frame with the worker's boxes (already in this image's pixels), same colours as the direct camera:
+    ignored objects grey, intruders red, targets yellow on top. Shape agreed with AGENT1: meta.objects with
+    "ignored": true for excluded ones, meta.intruders as a separate list.
+    """
     from PIL import Image, ImageDraw
 
-    objs = (doc.get("meta") or {}).get("objects") or []
-    if not objs:
+    meta = doc.get("meta") or {}
+    objs, intruders = meta.get("objects") or [], meta.get("intruders") or []
+    if not objs and not intruders:
         return data
     im = Image.open(io.BytesIO(data)).convert("RGB")
     draw = ImageDraw.Draw(im)
-    for o in objs:
+
+    def tag(box, text, fill, width):
+        u0, v0, u1, v1 = [int(x) for x in box]
+        draw.rectangle([u0, v0, u1, v1], outline=fill, width=width)
+        draw.rectangle([u0, max(v0 - 14, 0), u0 + 6 * len(text) + 4, max(v0 - 14, 0) + 14], fill=fill)
+        draw.text((u0 + 2, max(v0 - 13, 1)), text, fill=(0, 0, 0))
+
+    for o in sorted(objs, key=lambda o: not o.get("ignored")):  # ignored first, so targets end up on top
         if not o.get("bbox"):
             continue
-        u0, v0, u1, v1 = [int(x) for x in o["bbox"]]
-        draw.rectangle([u0, v0, u1, v1], outline=(255, 200, 0), width=2)
+        if o.get("ignored"):
+            tag(o["bbox"], "ignored", (170, 170, 170), 1)
+            continue
         label = str(o.get("label") or f"#{o.get('id', '')}")
         if o.get("score") is not None:
             label += f" {float(o['score']):.2f}"
-        draw.rectangle([u0, max(v0 - 14, 0), u0 + 6 * len(label) + 4, max(v0 - 14, 0) + 14], fill=(255, 200, 0))
-        draw.text((u0 + 2, max(v0 - 13, 1)), label, fill=(0, 0, 0))
+        tag(o["bbox"], label, (255, 200, 0), 2)
+    for it in intruders:
+        if it.get("bbox"):
+            tag(it["bbox"], "hand? arm paused", (240, 70, 60), 3)
     out = io.BytesIO()
     im.save(out, "JPEG", quality=80)
     return out.getvalue()
