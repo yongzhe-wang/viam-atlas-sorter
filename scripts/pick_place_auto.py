@@ -131,7 +131,7 @@ def decode(images) -> tuple:
     return rgb, depth
 
 
-def table_and_near(depth: np.ndarray, hint=None, radius: float = 150.0) -> tuple:
+def table_and_near(depth: np.ndarray, hint=None, radius: float = 150.0, shift=(0.0, 0.0)) -> tuple:
     """
     (table depth, object-top depth or None) from one depth map, in mm.
 
@@ -150,8 +150,8 @@ def table_and_near(depth: np.ndarray, hint=None, radius: float = 150.0) -> tuple
     if hint is None:
         k = 1 + int(np.argmax(sizes))
     else:
-        # Depth is aligned to colour, so the colour pixel indexes the depth map directly
-        hu, hv = hint[0], hint[1]
+        # Colour pixel -> depth pixel: (0, 0) with align_color_depth on (see Rig.detect_depth_shift)
+        hu, hv = hint[0] + shift[0], hint[1] + shift[1]
         cents = ndimage.center_of_mass(near, lab, range(1, n + 1))
         cand = [(math.hypot(c[1] - hu, c[0] - hv), i + 1) for i, c in enumerate(cents) if sizes[i] >= 800]
         if not cand or min(cand)[0] > radius:
@@ -348,6 +348,8 @@ class Rig:
         self.theta = 0.0
         # Flange floor; tightened from measured table depth before any descent
         self.floor_z = 250.0
+        self.depth_shift = (0.0, 0.0)  # colour -> depth pixel offset; (0, 0) when align_color_depth is on
+        self.last_depth = None  # depth map of the latest frame(), for finders that need it
 
     async def connect(self) -> None:
         opts = RobotClient.Options.with_api_key(
@@ -361,6 +363,7 @@ class Rig:
         if not hasattr(self, "fx"):
             intr = (await self.cam.get_properties()).intrinsic_parameters
             self.fx, self.fy, self.cx, self.cy = intr.focal_x_px, intr.focal_y_px, intr.center_x_px, intr.center_y_px
+            await self.detect_depth_shift()
 
     async def close(self) -> None:
         if self.robot is not None:
@@ -427,7 +430,39 @@ class Rig:
 
     async def frame(self) -> tuple:
         res = await self.call("get images", lambda: self.cam.get_images())
-        return decode(res[0] if isinstance(res, tuple) else res)
+        rgb, depth = decode(res[0] if isinstance(res, tuple) else res)
+        self.last_depth = depth
+        return rgb, depth
+
+    async def detect_depth_shift(self) -> None:
+        """
+        Pick the colour->depth offset that makes yellow pixels land on near-depth blobs (IoU).
+
+        WHY: align_color_depth can be switched in the Viam app at any moment (it was, mid-session); comparing
+        (0, 0) with the old unaligned offset on a live frame keeps the code right either way. No yellow
+        object in view -> keep the current value.
+        {COORDINATOR 2026-10-29 "IOU OF THE YELLOW MASK VS THE NEAR-DEPTH MASK IS 0.31 AT (0,0) AND 0.06 AT (-60,+22)"}
+        [CONFIDENCE: CONFIRMED 85% — measured by the coordinator after the flip]
+        """
+        rgb, depth = await self.frame()
+        if depth is None:
+            return
+        hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+        yel = (hsv[..., 0] >= 32) & (hsv[..., 0] <= 48) & (hsv[..., 1] > 100) & (hsv[..., 2] > 110)
+        if yel.sum() < 1500:
+            print(f"  depth shift: no yellow in view, keeping {self.depth_shift}")
+            return
+        table, _ = table_and_near(depth)
+        near = (depth > 0) & (depth < table - 10) & (depth > table - 80)
+        best = None
+        for du, dv in ((0, 0), (-60, 22)):
+            # Shift the yellow mask into depth coordinates and compare with the near-depth mask
+            moved = np.roll(np.roll(yel, dv, axis=0), du, axis=1)
+            iou = (moved & near).sum() / max((moved | near).sum(), 1)
+            if best is None or iou > best[0]:
+                best = (iou, (float(du), float(dv)))
+        self.depth_shift = best[1]
+        print(f"  depth shift: using {self.depth_shift} (IoU {best[0]:.2f})")
 
     async def measure(self, finder=None) -> tuple:
         """
@@ -440,7 +475,7 @@ class Rig:
         rgb, depth = await self.frame()
         if depth is None:
             raise RuntimeError("no depth map")
-        table, top = table_and_near(depth, finder(rgb) if finder else None)
+        table, top = table_and_near(depth, finder(rgb) if finder else None, shift=self.depth_shift)
         self.floor_z = p.z - (table - TIP_BELOW_CAM - TIP_CLEARANCE)
         return p.z, table, top
 
@@ -653,11 +688,8 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     t = time.monotonic()
     print("3/5 find blue square")
     times["at"] = "carry"
-    for _ in range(4):
-        if find_square((await rig.frame())[0]):
-            break
-        q = await rig.pose()
-        await rig.goto(q.x, q.y + 100.0, ALIGN_Z)  # square was on the +y side of the block
+    # The square is on paper that people move around: never assume where it is
+    await search_square(rig)
     await rig.servo(find_square, False, "square")
     t = mark(times, "carry", t)
 
@@ -667,6 +699,51 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     times["at"] = "place"
     await release_here(rig, height, grip, observe=True)
     mark(times, "place", t)
+
+
+# Observation points for finding the square, flange x/y mm, inside the reach the arm has used safely
+SEARCH_XY = [(x, y) for x in (250.0, 380.0, 500.0) for y in (-300.0, -150.0, 0.0, 150.0, 300.0)
+             if 150.0 <= math.hypot(x, y) <= 600.0]
+SQUARE_CLEAR_PX = 145.0  # ~60 mm at the 378 mm observe depth (~2.4 px/mm)
+
+
+def near_square(rgb: np.ndarray, uv, radius: float = SQUARE_CLEAR_PX) -> bool:
+    """
+    True if blue tape or the white paper under it is within `radius` px of pixel `uv`.
+
+    Paper = bright and unsaturated (V > 200, S < 40); the wood table reads S ~28 but V ~134.
+    """
+    hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+    paper = (hsv[..., 2] > 200) & (hsv[..., 1] < 40)
+    blue = blue_mask(rgb)
+    h, w = paper.shape
+    u, v = int(round(uv[0])), int(round(uv[1]))
+    # Inside the hole: tape on all four sides (the hole can be wider than `radius`)
+    if 0 <= u < w and 0 <= v < h:
+        rays = (blue[v, max(0, u - 450):u], blue[v, u:u + 450], blue[max(0, v - 450):v, u], blue[v:v + 450, u])
+        if all(r.any() for r in rays):
+            return True
+    vv, uu = np.ogrid[:h, :w]
+    disk = (uu - uv[0]) ** 2 + (vv - uv[1]) ** 2 < radius ** 2
+    disk[FINGER_ROW:] = False
+    return bool(((blue | paper) & disk).sum() > 400)
+
+
+async def search_square(rig: Rig) -> None:
+    """
+    Leave the arm at ALIGN_Z with the whole tape hole in view; raise if it is nowhere on the table.
+
+    Looks from the current pose first, then visits SEARCH_XY nearest-first.
+    """
+    if find_square((await rig.frame())[0]):
+        return
+    p = await rig.pose()
+    for x, y in sorted(SEARCH_XY, key=lambda q: math.hypot(q[0] - p.x, q[1] - p.y)):
+        await travel(rig, x, y)
+        if find_square((await rig.frame())[0]):
+            print(f"  square found from ({x:.0f},{y:.0f})")
+            return
+    raise RuntimeError("square: not found anywhere on the table")
 
 
 async def travel(rig: Rig, x: float, y: float, theta: float = None) -> None:
@@ -695,9 +772,12 @@ async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> 
     table, _ = table_and_near(depth)
     hint = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
     # ~220 px is ~90 mm at ALIGN_Z: keeps the open jaws (84 mm stroke) clear of neighbours
-    _, top = table_and_near(depth, hint, radius=220.0)
+    _, top = table_and_near(depth, hint, radius=220.0, shift=rig.depth_shift)
     if top is not None:
         print(f"  spot ({x:.0f},{y:.0f}) occupied, skipping")
+        return False
+    if near_square(rgb, hint):
+        print(f"  spot ({x:.0f},{y:.0f}) is on/near the tape square or its paper, skipping")
         return False
     await release_here(rig, height, grip)
     return True
