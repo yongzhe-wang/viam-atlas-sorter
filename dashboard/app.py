@@ -44,6 +44,7 @@ sys.path.insert(0, str(ROOT))
 from sorter.store import Store  # noqa: E402
 
 RESET_COMMAND = "__reset__"  # EXEC_PLAN "Clear square" button; executed by the arm worker
+SCAN_COMMAND = "__scan__"  # "Scan table" button: the module scans the whole table into its live map (module mode)
 MAX_TEXT = 200
 PREVIEW_HIGHLIGHT_S = 15.0
 STALE_S = 5.0  # camera state older than this means the camera process is down or restarting
@@ -352,13 +353,16 @@ def objects():
 async def add_command(body: TextIn):
     """Queue mode: Store command for a worker. Module mode: DoCommand on the module, which runs it in the background."""
     text = body.text.strip()
-    text = RESET_COMMAND if text == RESET_COMMAND else _clean(text)
+    text = text if text in (RESET_COMMAND, SCAN_COMMAND) else _clean(text)
     if not MODULE_MODE:
+        if text == SCAN_COMMAND:
+            raise HTTPException(400, "Scan table needs the Viam module (DASH_COMMAND_PATH=module)")
         return {"id": store.add_command(text)}
     entry = {"_id": uuid.uuid4().hex, "text": text, "ts": time.time(), "status": "sending"}
     module_cmds.appendleft(entry)
     try:
-        res = await module_call({"reset": True} if text == RESET_COMMAND else {"grasp": text})
+        res = await module_call({"reset": True} if text == RESET_COMMAND else {"scan_table": True}
+                                if text == SCAN_COMMAND else {"grasp": text})
     except HTTPException as e:
         entry.update(status="error", fail_reason=e.detail)
         raise
@@ -456,9 +460,11 @@ def table_map():
         sightings = d.get("sightings") or []
         running = ((_module_state().get("status") or {}).get("running") or {})
         sweep = running.get("sweep") or None
+        search = {**running["search"], "text": running.get("text")} if running.get("search") else None
     else:
         m, sightings, robot_now = store.get_table_map(with_emb=False), store.list_sightings(), time.time()
         sweep = next((w.get("sweep") for w in workers() if w.get("online") and w.get("sweep")), None)
+        search = None
     if m:
         m["age_s"] = round(robot_now - (m.get("ts") or robot_now), 1)
         # Live map: each object's own age (seen_ts); an older map without it -> the map's age for all
@@ -471,7 +477,7 @@ def table_map():
     for s in sightings:
         s["age_s"] = round(robot_now - (s.get("ts") or robot_now), 1)
     hl = dict(_map_highlight) if _map_highlight.get("until", 0) > time.time() else None
-    return {"map": m, "sightings": sightings, "sweep": sweep, "reach_mm": [120, 650], "highlight": hl}
+    return {"map": m, "sightings": sightings, "sweep": sweep, "search": search, "reach_mm": [120, 650], "highlight": hl}
 
 
 @app.post("/api/clear_map")

@@ -95,13 +95,20 @@ await sorter.do_command({"reset": True})                    # empty the square (
   table; it is refused while a job runs. `{"status": true}` → `"map"` reports objects, `updates`, `dropped` and `last_ms`.
   Sweep frames are also saved by the executor under `$VIAM_MODULE_DATA/data/sweeps` (the module sets
   `SORTER_DATA_DIR`). Only the newest 30 sweeps (about 8 MB each) are kept.
-- **Finding objects anywhere on the table**, in this order: (1) the cached idle frame → go at once; (2) the
-  live map has the object, seen within the last 60 s → `"remembered at (x, y) on the table map, seen N s ago ·
-  going there"` (an edge-only sighting adds "looking there first"); if the whole table was swept within the last 60 s and the map does not have it, the answer is
-  an immediate "not on the table"; (3) otherwise the arm sweeps the table (`"scanning the table…"`, progress
-  `pose k/N` in status), every frame goes into the map, and it picks from it. The idle loop also records each
-  recognised object's last-seen table position (`Store.log_sighting`). `{"table_map": true}` returns the live
-  map (each object with `seen_ts`) and the sightings for the dashboard.
+- **Finding objects anywhere on the table**: a grasp starts picking at once, with no scan first (the user's
+  rule: "just search, and if found just start grasp; do NOT have an initial step").
+  1. Cached idle frame shows it → go.
+  2. The live map saw it within the last 60 s → AGENT1's `search_and_find` looks there first
+     (`"remembered at (x, y) on the table map, seen N s ago · looking there first"`).
+  3. Otherwise → it searches the table pose by pose.
+
+  The search stops at the first view whose match is accepted and the pick starts right there. Status
+  `running.search` = `{k, n, path, found}`: "searching… view k/N", then "found at view k, grasping". Immediate
+  answers come only for two equal matches in the cached frame, or an object already in the drop square.
+  `{"scan_table": true}` (dashboard **Scan table**) scans the whole table into the live map, and only when asked
+  (progress `pose k/N`). The idle loop also records each recognised object's last-seen table position
+  (`Store.log_sighting`). `{"table_map": true}` returns the live map (each object with `seen_ts`), the sightings
+  and the scan / search progress for the dashboard.
 - One job at a time. A request while busy returns `{"accepted": false, "error": "busy", "running": {...}}`.
 - Summaries contain `status` (`done`, `failed`, `not_found`, `ambiguous` = two objects match about equally,
   `already_in_square` = the named object is only in the drop square (answered at once, no sweep), `too_wide`,

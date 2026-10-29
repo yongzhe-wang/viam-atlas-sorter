@@ -20,6 +20,8 @@ DoCommand:
   {"grasp": "...", "wait": true}     same, but block until done -> the attempt summary
   {"preview": "green square"}        the same decision without moving: what would be picked, or why not
   {"reset": true}                    clear the square (pick-out, wipe fallback, verify empty)
+  {"scan_table": true}               scan the whole table into the live map (only on request: a grasp never scans
+                                     first; it searches and picks at the first view that shows the object)
   {"status": true}                   busy / running / last / warm / seen / library / store mode / live map stats
   {"seen_image": true}               last idle frame as base64 JPEG (<= 640 px) with the seen boxes scaled to it
   {"table_map": true}                the live table map (no embeddings; each object's seen_ts), sightings, sweep progress
@@ -75,7 +77,7 @@ HEARTBEAT_S = 5.0  # dashboard marks a worker offline after 15 s (agreed with AG
 BUNDLE_DIR = Path(__file__).resolve().parent.parent / "library"
 # find_path / square_path (AGENT1 0d3c817): how the executor really found the object and the square, for status.last
 SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "duration_s", "fail_phase", "fail_reason",
-                "find_path", "square_path")
+                "find_path", "find_views", "square_path", "objects")
 WATCH_PERIOD_S = 1.0  # idle perception: one frame about every second
 SLOW_WATCH_PERIOD_S = 2.0  # ... every 2 s when one look takes longer than SLOW_LOOP_MS, so jobs are not starved
 SLOW_LOOP_MS = 800
@@ -530,7 +532,7 @@ class GraspByDescription(Generic, EasyResource):
                 jpeg = next((im.data for im in images if im.mime_type == "image/jpeg"), None)
                 if jpeg is None:
                     continue
-                label = (f"{self.job_info.get('kind')}: {self.job_info.get('text') or 'square'}" if self._busy()
+                label = (self._job_label() if self._busy()
                          else "idle")
                 await asyncio.to_thread(self._timelapse_save, jpeg, time.time(), label)
                 await asyncio.to_thread(self._prune_sweeps)
@@ -612,17 +614,14 @@ class GraspByDescription(Generic, EasyResource):
 
     async def _from_map(self, text: str) -> Optional[dict]:
         """
-        best_on_map() on the live map (VIAM CENTERAL: live entry fresh -> go; else sweep):
-        {"found", "xy", "label", "seen_s_ago", "status", "reason", "decide_ms", "map_age_s"}, or None = sweep.
-
-        Found and that object seen within MAP_FRESH_S -> go there (look_first: AGENT3 only saw it cut by the
-        image edge, xy approximate; the executor's target_xy path looks there before it grasps anyway).
-        Not found / ambiguous -> refuse only when a whole-table sweep is that recent too (only then does the map
-        cover the whole table); otherwise sweep.
+        The live map as a hint, never as an extra step (user: "just search, and if found just start grasp; do NOT
+        have an initial step"). best_on_map() names an object seen within MAP_FRESH_S -> {"found": True, "xy",
+        "label", "seen_s_ago", "look_first", ...}: the search looks there first. Only in the drop square (AGENT3)
+        -> {"found": False, "status": "already_in_square", "reason"}. Anything else -> None: search the table.
         """
         now = time.time()
-        m, swept_ago = self.live.map, now - self.live.swept_ts
-        if not m:
+        m = self.live.map
+        if not m or not m.get("objects"):
             return None
         t0 = time.monotonic()
         b = await asyncio.to_thread(_runtime().table_map.best_on_map, m, text, self.store)
@@ -631,33 +630,27 @@ class GraspByDescription(Generic, EasyResource):
         if o is not None and not b.get("ambiguous"):
             seen_ago = now - float(o.get("seen_ts") or m.get("ts") or 0.0)
             if seen_ago > MAP_FRESH_S:
-                return None  # remembered, but too long ago to drive there blind: sweep
+                return None  # remembered too long ago to be worth a first look; the search finds it anyway
             return {**out, "found": True, "xy": [round(float(v), 1) for v in b["xy"]], "label": o.get("label"),
                     "colour": o.get("colour"), "score": round(float(b.get("score") or 0.0), 3),
                     "seen_s_ago": round(seen_ago, 1), "look_first": bool(b.get("look_first"))}
         if b.get("already_in_square"):
-            # AGENT3: the named object is only in the drop square (delivered): say so at once, never sweep for it
+            # AGENT3: the named object is only in the drop square (delivered): say so at once, never search for it
             # or pick it out again
             return {**out, "found": False, "status": "already_in_square", "reason": b.get("reason")}
-        if swept_ago > MAP_FRESH_S:
-            return None
-        if b.get("ambiguous"):
-            return {**out, "found": False, "status": "ambiguous",
-                    "reason": f"two objects on the table match {text!r} about equally; be more specific"}
-        return {**out, "found": False, "status": "not_found",
-                "reason": f"no {text!r} on the table (whole-table map, scanned {swept_ago:.0f} s ago)"}
+        return None
 
     @staticmethod
     def _map_message(found: dict) -> str:
-        """'remembered at (x, y) on the table map, seen N s ago', plus why it looks first for an edge sighting."""
+        """'remembered at (x, y) on the table map, seen N s ago', plus a note for an edge-only sighting."""
         x, y = found["xy"]
-        edge = " (only seen at a picture's edge: looking there first)" if found.get("look_first") else ""
+        edge = " (only seen at a picture's edge)" if found.get("look_first") else ""
         return f"remembered at ({x:.0f}, {y:.0f}) on the table map, seen {found['seen_s_ago']:.0f} s ago{edge}"
 
     async def _preview(self, text: str) -> Dict[str, ValueTypes]:
         """
-        What a grasp for `text` would do, without moving (dashboard Preview): pick from the cached frame, else go
-        to where a fresh table map saw it, else it would scan the table.
+        What a grasp for `text` would do, without moving (dashboard Preview): pick from the cached frame, else
+        look first where the live map saw it, else search the table (and grasp at the first view that shows it).
         """
         busy_or_cold = self._not_ready()
         if busy_or_cold:
@@ -673,42 +666,74 @@ class GraspByDescription(Generic, EasyResource):
                     "decided_from_cache": True}
         found = await self._from_map(text)
         if found is None:
-            return {"ok": False, "via": "sweep", "status": "would_scan",
-                    "reason": f"{text!r} is not in view and the table map has not seen it in the last "
-                              f"{MAP_FRESH_S:.0f} s: a grasp would scan the table"}
+            return {"ok": False, "via": "search", "status": "would_search",
+                    "reason": f"{text!r} is not in view: a grasp would search the table and pick it at the first "
+                              f"view that shows it"}
         if found["found"]:
             return {"ok": True, "via": "map", "target_xy": found["xy"], "label": found["label"],
                     "decide_ms": found["decide_ms"], "map_age_s": found["map_age_s"], "seen_s_ago": found["seen_s_ago"],
-                    "look_first": found["look_first"], "message": self._map_message(found)}
+                    "look_first": found["look_first"],
+                    "message": self._map_message(found) + ": a grasp would look there first"}
         return {"ok": False, "status": found["status"], "reason": found["reason"], "decide_ms": found["decide_ms"]}
 
-    def _sweep_progress(self, k: int, n: int):
-        """
-        Executor callback during a table sweep: shows "pose k/N" in status. Returns a finished future, so it
-        works whether the executor calls it plainly or awaits it.
-        """
-        self.job_info["sweep"] = {"k": int(k), "n": int(n)}
+    @staticmethod
+    def _done_future():
+        """A finished future: executor callbacks work whether the executor calls them plainly or awaits them."""
         fut = asyncio.get_event_loop().create_future()
         fut.set_result(None)
         return fut
 
+    def _sweep_progress(self, k: int, n: int):
+        """Executor callback during a table scan ({"scan_table"}): "scanning table… pose k/N" in status."""
+        self.job_info["sweep"] = {"k": int(k), "n": int(n)}
+        return self._done_future()
+
+    def _search_progress(self, k: int, n: int, path: Optional[str] = None, found: bool = False):
+        """
+        Executor callback after each view of search_and_find (AGENT1): "searching… view k/N", and once best()
+        accepts, "found at view k, grasping" (the search stops there and the pick starts at once).
+        """
+        self.job_info["search"] = {"k": int(k), "n": int(n), "path": path, "found": bool(found)}
+        return self._done_future()
+
+    def _job_label(self) -> str:
+        """What the running job is, for heartbeat, timelapse and seen_image captions."""
+        kind = self.job_info.get("kind")
+        what = {"reset": "square", "scan": "table"}.get(kind) or self.job_info.get("text") or ""
+        return f"{kind}: {what}"
+
     # ---- jobs --------------------------------------------------------------------------------------
 
+    async def _scan(self, rt, rig) -> dict:
+        """
+        {"scan_table": true}, only on request (a grasp never scans first): every pose of the executor's
+        sweep_table, every frame into the live map (none dropped), then the map counts as covering the table.
+        """
+        t0 = time.monotonic()
+        self._sweeping = True  # sweep frames reach the live map through the Rig hook, none dropped
+        try:
+            await rt.executor.sweep_table(rig, progress=self._sweep_progress)
+        finally:
+            self._sweeping = False
+        await self.live.drain()
+        await self.live.mark_swept()
+        return {"status": "done", "objects": len((self.live.map or {}).get("objects") or []),
+                "duration_s": round(time.monotonic() - t0, 1)}
+
     async def _run(self, kind: str, text: Optional[str], target: Optional[dict] = None,
-                   decide_ms: Optional[int] = None, target_xy: Optional[list] = None, sweep: bool = False,
+                   decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
                    chosen: Optional[dict] = None) -> dict:
         """
-        Run one grasp or reset to completion and return its summary; never raises.
+        Run one grasp, reset or table scan to completion and return its summary; never raises.
 
-        Grasp, in order of what is known: target (from the cached frame) -> executor skips its own first look;
-        target_xy (from the live map) -> executor looks there and picks; sweep -> executor scans the whole table,
-        every frame updates the live map (through Rig.on_map_frame), and we pick from it. Each step needs the
-        matching executor entry point (AGENT1); without it the executor's own search (find_target) is used instead.
-        chosen: {"label", "colour"} of the object decided on (map path); frame and sweep paths fill it here.
+        Grasp, from what is known: target (the cached frame) -> the executor picks at once; target_xy (a fresh
+        live-map entry) -> AGENT1's search_and_find looks there first; neither -> it searches the table. The
+        search stops at the first view whose best() accepts and the pick starts right there: no scan first.
+        chosen: {"label", "colour"} of the object decided on (map path); the frame path fills it here.
         The summary's "label" is that recognised library name and "colour" its colour, because the executor's
         own "label" falls back to the colour (VIAM CENTERAL: a blue screwdriver came back as "label": "black").
         """
-        via = "search"
+        via = "scan" if kind == "scan" else "search"
         if target is not None:
             chosen = {"label": target.get("recognised"), "colour": getattr(target.get("obj"), "colour", None)}
         try:
@@ -718,38 +743,17 @@ class GraspByDescription(Generic, EasyResource):
             rig.on_map_frame = lambda rgb, depth, pose: self._on_map_frame(rig, rgb, depth, pose)
             if kind == "grasp":
                 params = inspect.signature(rt.executor.execute).parameters
-                if sweep and hasattr(rt.executor, "sweep_table"):
-                    self._sweeping = True  # sweep frames reach the live map through the hook, none dropped
-                    try:
-                        await rt.executor.sweep_table(rig, progress=self._sweep_progress)
-                    finally:
-                        self._sweeping = False
-                    await self.live.drain()
-                    await self.live.mark_swept()  # the map now covers the whole table
-                    m = self.live.map or {"objects": []}
-                    b = await asyncio.to_thread(rt.table_map.best_on_map, m, text, self.store)
-                    if b.get("map_obj") is None or b.get("ambiguous"):
-                        status = ("already_in_square" if b.get("already_in_square")
-                                  else "ambiguous" if b.get("ambiguous") else "not_found")
-                        reason = {"already_in_square": b.get("reason"),
-                                  "ambiguous": f"two objects match {text!r} about equally after scanning the table",
-                                  "not_found": f"no {text!r} on the table after scanning it"}[status]
-                        summary = {"status": status, "fail_phase": "find", "via": "sweep", "fail_reason": reason}
-                        self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"),
-                                     "finished": time.time(), **summary}
-                        return summary
-                    target_xy, via = [float(v) for v in b["xy"]], "sweep"
-                    chosen = {"label": b["map_obj"].get("label"), "colour": b["map_obj"].get("colour")}
-                kwargs = {}
+                kwargs = {"progress": self._search_progress} if "progress" in params else {}
                 if target is not None and "target" in params:
-                    kwargs, via = {"target": target}, "frame"
+                    kwargs["target"], via = target, "frame"
                 elif target_xy is not None and "target_xy" in params:
-                    kwargs = {"target_xy": tuple(target_xy)}
-                    via = via if via == "sweep" else "map"
+                    kwargs["target_xy"], via = tuple(target_xy), "map"
                 elif (target is not None or target_xy is not None) and not self._no_target_warned:
                     LOGGER.warning("executor.execute lacks target=/target_xy=: using its own search instead")
                     self._no_target_warned = True
                 doc = await rt.executor.execute(rig, text, self.store, mode="demo", **kwargs)
+            elif kind == "scan":
+                doc = await self._scan(rt, rig)
             else:
                 doc = await rt.executor.clear_square(rig, self.store)
             summary = {k: doc.get(k) for k in SUMMARY_KEYS if doc.get(k) is not None}
@@ -776,24 +780,25 @@ class GraspByDescription(Generic, EasyResource):
 
     async def _start(self, kind: str, text: Optional[str], wait: bool, target: Optional[dict] = None,
                      decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
-                     sweep: bool = False, chosen: Optional[dict] = None) -> Dict[str, ValueTypes]:
+                     chosen: Optional[dict] = None) -> Dict[str, ValueTypes]:
         if self._busy():
             return {"accepted": False, "error": "busy", "running": dict(self.job_info)}
         job_id = uuid.uuid4().hex[:12]
-        via = "frame" if target is not None else "map" if target_xy is not None else "sweep" if sweep else "search"
+        via = ("scan" if kind == "scan" else "frame" if target is not None else "map" if target_xy is not None
+               else "search")
         self.job_info = {"job": job_id, "kind": kind, "text": text or "", "started": time.time(), "via": via,
                          "fast_path": target is not None, "target_xy": target_xy}
-        self.job = asyncio.get_event_loop().create_task(
-            self._run(kind, text, target, decide_ms, target_xy, sweep, chosen))
+        self.job = asyncio.get_event_loop().create_task(self._run(kind, text, target, decide_ms, target_xy, chosen))
         if wait:
             return {"accepted": True, "job": job_id, **(await self.job)}
         return {"accepted": True, "job": job_id}
 
     async def _grasp(self, text: str, wait: bool) -> Dict[str, ValueTypes]:
         """
-        Find the object fast, in this order (VIAM CENTERAL): the cached idle frame -> go at once; a fresh
-        whole-table map (<= MAP_FRESH_S) -> go to where it saw it; otherwise scan the table, then pick. Answers at
-        once when the object is ambiguous, or when a fresh map says it is not on the table.
+        Start picking at once (user: "just search, and if found just start grasp; do NOT have an initial step"):
+        in the cached idle frame -> go; a fresh live-map entry -> search there first; otherwise search the table.
+        The search grasps at the first view that shows it. Answers at once only when the cached frame shows two
+        equal matches, or when the object is already in the drop square.
         """
         if self._busy():
             return {"ok": False, "accepted": False, "error": "busy", "running": dict(self.job_info)}
@@ -818,9 +823,8 @@ class GraspByDescription(Generic, EasyResource):
                          "fail_phase": "find", "fail_reason": refusal[1], "decide_ms": decide_ms, "decided_from_cache": True}
             return {"ok": False, "accepted": False, "status": "ambiguous", "reason": refusal[1], "decide_ms": decide_ms,
                     "decided_from_cache": True}
-        # Not in the cached frame (or no fresh frame): the whole-table map, else a sweep
         found = await self._from_map(text)
-        if found is not None and not found["found"]:
+        if found is not None and not found["found"]:  # already in the drop square
             self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": found["status"],
                          "fail_phase": "find", "fail_reason": found["reason"], "decide_ms": found["decide_ms"]}
             return {"ok": False, "accepted": False, "status": found["status"], "reason": found["reason"],
@@ -828,16 +832,14 @@ class GraspByDescription(Generic, EasyResource):
         if found is not None:
             res = await self._start("grasp", text, wait, target_xy=found["xy"], decide_ms=found["decide_ms"],
                                     chosen={"label": found["label"], "colour": found.get("colour")})
-            return {**res, "ok": bool(res.get("accepted")), "via": "map", "status_text": "going_to_map",
-                    "message": self._map_message(found) + " · going there",
+            return {**res, "ok": bool(res.get("accepted")), "via": "map", "status_text": "searching",
+                    "message": self._map_message(found) + " · looking there first",
                     "target_xy": found["xy"], "label": found["label"], "map_age_s": found["map_age_s"],
                     "seen_s_ago": found["seen_s_ago"], "look_first": found["look_first"],
                     "decide_ms": found["decide_ms"]}
-        has_sweep = hasattr(rt.executor, "sweep_table")
-        res = await self._start("grasp", text, wait, sweep=True)
-        return {**res, "ok": bool(res.get("accepted")), "via": "sweep" if has_sweep else "search",
-                "status_text": "scanning" if has_sweep else "searching",
-                "message": "scanning the table…" if has_sweep else "searching the observe positions…",
+        res = await self._start("grasp", text, wait)
+        return {**res, "ok": bool(res.get("accepted")), "via": "search", "status_text": "searching",
+                "message": "searching the table… (grasps at the first view that shows it)",
                 "why": "not in the cached frame" if pick is not None
                 else f"no fresh frame from the observe pose ({self.seen.get('reason') or self.seen.get('error') or 'no look yet'})"}
 
@@ -859,12 +861,16 @@ class GraspByDescription(Generic, EasyResource):
             return self._seen_image()
         if command.get("clear_map"):
             return await self._clear_map(str(command.get("reason") or "clear_map command"))
+        if command.get("scan_table"):
+            cold = self._not_ready()
+            return cold or await self._start("scan", None, bool(command.get("wait")))
         if command.get("table_map"):
             # Dashboard top-down view: the live map (no embeddings, each object with its seen_ts; up to
             # MAP_PERSIST_S newer than the saved one) + each object's latest sighting
             m = self.live.light() if self.live is not None else self.store.get_table_map(with_emb=False)
             return {"ok": bool(m), "map": m or {}, "sightings": self.store.list_sightings()[:40],
                     "sweep": dict(self.job_info.get("sweep") or {}) if self._busy() else {},
+                    "search": dict(self.job_info.get("search") or {}) if self._busy() else {},
                     "live": self.live.summary() if self.live is not None else {"live": False},
                     "now": time.time()}  # robot clock, so the dashboard can age objects without clock skew
         for key in ("grasp", "preview"):
@@ -876,7 +882,8 @@ class GraspByDescription(Generic, EasyResource):
         if command.get("reset"):
             return await self._start("reset", None, bool(command.get("wait")))
         return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"preview\": \"<description>\"}, "
-                         "{\"reset\": true}, {\"status\": true}, {\"seen_image\": true} or {\"table_map\": true}"}
+                         "{\"reset\": true}, {\"scan_table\": true}, {\"clear_map\": true}, {\"status\": true}, "
+                         "{\"seen_image\": true} or {\"table_map\": true}"}
 
     # ---- background loops --------------------------------------------------------------------------
 
@@ -885,7 +892,7 @@ class GraspByDescription(Generic, EasyResource):
         while True:
             try:
                 busy = self._busy()
-                phase = (f"{self.job_info.get('kind')}: {self.job_info.get('text') or 'square'}" if busy
+                phase = (self._job_label() if busy
                          else "idle" if self.warm else "warming up")
                 err = self.last.get("error") if not busy else None
                 # consumer: whether this instance takes dashboard commands, so the dashboard can warn when two

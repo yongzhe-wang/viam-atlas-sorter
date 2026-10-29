@@ -135,6 +135,7 @@
       <button class="primary" type="submit">Grasp</button>
       <button type="button" id="b-prev">Preview</button>
       <button type="button" id="b-reset">Clear square</button>
+      <button type="button" id="b-scan" title="Look over the whole table once and put everything on the map (a grasp never needs this first)">Scan table</button>
       <button type="button" id="b-clearmap" title="Someone rearranged the table: forget the map and every last-seen position">Clear map</button>
     </form>
     <div id="msg"></div>
@@ -282,7 +283,7 @@ async function refreshCommands() {
   for (const c of list) {
     const li = el("li");
     const left = el("div");
-    left.appendChild(el("div", c.text === "__reset__" ? "Clear square" : c.text));
+    left.appendChild(el("div", c.text === "__reset__" ? "Clear square" : c.text === "__scan__" ? "Scan table" : c.text));
     // Library name first, its colour in brackets ("picked blue screwdriver (black)"); colour alone if unrecognised
     const ch = c.chosen, name = ch && (ch.label ?? (ch.colour ? `${ch.colour} object` : "#" + ch.id));
     const chosen = ch ? `picked ${name}${ch.label && ch.colour ? ` (${ch.colour})` : ""}${ch.score != null ? " · " + Number(ch.score).toFixed(2) : ""}` : "";
@@ -377,6 +378,10 @@ $("b-reset").addEventListener("click", async () => {
   try { const r = await send("__reset__"); $("msg").textContent = sentMsg(r, "clear the blue square"); }
   catch (err) { $("msg").textContent = "error: " + err.message; }
 });
+$("b-scan").addEventListener("click", async () => {
+  try { const r = await send("__scan__"); $("msg").textContent = sentMsg(r, "scan the whole table"); }
+  catch (err) { $("msg").textContent = "error: " + err.message; }
+});
 $("b-clearmap").addEventListener("click", async () => {
   try {
     const d = await api("/api/clear_map", {method: "POST"}), r = d.module || d;
@@ -402,7 +407,9 @@ $("b-prev").addEventListener("click", async () => {
     if (r.module) {
       // Module mode: the robot's own decision from its cached frame; the target is boxed green in the picture
       const m = r.module, ms = m.decide_ms != null ? ` (decided in ${m.decide_ms} ms)` : "";
-      $("msg").textContent = m.ok ? `would pick ${m.target.label || "#" + m.target.id} · ${Number(m.target.score).toFixed(2)}${ms}` : `${m.reason}${ms}`;
+      // frame path: a target; map path: a message (no target); otherwise why not / what a grasp would do
+      $("msg").textContent = m.ok && m.target ? `would pick ${m.target.label || "#" + m.target.id} · ${Number(m.target.score).toFixed(2)}${ms}`
+        : `${m.message || m.reason}${ms}`;
     } else {
       $("msg").textContent = "best match: " + r.slice(0, 3).map((o) => `#${o.id} ${o.score.toFixed(2)}`).join(", ");
     }
@@ -576,7 +583,11 @@ async function refreshMap() {
     labels.push({g, x: px, y: py, text: `${s.label} · last seen ${agoText(s.age_s)}`, prio: 2, cls: "lbl-mute"});
   }
   placeLabels(svg, mk, marks, labels, [{x0: bx - 12, y0: by - 12, x1: bx + 40, y1: by + 6}], frames);
-  const head = d.sweep && d.sweep.n ? `scanning table… pose ${d.sweep.k}/${d.sweep.n}`
+  // A grasp's search (AGENT1's search_and_find): stops at the first view that shows the object and grasps
+  const srch = d.search;
+  const head = srch && srch.n ? (srch.found ? `found ${srch.text ? `"${srch.text}" ` : ""}at view ${srch.k}, grasping`
+                                            : `searching${srch.text ? ` for "${srch.text}"` : ""}… view ${srch.k}/${srch.n}`)
+    : d.sweep && d.sweep.n ? `scanning table… pose ${d.sweep.k}/${d.sweep.n}`
     : m && m.cleared_s_ago != null && !(m.objects || []).length ? `map cleared ${agoText(m.cleared_s_ago)} · 0 objects`
     : m ? `map updated ${agoText(m.age_s)} · ${(m.objects || []).length} objects`
           + (m.swept_s_ago != null ? ` · whole table scanned ${agoText(m.swept_s_ago)}` : "")
