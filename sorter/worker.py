@@ -21,17 +21,37 @@ def clean(text: str) -> str:
     return VERBS.sub("", text or "").strip()
 
 
+async def beat(store, rig, current: dict) -> None:
+    """Heartbeat every 2 s (dashboard shows offline after 15 s without one): phase, holding, error, pose."""
+    while True:
+        try:
+            p = rig.last_pose
+            store.heartbeat(executor.WORKER_ID, executor.phase_now(rig),
+                            holding=executor.ppa.load_state().get("holding"), error=executor.STATE.get("error"),
+                            command_id=current.get("id"),
+                            pose=None if p is None else {"x": round(p.x), "y": round(p.y), "z": round(p.z)})
+        except Exception as e:
+            print(f"heartbeat failed: {e}")
+        await asyncio.sleep(2.0)
+
+
 async def main() -> None:
     store = Store()
     rig = executor.ppa.Rig()
     await rig.start()
+    current = {"id": None}
+    beater = asyncio.create_task(beat(store, rig, current))
     print(f"worker: connected, store {'online' if store.online else 'offline (JSONL)'}; waiting for commands")
     try:
+        # A previous process may have died mid-carry: finish that first
+        await executor.resume(rig, store)
         while True:
+            current["id"] = None
             cmd = store.next_command()
             if cmd is None:
                 await asyncio.sleep(1.0)
                 continue
+            current["id"] = cmd["_id"]
             text = (cmd.get("text") or "").strip()
             print(f"worker: command {cmd['_id']}: {text!r}")
             try:
@@ -50,6 +70,7 @@ async def main() -> None:
                 except Exception:
                     pass
     finally:
+        beater.cancel()
         await rig.close()
 
 

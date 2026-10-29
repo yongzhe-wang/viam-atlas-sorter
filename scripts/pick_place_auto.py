@@ -330,6 +330,40 @@ def intruder(depth: np.ndarray, near_uv=None, radius: float = 300.0) -> bool:
     return int(tall.sum()) > INTRUDER_TALL_PX or biggest > INTRUDER_BLIND_PX
 
 
+def bbox_near(bbox, uv, radius: float) -> bool:
+    """True if bbox (u0, v0, u1, v1) comes within `radius` px of `uv` (whole image if uv is None)."""
+    if uv is None:
+        return True
+    du = max(bbox[0] - uv[0], 0, uv[0] - bbox[2])
+    dv = max(bbox[1] - uv[1], 0, uv[1] - bbox[3])
+    return math.hypot(du, dv) < radius
+
+
+STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "arm_state.json"
+
+
+def save_state(holding: bool, height: float = None, grip: float = None) -> None:
+    """
+    Remember what the gripper holds, so a restarted process can finish the job.
+
+    WHY: the Viam SDK can abort the process mid-run (SIGABRT in its native layer), leaving the arm holding
+    an object; the supervisor restarts the program, which reads this to resume.
+    """
+    import json
+
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps({"holding": holding, "height": height, "grip": grip, "ts": time.time()}))
+
+
+def load_state() -> dict:
+    import json
+
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {"holding": False}
+
+
 class ObjectLost(RuntimeError):
     """The held object is no longer in the gripper (dropped or taken)."""
 
@@ -369,10 +403,15 @@ class Rig:
         self.floor_z = 250.0
         self.depth_shift = (0.0, 0.0)  # colour -> depth pixel offset; (0, 0) when align_color_depth is on
         self.last_depth = None  # depth map of the latest frame(), for finders that need it
+        self.last_pose = None  # latest pose read, for status reports
+        self.status = None  # "reconnecting" / "paused_person" while that is happening, else None
 
     async def connect(self) -> None:
+        # The SDK's own reconnect loop is off: it fought call()'s backoff, and its native layer can abort the
+        # whole process during a reconnect (exit 134, "memory allocation of 8302792106237310565 bytes failed")
         opts = RobotClient.Options.with_api_key(
-            api_key=os.environ["VIAM_API_KEY"], api_key_id=os.environ["VIAM_API_KEY_ID"]
+            api_key=os.environ["VIAM_API_KEY"], api_key_id=os.environ["VIAM_API_KEY_ID"],
+            check_connection_interval=0, attempt_reconnect_interval=0,
         )
         # Bounded: a reconnect once hung for minutes inside at_address with the arm holding the block
         self.robot = await asyncio.wait_for(RobotClient.at_address(os.environ["VIAM_MACHINE_ADDRESS"], opts), CONNECT_TIMEOUT_S)
@@ -413,6 +452,7 @@ class Rig:
         for wait in (0.0,) + RETRY_BACKOFF_S:
             if wait:
                 print(f"  link dropped during {what} ({type(last).__name__}); reconnecting in {wait:.0f}s")
+                self.status = "reconnecting"
                 await asyncio.sleep(wait)
                 try:
                     await self.close()
@@ -420,6 +460,8 @@ class Rig:
                 except Exception as e:
                     last = e
                     continue
+                finally:
+                    self.status = None
             try:
                 return await fn()
             except Exception as e:
@@ -429,7 +471,8 @@ class Rig:
         raise RuntimeError(f"{what}: link still down after {len(RETRY_BACKOFF_S)} reconnects") from last
 
     async def pose(self):
-        return await self.call("get pose", lambda: self.arm.get_end_position())
+        self.last_pose = await self.call("get pose", lambda: self.arm.get_end_position())
+        return self.last_pose
 
     async def open(self) -> None:
         await self.call("open", lambda: self.gripper.open())
@@ -619,20 +662,29 @@ class Rig:
 
         Raises RuntimeError if it does not clear within timeout_s (the caller lifts and reports).
         """
+        from sorter.perception import segment_full
+
         t0, clear_since, paused = time.monotonic(), None, False
         while True:
-            _, depth = await self.frame()
-            if depth is None or not intruder(depth, near_uv):
+            rgb, depth = await self.frame()
+            busy = depth is not None and intruder(depth, near_uv)
+            if depth is not None and not busy:
+                # AGENT3's detector: skin-coloured blind holes / tall blobs reaching into the workspace
+                busy = any(bbox_near(i["bbox"], near_uv, 300.0) for i in segment_full(rgb, depth).intruders)
+            if not busy:
                 clear_since = clear_since or time.monotonic()
                 if not paused or time.monotonic() - clear_since >= 2.0:
                     if paused:
                         print("  workspace clear, resuming")
+                    self.status = None
                     return
             else:
                 if not paused:
                     print("  hand/arm in the workspace: pausing")
                 paused, clear_since = True, None
+                self.status = "paused_person"
             if time.monotonic() - t0 > timeout_s:
+                self.status = None
                 raise RuntimeError("workspace not clear for too long")
             await asyncio.sleep(0.5)
 
@@ -720,6 +772,7 @@ async def pick(rig: Rig, times: dict = None, finder=None) -> tuple:
             await rig.servo(finder, True, "block")
     else:
         raise PickFailed(f"nothing in gripper after {GRAB_TRIES} tries")
+    save_state(True, height, grip)
     return height, grip
 
 
@@ -736,6 +789,7 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
     print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
     await rig.descend(z_place)
     await rig.open()
+    save_state(False)
     if observe:
         # Free calibration data: the released block marks where the jaw axis really is
         await observe_release(rig, z1, table, height)

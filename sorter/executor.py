@@ -37,6 +37,33 @@ RESET_X = (230.0, 380.0)
 RESET_Y = (-220.0, 220.0)
 WIPE_CLEAR_MM = 10.0  # fingertips this far above the table during a wipe
 WIPE_STEP_MM = 20.0  # wipe in short moves = slow, and interruptible between steps
+WORKER_ID = "sfhack4-worker"  # heartbeat / frame id; AGENT 2's Viam module uses "module:<name>"
+# What the arm is doing right now, for heartbeats: the current attempt's times dict ("at" = phase) + last error
+STATE = {"phase": "idle", "times": None, "error": None}
+PHASES = {"square": "observe", "find": "observe", "check": "place", "start": "observe"}
+
+
+def phase_now(rig) -> str:
+    """Heartbeat phase: link/person states first, then the step in progress, else idle."""
+    if rig.status:
+        return rig.status
+    at = (STATE.get("times") or {}).get("at")
+    return PHASES.get(at, at) if at else STATE["phase"]
+
+
+def publish_frame(store, rgb: np.ndarray, seg, phase: str, scores: dict = None) -> None:
+    """Latest frame + boxes for the dashboard: targets, ignored (excluded) objects, and intruders."""
+    if not hasattr(store, "put_frame"):
+        return
+    objs = [{"id": o.id, "bbox": list(o.bbox), "label": o.colour, "height_mm": round(o.height_mm),
+             **({"score": round(scores[o.id], 3)} if scores and o.id in scores else {})} for o in seg.objects]
+    objs += [{"id": o.id, "bbox": list(o.bbox), "label": why, "ignored": True} for o, why in seg.excluded]
+    meta = {"objects": objs, "intruders": [{"bbox": list(i["bbox"]), "reason": i["reason"]} for i in seg.intruders],
+            "phase": phase}
+    try:
+        store.put_frame(WORKER_ID, jpeg(rgb), meta)
+    except Exception as e:
+        print(f"put_frame failed: {e}")
 
 
 class ObjTracker:
@@ -106,12 +133,18 @@ def hole_mask(rgb: np.ndarray):
 
 
 def objects_in_hole(rgb: np.ndarray, depth: np.ndarray) -> tuple:
-    """(hole visible?, [Obj inside the hole]) from a frame taken above the square. Inside = >= half the mask."""
+    """
+    (hole visible?, [Obj inside the hole], segmentation) from a frame taken above the square at z >= 400.
+
+    Inside = >= half the mask. Must be looked at from ALIGN_Z: below ~280 mm depth is blind and a block in
+    the square is invisible. Edge-cut objects are counted too (a full square can push one to the border).
+    """
+    seg = perception.segment_full(rgb, depth) if depth is not None else None
     hole = hole_mask(rgb)
-    if hole is None or depth is None:
-        return False, []
-    _, objs = perception.segment(rgb, depth)
-    return True, [o for o in objs if (o.mask & hole).sum() >= 0.5 * o.mask.sum()]
+    if hole is None or seg is None:
+        return False, [], seg
+    objs = list(seg.objects) + [o for o, _ in seg.excluded]
+    return True, [o for o in objs if (o.mask & hole).sum() >= 0.5 * o.mask.sum()], seg
 
 
 def jpeg(rgb: np.ndarray) -> bytes:
@@ -139,6 +172,7 @@ async def find_target(rig, text: str, store) -> dict:
             await ppa.travel(rig, *xy)
         rgb, depth = await rig.frame()
         seg = perception.segment_full(rgb, depth)
+        publish_frame(store, rgb, seg, "observe")
         hole = hole_mask(rgb)
         # Never pick what is already in the square, or something cut by the image border
         objs = [o for o in seg.objects if not o.touches_edge and (hole is None or (o.mask & hole).sum() < 0.5 * o.mask.sum())]
@@ -161,6 +195,7 @@ async def execute(rig, text: str, store, mode: str = "demo") -> dict:
     doc = {"ts": time.time(), "mode": mode, "target_text": text, "success": False, "status": "failed",
            "fail_phase": None, "fail_reason": None}
     times = {}
+    STATE.update(times=times, error=None)
     t0 = time.monotonic()
     try:
         # Locate the square first, while the gripper is empty: a held object hides part of the hole
@@ -186,7 +221,9 @@ async def execute(rig, text: str, store, mode: str = "demo") -> dict:
         await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy)
         times["at"] = "check"
         rgb, depth = await rig.frame()
-        seen, inside = objects_in_hole(rgb, depth)
+        seen, inside, seg = objects_in_hole(rgb, depth)
+        if seg is not None:
+            publish_frame(store, rgb, seg, "place")
         doc["img_after"] = jpeg(rgb)
         doc["success"] = bool(seen and inside)
         doc["status"] = "done" if doc["success"] else "failed"
@@ -199,6 +236,7 @@ async def execute(rig, text: str, store, mode: str = "demo") -> dict:
         times.pop("at", None)
         doc["phase_times"], doc["duration_s"] = times, round(time.monotonic() - t0, 1)
         doc["_id"] = store.log_attempt({k: v for k, v in doc.items() if k != "_id"})
+        STATE.update(times=None, error=doc["fail_reason"] if doc["status"] == "failed" else None)
     return doc
 
 
@@ -264,12 +302,15 @@ async def clear_square(rig, store) -> dict:
     doc = {"ts": time.time(), "mode": "reset", "target_text": "__reset__", "success": False, "status": "failed",
            "removed": 0, "wipes": 0, "fail_phase": None, "fail_reason": None}
     t0 = time.monotonic()
+    STATE.update(times={"at": "reset"}, error=None)
     try:
         await ppa.search_square(rig)
         await rig.servo(ppa.find_square, False, "square")
         for _round in range(6):
             rgb, depth = await rig.frame()
-            seen, inside = objects_in_hole(rgb, depth)
+            seen, inside, seg = objects_in_hole(rgb, depth)
+            if seg is not None:
+                publish_frame(store, rgb, seg, "reset")
             if not seen:
                 raise RuntimeError("square not visible after servo")
             if not inside:
@@ -309,4 +350,41 @@ async def clear_square(rig, store) -> dict:
         await recover(rig, doc)
     doc["duration_s"] = round(time.monotonic() - t0, 1)
     doc["_id"] = store.log_attempt({k: v for k, v in doc.items() if k != "_id"})
+    STATE.update(times=None, error=None if doc["success"] else doc["fail_reason"])
+    return doc
+
+
+async def resume(rig, store):
+    """
+    After a restart: if the gripper still holds something, put it in the square first. Returns the doc or None.
+
+    WHY: the SDK can abort the process mid-carry; the supervisor restarts it with the object still held.
+    Height/grip come from data/arm_state.json (pick_place_auto.save_state); defaults fit the yellow block.
+    """
+    st = ppa.load_state()
+    if not await rig.holding():
+        if st.get("holding"):
+            ppa.save_state(False)
+        return None
+    print("resume: gripper is holding something; placing it in the square first")
+    height, grip = st.get("height") or 32.0, st.get("grip") or 15.0
+    doc = {"ts": time.time(), "mode": "resume", "target_text": "held after restart", "success": False,
+           "status": "failed", "fail_phase": None, "fail_reason": None, "height_mm": height}
+    times = {}
+    STATE.update(times=times, error=None)
+    t0 = time.monotonic()
+    try:
+        await ppa.place_in_square(rig, height, grip, times)
+        times["at"] = "check"
+        rgb, depth = await rig.frame()
+        seen, inside, _ = objects_in_hole(rgb, depth)
+        doc["success"] = bool(seen and inside)
+        doc["status"] = "done" if doc["success"] else "failed"
+    except Exception as e:
+        doc.update(fail_phase=times.get("at", "start"), fail_reason=f"{type(e).__name__}: {e}")
+        await recover(rig, doc)
+    times.pop("at", None)
+    doc["phase_times"], doc["duration_s"] = times, round(time.monotonic() - t0, 1)
+    doc["_id"] = store.log_attempt({k: v for k, v in doc.items() if k != "_id"})
+    STATE.update(times=None, error=doc["fail_reason"])
     return doc

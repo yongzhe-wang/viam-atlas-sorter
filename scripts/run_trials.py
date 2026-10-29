@@ -137,18 +137,24 @@ async def trial(rig, store, run_id: str, i: int, square_xy=None) -> dict:
 
 
 async def main(n: int) -> None:
-    run_id = time.strftime("%Y%m%d-%H%M%S")
+    # RUN_ID is kept across supervisor restarts so the count continues instead of starting over
+    run_id = os.environ.get("RUN_ID") or time.strftime("%Y%m%d-%H%M%S")
     store = open_store()
+    done = [d for d in (store.list_attempts(limit=0) if store else []) if d.get("run_id") == run_id and d.get("mode") == "trial"]
+    if done:
+        print(f"resuming run {run_id}: {len(done)} trial(s) already logged")
     rig = ppa.Rig()
     await rig.start()
     results = []
     try:
+        # A previous process may have died holding the block: put it in the square first
+        await executor.resume(rig, store)
         # Where the block is if the square starts empty (env BLOCK_XY="x,y", flange mm); else from the resets
         block_xy = tuple(map(float, os.environ["BLOCK_XY"].split(","))) if os.environ.get("BLOCK_XY") else None
         # Empty the square first, so trial 1 is a real pick-into-square
         cleared = await executor.clear_square(rig, store)
         print(f"reset: {cleared['status']} removed={cleared['removed']} wipes={cleared['wipes']} {cleared['duration_s']}s")
-        for i in range(1, n + 1):
+        for i in range(len(done) + 1, n + 1):
             if not cleared["success"]:
                 print(f"square not empty ({cleared['fail_reason']}); parked, not starting trial {i}")
                 break
