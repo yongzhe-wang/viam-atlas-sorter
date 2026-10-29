@@ -23,7 +23,9 @@
   .pill.ok { color: var(--ok); } .pill.bad { color: var(--bad); } .pill.warn { color: var(--warn); }
   main { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px;
          max-width: 1500px; margin: 0 auto; }
-  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+  /* Grid items may shrink below their content, so the wide attempts table scrolls inside its card */
+  main > * { min-width: 0; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px; } }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 10px; }
   #cam { width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #000; border-radius: 8px; display: block; }
