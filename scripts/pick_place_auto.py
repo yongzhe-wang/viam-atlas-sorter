@@ -27,6 +27,7 @@ import io
 import math
 import os
 import sys
+import time
 
 import jaw_calib
 import numpy as np
@@ -130,7 +131,7 @@ def decode(images) -> tuple:
     return rgb, depth
 
 
-def table_and_near(depth: np.ndarray, hint=None) -> tuple:
+def table_and_near(depth: np.ndarray, hint=None, radius: float = 150.0) -> tuple:
     """
     (table depth, object-top depth or None) from one depth map, in mm.
 
@@ -153,12 +154,55 @@ def table_and_near(depth: np.ndarray, hint=None) -> tuple:
         hu, hv = hint[0] + DEPTH_DU, hint[1] + DEPTH_DV
         cents = ndimage.center_of_mass(near, lab, range(1, n + 1))
         cand = [(math.hypot(c[1] - hu, c[0] - hv), i + 1) for i, c in enumerate(cents) if sizes[i] >= 800]
-        if not cand or min(cand)[0] > 150:
+        if not cand or min(cand)[0] > radius:
             return table, None
         k = min(cand)[1]
     if sizes[k - 1] < 800:
         return table, None
     return table, float(np.median(depth[lab == k]))
+
+
+def yellow_blobs(rgb: np.ndarray) -> list:
+    """All yellow blobs >= 1500 px as (u, v, long-axis angle, area), largest first."""
+    hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    mask = (h >= 32) & (h <= 48) & (s > 100) & (v > 110)
+    lab, n = ndimage.label(mask)
+    out = []
+    for k in range(1, n + 1):
+        ys, xs = np.nonzero(lab == k)
+        if len(xs) < 1500:
+            continue
+        cx, cy = xs.mean(), ys.mean()
+        w, vec = np.linalg.eigh(np.cov(np.vstack([xs - cx, ys - cy])))
+        out.append((cx, cy, math.degrees(math.atan2(-vec[1, 1], vec[0, 1])) % 180.0, len(xs)))
+    return sorted(out, key=lambda b: -b[3])
+
+
+class Tracker:
+    """
+    Finder that follows ONE yellow object: the blob nearest to where it was last seen.
+
+    WHY: with several yellow things on the table (a yellow cylinder appeared next to the block),
+    "largest yellow blob" switched targets. Between two frames our own motion moves the target by at most
+    ~60 mm (servo cap) ~ 160 px, so a blob farther than MAX_JUMP_PX away means the object is gone or was
+    moved by a person; the tracker then reports None and the caller re-acquires.
+    """
+
+    MAX_JUMP_PX = 260.0
+
+    def __init__(self, seed_uv):
+        self.uv = tuple(seed_uv)
+
+    def __call__(self, rgb: np.ndarray):
+        blobs = yellow_blobs(rgb)
+        if not blobs:
+            return None
+        best = min(blobs, key=lambda b: math.hypot(b[0] - self.uv[0], b[1] - self.uv[1]))
+        if math.hypot(best[0] - self.uv[0], best[1] - self.uv[1]) > self.MAX_JUMP_PX:
+            return None
+        self.uv = (best[0], best[1])
+        return best
 
 
 def find_block(rgb: np.ndarray):
@@ -188,6 +232,17 @@ def find_block(rgb: np.ndarray):
 SQUARE_SIZE = {}  # hole (w, h) in px, recorded on the first unoccluded sighting at the current height
 
 
+def blue_mask(rgb: np.ndarray) -> np.ndarray:
+    """
+    Blue tape pixels by hue/saturation, not brightness.
+
+    WHY: seen from above the square the tape reads (0,64,116) and (4,57,109); the old rule `b > 110`
+    dropped part of the ring and the hole leaked to the image border. Tape hue ~207 deg = PIL H ~147.
+    """
+    hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+    return (hsv[..., 0] >= 130) & (hsv[..., 0] <= 165) & (hsv[..., 1] > 120) & (hsv[..., 2] > 50)
+
+
 def find_square(rgb: np.ndarray):
     """
     Centre (u, v) of the hole enclosed by the blue tape, or None if it is not in view.
@@ -197,8 +252,7 @@ def find_square(rgb: np.ndarray):
     Yellow and the dark fingers now count as walls, and once the hole size is known the centre is taken
     from its top-left corner (far from the occluder) plus half that size.
     """
-    r, g, b = [rgb[..., i].astype(int) for i in range(3)]
-    blue = (b > 110) & (b - r > 60) & (b - g > 20)
+    blue = blue_mask(rgb)
     hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
     yellow = (hsv[..., 0] >= 32) & (hsv[..., 0] <= 48) & (hsv[..., 1] > 100) & (hsv[..., 2] > 110)
     dark = hsv[..., 2] < 70
@@ -405,20 +459,25 @@ class Rig:
             await self.goto(p.x + move[0], p.y + move[1], p.z)
         raise RuntimeError(f"{label}: did not converge")
 
-    async def align_wrist(self) -> None:
+    async def align_wrist(self, finder=find_block) -> None:
         """
         Rotate the wrist so the block's long axis is vertical in the image (jaws close along image u).
 
         WHY: the finger axis was seen along image u, so the jaws then clamp across the block's short side.
         The sign of theta is not assumed: try one direction, keep it only if the angle error shrank.
         """
-        hit = find_block((await self.frame())[0])
+        hit = finder((await self.frame())[0])
+        if hit is None:
+            raise RuntimeError("block: not visible for wrist alignment")
         err = ((90.0 - hit[2] + 90.0) % 180.0) - 90.0  # signed distance to vertical, in [-90, 90)
         if abs(err) < 4:
             return
         p = await self.pose()
         await self.goto(p.x, p.y, p.z, theta=self.theta + err)
-        err2 = ((90.0 - find_block((await self.frame())[0])[2] + 90.0) % 180.0) - 90.0
+        hit2 = finder((await self.frame())[0])
+        if hit2 is None:
+            raise RuntimeError("block: lost after wrist rotation")
+        err2 = ((90.0 - hit2[2] + 90.0) % 180.0) - 90.0
         print(f"  wrist: angle err {err:.0f} -> {err2:.0f}")
         if abs(err2) > abs(err) * 0.5:
             await self.goto(p.x, p.y, p.z, theta=self.theta - 2 * err)
@@ -432,23 +491,43 @@ class Rig:
             await self.goto(p.x, p.y, z)
 
 
-async def pick(rig: Rig) -> tuple:
+class PickFailed(RuntimeError):
+    """The grab closed on nothing; the gripper has been opened and the arm lifted."""
+
+
+def mark(times: dict, phase: str, t0: float) -> float:
+    """Record seconds spent in `phase`, set the current phase marker, return the new start time."""
+    now = time.monotonic()
+    times[phase] = round(now - t0, 1)
+    return now
+
+
+async def pick(rig: Rig, times: dict = None, finder=None) -> tuple:
     """
     Steps 1-2: align over the block, measure it, descend and grab. Returns (block height, grip depth).
 
-    Exits the program (gripper open, arm lifted) if the grab closes on nothing.
+    `times` receives seconds per phase (servo, descend, grab) and times["at"] names the phase in progress,
+    so a caller can log where a failure happened. Raises PickFailed if the grab closes on nothing.
+    `finder` picks which object (default: largest yellow blob; pass a Tracker when other yellow things
+    are on the table).
     """
+    times = {} if times is None else times
+    finder = finder or find_block
+    t = time.monotonic()
+    times["at"] = "servo"
     await rig.open()
     p = await rig.pose()
     await rig.goto(p.x, p.y, ALIGN_Z, theta=0.0)
 
     print("1/5 find + align over block")
-    await rig.servo(find_block, True, "block")
-    await rig.align_wrist()
-    await rig.servo(find_block, True, "block")
+    await rig.servo(finder, True, "block")
+    await rig.align_wrist(finder)
+    await rig.servo(finder, True, "block")
+    t = mark(times, "servo", t)
 
     print("2/5 measure + descend + grab")
-    z0, table, top = await rig.measure(find_block)
+    times["at"] = "descend"
+    z0, table, top = await rig.measure(finder)
     if top is None:
         raise RuntimeError("block top not found in depth map")
     height = table - top
@@ -462,19 +541,96 @@ async def pick(rig: Rig) -> tuple:
     await rig.descend(z_mid)
     # Too close for the RealSense depth range (~280 mm min), so the block-top depth is carried over
     # from the measurement above; straight vertical moves keep that relation exact
-    await rig.servo(find_block, True, "block-close", plane_at=lambda z: top - (z0 - z))
+    await rig.servo(finder, True, "block-close", plane_at=lambda z: top - (z0 - z))
     # Fingertips (TIP_BELOW_CAM past the camera) end `grip` below the block top
     z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
     print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
     await rig.descend(z_grasp)
+    t = mark(times, "descend", t)
+
+    times["at"] = "grab"
     grabbed = await rig.grab()
     print("  grab returned", grabbed)
     p = await rig.pose()
     await rig.goto(p.x, p.y, ALIGN_Z)
+    mark(times, "grab", t)
     if not grabbed:
         await rig.open()
-        sys.exit("nothing in gripper; stopped before moving to the square")
+        raise PickFailed("nothing in gripper; stopped before moving to the square")
     return height, grip
+
+
+async def release_here(rig: Rig, height: float, grip: float, observe: bool = False) -> None:
+    """
+    Lower the held block straight down until its bottom is PLACE_GAP above the table, open, lift to ALIGN_Z.
+
+    `observe` records jaw-calibration samples from the released block before lifting away.
+    """
+    z1, table, _ = await rig.measure()
+    # Block bottom hangs (height - grip) below the fingertips; release it PLACE_GAP above the table
+    z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z)
+    print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
+    await rig.descend(z_place)
+    await rig.open()
+    if observe:
+        # Free calibration data: the released block marks where the jaw axis really is
+        await observe_release(rig, z1, table, height)
+    q = await rig.pose()
+    await rig.goto(q.x, q.y, ALIGN_Z)
+
+
+async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None) -> None:
+    """Steps 3-4: find the blue square, servo over its hole, release there (with calibration samples)."""
+    times = {} if times is None else times
+    t = time.monotonic()
+    print("3/5 find blue square")
+    times["at"] = "carry"
+    for _ in range(4):
+        if find_square((await rig.frame())[0]):
+            break
+        q = await rig.pose()
+        await rig.goto(q.x, q.y + 100.0, ALIGN_Z)  # square was on the +y side of the block
+    await rig.servo(find_square, False, "square")
+    t = mark(times, "carry", t)
+
+    print("4/5 lower + release")
+    times["at"] = "place"
+    await release_here(rig, height, grip, observe=True)
+    mark(times, "place", t)
+
+
+async def travel(rig: Rig, x: float, y: float, theta: float = None) -> None:
+    """Move at ALIGN_Z to (x, y) in legs short enough for the MAX_STEP_MM guard."""
+    p = await rig.pose()
+    if p.z < ALIGN_Z - 1:
+        await rig.goto(p.x, p.y, ALIGN_Z)
+    legs = max(1, math.ceil(math.hypot(x - p.x, y - p.y) / 200.0))
+    for i in range(1, legs + 1):
+        await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, ALIGN_Z, theta=theta)
+
+
+async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> bool:
+    """
+    Put the held block down at flange (x, y) if the spot is clear; False (still holding, at ALIGN_Z) if not.
+
+    WHY: self-reset for unattended trials, so each run starts from a new spot without a person.
+    "Clear" = no depth blob 10-80 mm above the table near where the jaw axis meets the table. The held
+    block itself is closer than the RealSense minimum range (~280 mm) at ALIGN_Z, so it reads as invalid.
+    """
+    await travel(rig, x, y)
+    rgb, depth = await rig.frame()
+    if depth is None:
+        return False
+    p = await rig.pose()
+    table, _ = table_and_near(depth)
+    hint = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
+    # ~220 px is ~90 mm at ALIGN_Z: keeps the open jaws (84 mm stroke) clear of neighbours
+    _, top = table_and_near(depth, hint, radius=220.0)
+    if top is not None:
+        print(f"  spot ({x:.0f},{y:.0f}) occupied, skipping")
+        return False
+    await release_here(rig, height, grip)
+    return True
 
 
 async def run(mode: str) -> None:
@@ -490,29 +646,10 @@ async def run(mode: str) -> None:
                 await rig.goto(p.x, p.y, ALIGN_Z, theta=0.0)
             else:
                 height, grip = await pick(rig)
-
-            print("3/5 find blue square")
-            for _ in range(4):
-                if find_square((await rig.frame())[0]):
-                    break
-                q = await rig.pose()
-                await rig.goto(q.x, q.y + 100.0, ALIGN_Z)  # square was on the +y side of the block
-            await rig.servo(find_square, False, "square")
-
-            print("4/5 lower + release")
-            z1, table, _ = await rig.measure()
-            # Block bottom hangs (height - grip) below the fingertips; release it PLACE_GAP above the table
-            z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z)
-            print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
-            await rig.descend(z_place)
-            await rig.open()
-            # Free calibration data: the released block marks where the jaw axis really is
-            await observe_release(rig, z1, table, height)
-            q = await rig.pose()
-            await rig.goto(q.x, q.y, ALIGN_Z)
+            await place_in_square(rig, height, grip)
 
             print("5/5 home")
-            await rig.goto(HOME_XY[0], HOME_XY[1], ALIGN_Z, theta=0.0)
+            await travel(rig, HOME_XY[0], HOME_XY[1], theta=0.0)
             print("done")
         except Exception:
             # Any failure: go straight up so nothing drags across the table, then surface the error
