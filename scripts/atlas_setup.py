@@ -19,7 +19,7 @@ from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.operations import SearchIndexModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from sorter.store import COLLECTIONS, EMBED_DIM, VECTOR_INDEX  # noqa: E402
+from sorter.store import COLLECTIONS, EMBED_DIM, LIVE_COLLECTIONS, VECTOR_INDEX  # noqa: E402
 
 VECTOR_DEF = {
     "fields": [
@@ -34,6 +34,8 @@ PLAIN_INDEXES = {
     "commands": [[("status", ASCENDING), ("ts", ASCENDING)], [("ts", DESCENDING)]],
     "calib_samples": [[("ts", DESCENDING)]],
     "views": [[("label", ASCENDING)]],
+    "status": [[("ts", DESCENDING)]],
+    "frames": [[("ts", DESCENDING)]],
 }
 
 
@@ -44,7 +46,7 @@ def main() -> None:
     db = MongoClient(uri, serverSelectionTimeoutMS=8000)[os.environ.get("MONGODB_DB", "sorter")]
 
     existing = set(db.list_collection_names())
-    for coll in COLLECTIONS:
+    for coll in COLLECTIONS + LIVE_COLLECTIONS:
         if coll not in existing:
             db.create_collection(coll)
             print("created collection", coll)

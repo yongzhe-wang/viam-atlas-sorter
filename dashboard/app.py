@@ -9,9 +9,15 @@ is restarted if the Viam SDK aborts, so the page itself never goes down.
 Run from the repo root (laptop):
   python -m uvicorn dashboard.app:app --port 8000          # or: python dashboard/app.py
 Env: VIAM_* (camera), MONGODB_URI (Atlas; else data/*.jsonl), SORTER_DATA (JSONL dir),
-     ATLAS_CHART_URLS (comma-separated Atlas Charts embed URLs), HOST / PORT for `python dashboard/app.py`.
+     ATLAS_CHART_URLS (comma-separated Atlas Charts embed URLs), HOST / PORT for `python dashboard/app.py`,
+     DASH_DIRECT_CAMERA=0 to never connect to the robot from this machine (use the worker's frames only).
+
+Picture source: the arm worker's latest frame from the Store (Store.put_frame) when it is under 30 s old,
+else this machine's own camera connection, else the stale worker frame. Once Atlas is live and the worker
+runs on the Linux box next to the arm, the laptop needs no robot connection at all.
 """
 import asyncio
+import io
 import json
 import os
 import pickle
@@ -34,10 +40,14 @@ RESET_COMMAND = "__reset__"  # EXEC_PLAN "Clear square" button; executed by the 
 MAX_TEXT = 200
 PREVIEW_HIGHLIGHT_S = 15.0
 STALE_S = 5.0  # camera state older than this means the camera process is down or restarting
+WORKER_FRAME_FRESH_S = 30.0  # prefer the worker's frame over our own camera while it is this fresh
+WORKER_OFFLINE_S = 15.0  # agreed with AGENT1: heartbeat at least every 5 s
+DIRECT_CAMERA = os.environ.get("DASH_DIRECT_CAMERA", "1") != "0"
 
 store = Store()
 CAM_DIR = store.data / "camera"
-camproc = {"pid": None, "restarts": 0, "last_exit": None}
+camproc = {"pid": None, "restarts": 0, "last_exit": None, "enabled": DIRECT_CAMERA}
+_worker_render = {"key": None, "jpeg": None}  # last annotated worker frame, keyed by (worker, ts)
 
 
 async def supervise_camera() -> None:
@@ -66,9 +76,10 @@ async def supervise_camera() -> None:
 
 @asynccontextmanager
 async def lifespan(_app):
-    task = asyncio.create_task(supervise_camera())
+    task = asyncio.create_task(supervise_camera()) if DIRECT_CAMERA else None
     yield
-    task.cancel()
+    if task:
+        task.cancel()
 
 
 app = FastAPI(title="Sorter dashboard", lifespan=lifespan)
@@ -86,7 +97,10 @@ def _clean(text: str) -> str:
 
 
 def _cam_state() -> dict:
-    """Latest camera state from the worker, marked disconnected when the heartbeat is stale."""
+    """Latest state of our own camera process, marked disconnected when its heartbeat is stale."""
+    if not DIRECT_CAMERA:
+        return {"connected": False, "error": "direct camera off (DASH_DIRECT_CAMERA=0)", "objects": [],
+                "frame_age_s": None, "process": camproc}
     try:
         state = json.loads((CAM_DIR / "state.json").read_text())
     except (FileNotFoundError, ValueError):
@@ -96,6 +110,47 @@ def _cam_state() -> dict:
         state["error"] = f"camera process restarting (last exit code {camproc['last_exit']})"
     state["frame_age_s"] = state.get("frame_age_s")
     return {**state, "process": camproc}
+
+
+def _render_worker_frame(data: bytes, doc: dict) -> bytes:
+    """Worker frame with the worker's object boxes drawn on it (bboxes are already in this image's pixels)."""
+    from PIL import Image, ImageDraw
+
+    objs = (doc.get("meta") or {}).get("objects") or []
+    if not objs:
+        return data
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    draw = ImageDraw.Draw(im)
+    for o in objs:
+        if not o.get("bbox"):
+            continue
+        u0, v0, u1, v1 = [int(x) for x in o["bbox"]]
+        draw.rectangle([u0, v0, u1, v1], outline=(255, 200, 0), width=2)
+        label = str(o.get("label") or f"#{o.get('id', '')}")
+        if o.get("score") is not None:
+            label += f" {float(o['score']):.2f}"
+        draw.rectangle([u0, max(v0 - 14, 0), u0 + 6 * len(label) + 4, max(v0 - 14, 0) + 14], fill=(255, 200, 0))
+        draw.text((u0 + 2, max(v0 - 13, 1)), label, fill=(0, 0, 0))
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=80)
+    return out.getvalue()
+
+
+def _pick_frame():
+    """(jpeg, source description, age_s) by the policy in the module docstring, or None."""
+    worker = store.get_frame()
+    worker_age = time.time() - worker[1].get("ts", 0) if worker else None
+    direct = CAM_DIR / "frame.jpg"
+    direct_age = time.time() - direct.stat().st_mtime if DIRECT_CAMERA and direct.exists() else None
+    if worker and (worker_age <= WORKER_FRAME_FRESH_S or direct_age is None):
+        data, doc = worker
+        key = (doc.get("worker"), doc.get("ts"))
+        if _worker_render["key"] != key:
+            _worker_render.update(key=key, jpeg=_render_worker_frame(data, doc))
+        return _worker_render["jpeg"], f"worker {doc.get('worker')}", worker_age
+    if direct_age is not None:
+        return direct.read_bytes(), "direct camera", direct_age
+    return None
 
 
 @app.get("/")
@@ -108,15 +163,26 @@ def status():
     urls = [u.strip() for u in os.environ.get("ATLAS_CHART_URLS", "").split(",") if u.strip()]
     cam = _cam_state()
     cam["objects"] = len(cam.get("objects", []))
-    return {"atlas": store.online, "queued": store.queued_counts(), "camera": cam, "charts": urls, "now": time.time()}
+    picked = _pick_frame()
+    frame = {"source": picked[1], "age_s": round(picked[2], 1)} if picked else None
+    return {"atlas": store.online, "queued": store.queued_counts(), "camera": cam, "frame": frame,
+            "workers": workers(), "charts": urls, "now": time.time()}
+
+
+@app.get("/api/workers")
+def workers():
+    """Each arm worker's latest heartbeat, with `online` = heard from within WORKER_OFFLINE_S."""
+    return [{**w, "online": w["age_s"] <= WORKER_OFFLINE_S} for w in store.worker_status()]
 
 
 @app.get("/api/snapshot.jpg")
 def snapshot():
-    path = CAM_DIR / "frame.jpg"
-    if not path.exists():
+    picked = _pick_frame()
+    if picked is None:
         raise HTTPException(503, "no frame yet")
-    return Response(path.read_bytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    data, source, age = picked
+    return Response(data, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-Frame-Source": source, "X-Frame-Age": f"{age:.1f}"})
 
 
 @app.get("/api/objects")

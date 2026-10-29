@@ -20,6 +20,7 @@ import fcntl
 import io
 import json
 import os
+import re
 import time
 import uuid
 from contextlib import contextmanager
@@ -28,6 +29,8 @@ from pathlib import Path
 import numpy as np
 
 COLLECTIONS = ("attempts", "calib_samples", "views", "commands")
+# Latest-value collections: one doc per worker, overwritten in place, never queued or flushed
+LIVE_COLLECTIONS = ("status", "frames")
 VECTOR_INDEX = "views_vec"  # Atlas Vector Search index on views.embedding (scripts/atlas_setup.py)
 EMBED_DIM = 512
 IMAGE_FIELDS = {"attempts": ("img_before", "img_after"), "views": ("jpeg",)}
@@ -38,16 +41,34 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
-def _small_jpeg(data: bytes) -> bytes:
-    """Downscale a JPEG to at most MAX_IMG_WIDTH wide so docs stay small (Atlas doc limit is 16 MB)."""
+def _small_jpeg_scaled(data: bytes) -> tuple:
+    """(JPEG at most MAX_IMG_WIDTH wide, scale factor applied) so docs stay small (Atlas doc limit is 16 MB)."""
     from PIL import Image
 
     im = Image.open(io.BytesIO(data)).convert("RGB")
+    scale = 1.0
     if im.width > MAX_IMG_WIDTH:
-        im = im.resize((MAX_IMG_WIDTH, round(im.height * MAX_IMG_WIDTH / im.width)))
+        scale = MAX_IMG_WIDTH / im.width
+        im = im.resize((MAX_IMG_WIDTH, round(im.height * scale)))
     out = io.BytesIO()
     im.save(out, "JPEG", quality=80)
-    return out.getvalue()
+    return out.getvalue(), scale
+
+
+def _small_jpeg(data: bytes) -> bytes:
+    return _small_jpeg_scaled(data)[0]
+
+
+def _safe_name(worker: str) -> str:
+    """Worker id usable as a file name (offline mode)."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", worker)[:80] or "worker"
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Write then rename, so a reader in another process never sees a half-written file."""
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
 
 
 def _with_date(doc: dict) -> dict:
@@ -236,6 +257,86 @@ class Store:
             self.db.commands.update_one({"_id": cmd_id}, {"$set": fields})
         else:
             self._append("commands", {"_op": "set", "_id": cmd_id, "fields": fields})
+
+    # ---- live worker state (agreed with AGENT1; one doc per worker, overwritten) ---------------------
+
+    def heartbeat(self, worker: str, phase: str, holding=None, error=None, command_id=None, **extra) -> None:
+        """
+        Record what the arm worker is doing right now. Call on every phase change and at least every 5 s;
+        the dashboard shows a worker as offline after 15 s without a heartbeat.
+
+        phase: idle / observe / servo / descend / grab / carry / place / reset / paused_person / reconnecting /
+        parked / error. holding: gripper is_holding_something() or None. extra: e.g. pose, attempt_id.
+        """
+        doc = {**extra, "_id": worker, "worker": worker, "ts": time.time(), "phase": phase,
+               "holding": holding, "error": error, "command_id": command_id}
+        if self.online:
+            self.db.status.replace_one({"_id": worker}, _with_date(doc), upsert=True)
+        else:
+            (self.data / "status").mkdir(exist_ok=True)
+            _write_atomic(self.data / "status" / f"{_safe_name(worker)}.json", json.dumps(doc, default=str).encode())
+
+    def worker_status(self) -> list:
+        """All workers' latest heartbeat, most recent first, each with age_s."""
+        if self.online:
+            docs = list(self.db.status.find({}))
+        else:
+            docs = []
+            for p in (self.data / "status").glob("*.json"):
+                try:
+                    docs.append(json.loads(p.read_text()))
+                except ValueError:
+                    continue
+        now = time.time()
+        for d in docs:
+            d.pop("at", None)
+            d["age_s"] = round(now - d.get("ts", 0), 1)
+        return sorted(docs, key=lambda d: d["age_s"])
+
+    def put_frame(self, worker: str, jpeg: bytes, meta: dict = None) -> None:
+        """
+        Store the worker's latest observe frame (overwrites). meta["objects"][i]["bbox"] is in pixels of the
+        image passed in; it is rescaled with the JPEG so the dashboard can draw boxes on the stored frame.
+        """
+        data, scale = _small_jpeg_scaled(bytes(jpeg))
+        meta = dict(meta or {})
+        if scale != 1.0 and meta.get("objects"):
+            meta["objects"] = [{**o, "bbox": [float(x) * scale for x in o["bbox"]]} if o.get("bbox") else o
+                               for o in meta["objects"]]
+        doc = {"_id": worker, "worker": worker, "ts": time.time(), "meta": meta}
+        if self.online:
+            from bson import Binary
+
+            self.db.frames.replace_one({"_id": worker}, _with_date({**doc, "jpeg": Binary(data)}), upsert=True)
+        else:
+            folder = self.data / "frames"
+            folder.mkdir(exist_ok=True)
+            name = _safe_name(worker)
+            _write_atomic(folder / f"{name}.jpg", data)
+            _write_atomic(folder / f"{name}.json", json.dumps(doc, default=str).encode())
+
+    def get_frame(self, worker: str = None):
+        """(jpeg bytes, doc without image) of the newest worker frame (or that worker's), or None."""
+        if self.online:
+            query = {"_id": worker} if worker else {}
+            doc = next(iter(self.db.frames.find(query).sort("ts", -1).limit(1)), None)
+            if not doc:
+                return None
+            data = bytes(doc.pop("jpeg"))
+            doc.pop("at", None)
+            return data, doc
+        folder = self.data / "frames"
+        names = [_safe_name(worker)] if worker else [p.stem for p in folder.glob("*.json")]
+        best = None
+        for name in names:
+            try:
+                doc = json.loads((folder / f"{name}.json").read_text())
+                data = (folder / f"{name}.jpg").read_bytes()
+            except (FileNotFoundError, ValueError):
+                continue
+            if best is None or doc.get("ts", 0) > best[1].get("ts", 0):
+                best = (data, doc)
+        return best
 
     # ---- reads for the dashboard -------------------------------------------------------------------
 

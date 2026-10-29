@@ -38,6 +38,13 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button:disabled { opacity: .5; cursor: default; }
   #msg { min-height: 20px; color: var(--muted); font-size: 12px; margin-top: 6px; }
+  #workers { margin-bottom: 12px; }
+  .worker { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 10px;
+            background: var(--bg); border-radius: 8px; margin-bottom: 6px; font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  .phase { font-weight: 600; }
+  .werr { flex-basis: 100%; color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
   ul.cmds { list-style: none; margin: 10px 0 0; padding: 0; }
   ul.cmds li { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--chip); white-space: nowrap; }
@@ -80,6 +87,7 @@
 
   <section class="card">
     <h2>Command</h2>
+    <div id="workers"></div>
     <form id="f">
       <input id="t" type="text" placeholder="grasp green square" autocomplete="off" maxlength="200">
       <button class="primary" type="submit">Grasp</button>
@@ -153,15 +161,35 @@ async function refreshStatus() {
     const q = Object.values(s.queued).reduce((a, b) => a + b, 0);
     setPill("p-atlas", s.atlas ? "Atlas online" : `Atlas offline · ${q} queued locally`, s.atlas ? "ok" : "warn");
     const c = s.camera;
-    setPill("p-cam", c.connected ? `Camera live · ${c.frame_age_s ?? "–"} s` : "Camera reconnecting", c.connected ? "ok" : "bad");
+    // Picture pill follows whichever source the server picked (worker frame or our own camera)
+    if (s.frame) setPill("p-cam", `Picture: ${s.frame.source} · ${s.frame.age_s} s`, s.frame.age_s < 10 ? "ok" : "warn");
+    else setPill("p-cam", "No picture yet", "bad");
     setPill("p-perc", c.perception ? `Perception · ${c.objects} objects` : "Perception off", c.perception ? "ok" : "warn");
-    $("camnote").textContent = c.error || c.perception_error || "";
+    const fromWorker = s.frame && s.frame.source.startsWith("worker");
+    $("camnote").textContent = fromWorker ? "" : (c.error || c.perception_error || "");
+    renderWorkers(s.workers);
     const box = $("charts");
     if (s.charts.length && !box.childElementCount) {
       $("charts-card").hidden = false;
       for (const u of s.charts) { const f = el("iframe"); f.src = u; box.appendChild(f); }
     }
   } catch (e) { setPill("p-atlas", "dashboard server unreachable", "bad"); }
+}
+
+const ago = (s) => s < 90 ? `${Math.round(s)} s ago` : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
+function renderWorkers(list) {
+  const box = $("workers"); box.replaceChildren();
+  if (!list.length) { box.appendChild(el("div", "Arm worker: no heartbeat yet", "worker muted")); return; }
+  for (const w of list) {
+    const row = el("div", null, "worker");
+    row.appendChild(el("span", null, "dot " + (!w.online ? "" : w.error ? "bad" : "ok")));
+    row.appendChild(el("span", w.worker));
+    row.appendChild(el("span", w.online ? w.phase : "offline", "phase"));
+    if (w.online && w.holding != null) row.appendChild(el("span", w.holding ? "holding object" : "gripper empty", "muted"));
+    row.appendChild(el("span", w.online ? ago(w.age_s) : `last seen ${ago(w.age_s)}`, "muted"));
+    if (w.error) row.appendChild(el("div", w.error, "werr"));
+    box.appendChild(row);
+  }
 }
 
 async function refreshCommands() {
