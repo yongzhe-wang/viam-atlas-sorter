@@ -212,7 +212,7 @@ async def main() -> None:
 
 
 async def around(points: list, offset: float = 40.0) -> None:
-    """4 library views per point; see around_offsets(). Kept as the --around entry point."""
+    """4 library views per point: flange at (x +- offset, y +- offset) (the --around entry point)."""
     await shoot(points, ((-offset, -offset), (-offset, offset), (offset, -offset), (offset, offset)), "library")
 
 
