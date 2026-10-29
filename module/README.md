@@ -72,6 +72,14 @@ await sorter.do_command({"reset": True})                    # empty the square (
   `too_wide`, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
 - A hand or arm reaching into the workspace pauses the robot; it resumes 2 s after the workspace is clear.
 
+From our web dashboard (no Atlas needed): start it with `DASH_COMMAND_PATH=module` (and `DASH_MODULE_NAME` if
+your service is not called `sorter`). Its "Grasp" box and "Clear square" button then call this DoCommand, and
+the worker panel and command list show `{"status": true}`: the running job, then the result.
+
+```bash
+DASH_COMMAND_PATH=module VIAM_MACHINE_ADDRESS=... VIAM_API_KEY_ID=... VIAM_API_KEY=... python dashboard/app.py
+```
+
 ## Calibrate (once per camera mount)
 
 1. Put the arm at `home_xy`, z = 400 mm, tool down. Close the gripper slowly until the fingertips appear at

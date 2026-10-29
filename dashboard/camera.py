@@ -174,9 +174,34 @@ class CameraFeed:
             self._dumped_ts = self.frame_ts
         _write_atomic(out / "state.json", json.dumps(state).encode())
 
-    async def run(self) -> None:
-        """Connect, stream frames, reconnect with backoff on any error. Never sends motion commands."""
+    async def _frames(self, robot) -> None:
+        """Camera loop on an open connection; raises on any error so the caller reconnects."""
         from viam.components.camera import Camera
+
+        cam = Camera.from_robot(robot, os.environ.get("VIAM_CAMERA", "cam"))
+        last_depth = 0.0
+        while True:
+            self._load_perception()
+            # Depth (~1.8 MB) only every DEPTH_EVERY_S for boxes; colour alone (~70 KB) in between, since
+            # the laptop link timed out even on single colour+depth frames
+            want_depth = self.perception is not None and time.time() - last_depth >= DEPTH_EVERY_S
+            kw = {} if want_depth else {"filter_source_names": [COLOR_SOURCE]}
+            res = await asyncio.wait_for(cam.get_images(**kw), timeout=FRAME_TIMEOUT_S)
+            rgb, depth = decode(res[0] if isinstance(res, tuple) else res)
+            if rgb is not None:
+                if depth is not None:
+                    last_depth = time.time()
+                    await asyncio.to_thread(self._segment, rgb, depth)
+                self.jpeg = await asyncio.to_thread(self._render, rgb)
+                self.frame_ts = time.time()
+            await asyncio.sleep(PERIOD_S)
+
+    async def run(self, camera_on: bool = True, bridge=None) -> None:
+        """
+        Connect, run the camera loop and/or the module bridge on that one connection, reconnect with backoff
+        when either fails. This process never moves the arm itself; the bridge only forwards dashboard
+        commands to our module's DoCommand.
+        """
         from viam.robot.client import RobotClient
 
         backoff = 2.0
@@ -189,34 +214,20 @@ class CameraFeed:
             robot = None
             try:
                 # Our loop is the only reconnect logic: the SDK's own checker raced it before the native abort.
-                # Sessions are off because this client only reads the camera.
+                # Sessions off: camera reads need none, and a module job must not be cancelled when this
+                # laptop link drops (the module runs it on the robot).
                 opts = RobotClient.Options.with_api_key(api_key=env[2], api_key_id=env[1], check_connection_interval=0,
                                                         attempt_reconnect_interval=0, disable_sessions=True)
                 robot = await asyncio.wait_for(RobotClient.at_address(env[0], opts), timeout=30)
-                cam = Camera.from_robot(robot, os.environ.get("VIAM_CAMERA", "cam"))
                 self.connected, self.error, backoff = True, None, 2.0
-                last_depth = 0.0
-                while True:
-                    self._load_perception()
-                    # Depth (~1.8 MB) only every DEPTH_EVERY_S for boxes; colour alone (~70 KB) in between, since
-                    # the laptop link timed out even on single colour+depth frames
-                    want_depth = self.perception is not None and time.time() - last_depth >= DEPTH_EVERY_S
-                    kw = {} if want_depth else {"filter_source_names": [COLOR_SOURCE]}
-                    res = await asyncio.wait_for(cam.get_images(**kw), timeout=FRAME_TIMEOUT_S)
-                    rgb, depth = decode(res[0] if isinstance(res, tuple) else res)
-                    if rgb is not None:
-                        if depth is not None:
-                            last_depth = time.time()
-                            await asyncio.to_thread(self._segment, rgb, depth)
-                        self.jpeg = await asyncio.to_thread(self._render, rgb)
-                        self.frame_ts = time.time()
-                    await asyncio.sleep(PERIOD_S)
+                loops = ([self._frames(robot)] if camera_on else []) + ([bridge.run(robot)] if bridge else [])
+                await _first_failure(loops)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self.connected = False
                 # TimeoutError has an empty message; say what timed out
-                detail = str(e) or f"no frame within {FRAME_TIMEOUT_S:.0f} s, reconnecting"
+                detail = str(e) or f"no answer within {FRAME_TIMEOUT_S:.0f} s, reconnecting"
                 self.error = f"{type(e).__name__}: {detail}"[:200]
             finally:
                 if robot is not None:
@@ -226,6 +237,85 @@ class CameraFeed:
                         pass
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
+
+
+async def _first_failure(coros: list) -> None:
+    """Run loops together; when one raises, cancel the rest and re-raise (the caller reconnects)."""
+    if not coros:
+        await asyncio.Event().wait()  # nothing to run; keep the connection open
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for t in done:
+            t.result()
+    finally:
+        for t in tasks:
+            t.cancel()
+
+
+class ModuleBridge:
+    """
+    Dashboard <-> our Viam module (generic service) over the SDK, without the Store command queue.
+
+    WHY: without MONGODB_URI the laptop and the robot cannot share the queue (offline JSONL is per machine),
+    but the module's DoCommand works over the existing robot connection. Runs in this subprocess so an SDK
+    abort cannot take the web server down.
+
+    File protocol in <out>: the web server writes module_req/<id>.json {"command": {...}}; this loop calls
+    DoCommand and writes module_res/<id>.json; module_status.json holds the latest {"status": true} answer.
+    """
+
+    STATUS_EVERY_S = 1.5
+    CMD_TIMEOUT_S = 15.0
+    MAX_FAILURES = 5  # consecutive failed calls -> raise, so the connection is rebuilt
+
+    def __init__(self, out: Path, name: str):
+        self.out, self.name = out, name
+        (out / "module_req").mkdir(parents=True, exist_ok=True)
+        (out / "module_res").mkdir(parents=True, exist_ok=True)
+
+    async def _call(self, svc, command: dict, timeout: float) -> dict:
+        return _jsonable(await asyncio.wait_for(svc.do_command(command), timeout=timeout))
+
+    async def run(self, robot) -> None:
+        from viam.services.generic import Generic
+
+        svc = Generic.from_robot(robot, self.name)
+        failures, last_poll = 0, 0.0
+        while True:
+            for req_path in sorted((self.out / "module_req").glob("*.json")):
+                try:
+                    req = json.loads(req_path.read_text())
+                except (FileNotFoundError, ValueError):
+                    continue
+                try:
+                    res, failures = await self._call(svc, req["command"], self.CMD_TIMEOUT_S), 0
+                except Exception as e:
+                    failures += 1
+                    res = {"accepted": False, "error": f"{type(e).__name__}: {e or 'no answer'}"[:300]}
+                _write_atomic(self.out / "module_res" / req_path.name, json.dumps(res, default=str).encode())
+                req_path.unlink(missing_ok=True)
+            if time.time() - last_poll >= self.STATUS_EVERY_S:
+                last_poll = time.time()
+                try:
+                    state, failures = {"ok": True, "status": await self._call(svc, {"status": True}, 10.0)}, 0
+                except Exception as e:
+                    failures += 1
+                    state = {"ok": False, "error": f"{type(e).__name__}: {e or 'no answer'}"[:300]}
+                state["ts"] = time.time()
+                _write_atomic(self.out / "module_status.json", json.dumps(state, default=str).encode())
+            if failures >= self.MAX_FAILURES:
+                raise ConnectionError(f"module '{self.name}' failed {failures} calls in a row")
+            await asyncio.sleep(0.2)
+
+
+def _jsonable(v):
+    """DoCommand results (Mapping / Sequence / numbers) -> plain JSON-serialisable Python."""
+    if isinstance(v, dict) or hasattr(v, "items"):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return v
 
 
 def _plain(v):

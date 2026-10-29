@@ -10,7 +10,12 @@ Run from the repo root (laptop):
   python -m uvicorn dashboard.app:app --port 8000          # or: python dashboard/app.py
 Env: VIAM_* (camera), MONGODB_URI (Atlas; else data/*.jsonl), SORTER_DATA (JSONL dir),
      ATLAS_CHART_URLS (comma-separated Atlas Charts embed URLs), HOST / PORT for `python dashboard/app.py`,
-     DASH_DIRECT_CAMERA=0 to never connect to the robot from this machine (use the worker's frames only).
+     DASH_DIRECT_CAMERA=0 to never connect to the robot from this machine (use the worker's frames only),
+     DASH_COMMAND_PATH=queue|module (default queue), DASH_MODULE_NAME (default "sorter").
+
+Command path: "queue" writes commands to the Store for a worker to claim (needs Atlas when the worker runs on
+another machine). "module" sends them straight to our Viam module's DoCommand ({"grasp": text} / {"reset":
+true}) over the robot link and shows its {"status": true} answers, so the demo needs no Atlas at all.
 
 Picture source: the arm worker's latest frame from the Store (Store.put_frame) when it is under 30 s old,
 else this machine's own camera connection, else the stale worker frame. Once Atlas is live and the worker
@@ -23,6 +28,8 @@ import os
 import pickle
 import sys
 import time
+import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,10 +50,16 @@ STALE_S = 5.0  # camera state older than this means the camera process is down o
 WORKER_FRAME_FRESH_S = 30.0  # prefer the worker's frame over our own camera while it is this fresh
 WORKER_OFFLINE_S = 15.0  # agreed with AGENT1: heartbeat at least every 5 s
 DIRECT_CAMERA = os.environ.get("DASH_DIRECT_CAMERA", "1") != "0"
+COMMAND_PATH = "module" if os.environ.get("DASH_COMMAND_PATH", "queue") == "module" else "queue"
+MODULE_MODE = COMMAND_PATH == "module"
+MODULE_NAME = os.environ.get("DASH_MODULE_NAME", "sorter")
+MODULE_STALE_S = 6.0  # status is polled every 1.5 s; older than this = link or module down
+MODULE_CALL_TIMEOUT_S = 25.0  # one DoCommand round trip through the robot-link process
 
 store = Store()
 CAM_DIR = store.data / "camera"
-camproc = {"pid": None, "restarts": 0, "last_exit": None, "enabled": DIRECT_CAMERA}
+camproc = {"pid": None, "restarts": 0, "last_exit": None, "enabled": DIRECT_CAMERA or MODULE_MODE}
+module_cmds = deque(maxlen=30)  # module mode: commands sent this session, newest first
 _worker_render = {"key": None, "jpeg": None}  # last annotated worker frame, keyed by (worker, ts)
 
 
@@ -57,12 +70,15 @@ async def supervise_camera() -> None:
     Backoff resets after a worker has run for a minute, so a crash every few hours restarts at once.
     """
     CAM_DIR.mkdir(parents=True, exist_ok=True)
+    # What the robot-link process runs: the camera, the module bridge, or both (one shared connection)
+    env = {**os.environ, "DASH_CAMERA": "1" if DIRECT_CAMERA else "0", "DASH_MODULE_NAME": MODULE_NAME if MODULE_MODE else ""}
     backoff = 1.0
     while True:
         started = time.time()
         with open(CAM_DIR / "worker.log", "wb") as log:
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "dashboard.camera_worker", str(CAM_DIR), cwd=str(ROOT), stdout=log, stderr=log)
+                sys.executable, "-m", "dashboard.camera_worker", str(CAM_DIR), cwd=str(ROOT), stdout=log, stderr=log,
+                env=env)
             camproc["pid"] = proc.pid
             try:
                 rc = await proc.wait()
@@ -76,7 +92,7 @@ async def supervise_camera() -> None:
 
 @asynccontextmanager
 async def lifespan(_app):
-    task = asyncio.create_task(supervise_camera()) if DIRECT_CAMERA else None
+    task = asyncio.create_task(supervise_camera()) if DIRECT_CAMERA or MODULE_MODE else None
     yield
     if task:
         task.cancel()
@@ -181,7 +197,71 @@ def status():
     picked = _pick_frame()
     frame = {"source": picked[1], "age_s": round(picked[2], 1)} if picked else None
     return {"atlas": store.online, "queued": store.queued_counts(), "camera": cam, "frame": frame,
-            "workers": workers(), "charts": urls, "now": time.time()}
+            "workers": workers(), "command_path": COMMAND_PATH, "charts": urls, "now": time.time()}
+
+
+def _module_state() -> dict:
+    """Latest {"status": true} answer from the module (written by the robot-link process), with age_s."""
+    try:
+        state = json.loads((CAM_DIR / "module_status.json").read_text())
+    except (FileNotFoundError, ValueError):
+        return {"ok": False, "error": "no answer from the module yet", "age_s": None, "status": {}}
+    state["age_s"] = round(time.time() - state.get("ts", 0), 1)
+    state.setdefault("status", {})
+    return state
+
+
+def _module_worker() -> dict:
+    """The module as a worker-panel row: busy job as phase, link or job errors as error; it takes our commands."""
+    st = _module_state()
+    s = st.get("status") or {}
+    running, last = s.get("running") or {}, s.get("last") or {}
+    online = bool(st.get("ok")) and st["age_s"] is not None and st["age_s"] <= MODULE_STALE_S
+    phase = f"{running.get('kind')}: {running.get('text') or 'square'}" if s.get("busy") else "idle"
+    error = None if st.get("ok") else st.get("error")
+    if not error and not s.get("busy") and last.get("status") in ("error", "failed"):
+        error = last.get("error") or last.get("fail_reason")
+    return {"worker": f"module:{MODULE_NAME} (direct)", "phase": phase, "holding": None, "error": error,
+            "age_s": st["age_s"] if st["age_s"] is not None else 1e9, "online": online, "consumer": True}
+
+
+def _sync_module_cmds() -> None:
+    """
+    Update sent commands from the module's status: running while its job is the module's current job, then the
+    module's last result once that names the same job (fallback for an older module without job ids: the
+    first result finished after the command was sent).
+    """
+    s = _module_state().get("status") or {}
+    running, last = s.get("running") or {}, s.get("last") or {}
+    for c in module_cmds:
+        if c["status"] != "running":
+            continue
+        if s.get("busy") and running.get("job") == c.get("job"):
+            continue
+        same = last.get("job") == c.get("job") if last.get("job") else (last.get("finished") or 0) >= c["ts"]
+        if last and same:
+            c.update(status=last.get("status") or "done", finished=last.get("finished"), attempt_id=last.get("_id"),
+                     fail_reason=last.get("fail_reason") or last.get("error"), duration_s=last.get("duration_s"),
+                     chosen={"label": last.get("label"), "score": last.get("score")} if last.get("label") else None)
+
+
+async def module_call(command: dict) -> dict:
+    """One DoCommand through the robot-link process (file request/response); 504 if it does not answer."""
+    rid = f"{time.time():.3f}-{uuid.uuid4().hex[:8]}"
+    req, res = CAM_DIR / "module_req" / f"{rid}.json", CAM_DIR / "module_res" / f"{rid}.json"
+    req.parent.mkdir(parents=True, exist_ok=True)
+    tmp = req.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"command": command}))
+    tmp.replace(req)  # the bridge only picks up complete *.json files
+    t0 = time.time()
+    while time.time() - t0 < MODULE_CALL_TIMEOUT_S:
+        if res.exists():
+            out = json.loads(res.read_text())
+            res.unlink(missing_ok=True)
+            return out
+        await asyncio.sleep(0.1)
+    req.unlink(missing_ok=True)
+    raise HTTPException(504, "the robot link did not answer; is the module running and the machine online?")
 
 
 @app.get("/api/workers")
@@ -194,7 +274,7 @@ def workers():
     consumer=true/false; without the flag the command worker (sfhack4-worker) counts as a consumer and the
     Viam module (module:<name>) does not, because the module heartbeats even with consume_dashboard_commands off.
     """
-    out = []
+    out = [_module_worker()] if MODULE_MODE else []
     for w in store.worker_status():
         consumer = w.get("consumer")
         if consumer is None:
@@ -219,13 +299,33 @@ def objects():
 
 
 @app.post("/api/commands")
-def add_command(body: TextIn):
+async def add_command(body: TextIn):
+    """Queue mode: Store command for a worker. Module mode: DoCommand on the module, which runs it in the background."""
     text = body.text.strip()
-    return {"id": store.add_command(RESET_COMMAND if text == RESET_COMMAND else _clean(text))}
+    text = RESET_COMMAND if text == RESET_COMMAND else _clean(text)
+    if not MODULE_MODE:
+        return {"id": store.add_command(text)}
+    entry = {"_id": uuid.uuid4().hex, "text": text, "ts": time.time(), "status": "sending"}
+    module_cmds.appendleft(entry)
+    try:
+        res = await module_call({"reset": True} if text == RESET_COMMAND else {"grasp": text})
+    except HTTPException as e:
+        entry.update(status="error", fail_reason=e.detail)
+        raise
+    if res.get("accepted"):
+        entry.update(status="running", job=res.get("job"))
+    else:
+        busy = res.get("error") == "busy"
+        # the "busy" badge says it all; a refusal for any other reason shows its message
+        entry.update(status="busy" if busy else "rejected", fail_reason=None if busy else res.get("error"))
+    return {"id": entry["_id"], "module": res}
 
 
 @app.get("/api/commands")
 def commands(limit: int = 15):
+    if MODULE_MODE:
+        _sync_module_cmds()
+        return list(module_cmds)[: min(limit, 100)]
     return store.list_commands(limit=min(limit, 100))
 
 

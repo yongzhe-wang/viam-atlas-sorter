@@ -178,7 +178,8 @@ class GraspByDescription(Generic, EasyResource):
                     await self.rig.lift()
             except Exception:
                 pass
-        self.last = {"kind": kind, "text": text, "finished": time.time(), **summary}
+        # job id lets a DoCommand caller (the dashboard in module mode) match this result to its request
+        self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
         return summary
 
     async def _start(self, kind: str, text: Optional[str], wait: bool) -> Dict[str, ValueTypes]:
