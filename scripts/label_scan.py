@@ -86,7 +86,8 @@ def sightings(frames: list) -> tuple:
     for name, rgb, depth, pose, intr in frames:
         seg = perception.segment_full(rgb, depth, align=perception.IDENTITY)
         for o in seg.objects:
-            xy = world_xy(pose, intr, *o.centroid_px, o.top_depth_mm)
+            # Top-face centroid sits above the object's axis from any view; the full mask drifts with its sides
+            xy = world_xy(pose, intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
             items.append({"frame": name, "obj": o.id, "bbox": list(o.bbox), "xy": [round(xy[0], 1), round(xy[1], 1)],
                           "colour": o.colour, "height_mm": round(o.height_mm, 1), "rect_fill": round(o.rect_fill, 3)})
             crops.append(o.crop)

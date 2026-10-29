@@ -3,9 +3,14 @@ CLIP embeddings and text ranking: which object on the table did the user mean?
 
 WHY: the demo command is a free description ("green square", "the cup"); CLIP puts text and image in one
 512-d space, so the description can be compared with every object crop directly, with no training.
-CLIP is weak on colour + shape words, so two cheap cues from segmentation are added on top: the
-object's dominant colour and its footprint aspect ratio. With a Store, labelled views of scanned objects
-also vote, which is how teach-once and the object library improve recognition.
+CLIP is weak on colour + shape words, so the object's dominant colour is added on top. With a Store,
+each object is also *recognised* from its nearest labelled views (the arm scan), and the query is
+matched against that label and its aliases. That is what separates look-alikes such as the green cube
+("green square") and the green cylinder.
+
+Depth-based shape cues were tried and dropped: on sfhack4 frames the top faces of standing cylinders
+(0.82-0.87 hull rectangularity) and of blocks (0.83-0.95) overlap, so a shape rule both refused cubes
+and picked cylinders.
 
 Contract: docs/EXEC_PLAN.md (embed_images, embed_text, rank). Model: open_clip ViT-B-32, CPU.
 """
@@ -22,17 +27,18 @@ COMPATIBLE = {"blue": {"blue", "cyan", "purple"}, "cyan": {"cyan", "blue", "gree
               "yellow": {"yellow", "orange"}, "orange": {"orange", "yellow", "red"}, "red": {"red", "orange", "purple"},
               "purple": {"purple", "blue", "red"}, "white": {"white", "grey"}, "grey": {"grey", "white", "black"},
               "black": {"black", "grey"}}
-
-
-def colour_ok(query_colours: set, obj_colour: str) -> bool:
-    """True if the object's colour is one a person could call by any of the query's colour words."""
-    return any(obj_colour in COMPATIBLE.get(c, {c}) for c in query_colours)
 # Command verbs/fillers stripped before embedding; the destination is always the blue square
 STOP = r"^(please\s+)?(grasp|grab|pick( up)?|get|take|move|put|place)\s+(up\s+)?(the\s+|a\s+|an\s+)?"
+FILLER = {"the", "a", "an", "one", "object", "thing"}
 COLOUR_BONUS = 0.04  # colour word matches the object's dominant colour (CLIP sims sit around 0.2-0.3)
 COLOUR_PENALTY = 0.04  # colour word names a different, saturated colour
-SHAPE_BONUS = 0.02
-STORE_WEIGHT = 0.10  # weight of labelled-view votes from the object library
+SHAPE_BONUS = 0.02  # "long"/"stick" vs footprint aspect; the only shape cue that held up
+# Library recognition. View scores are on the Store's 0-1 scale ((1 + cos) / 2): a crop matched its own
+# view at 1.0 and a different object's view at 0.83-0.87 in the offline test.
+# [CONFIDENCE: SINGLE-SRC 55% — offline test only; calibrate on the arm scan]
+KNN_MIN = 0.90  # a view at least this close counts as "same object"
+LABEL_BONUS = 0.15  # object recognised as something the query names
+LABEL_PENALTY = 0.10  # object recognised as something else
 # Below this the best crop is not really what was asked for. On frame t01 the correct objects scored
 # 0.27-0.35 while "green square" (no green object present) topped out at 0.203 on a laptop key.
 # [CONFIDENCE: SINGLE-SRC 60% — one frame, 6 objects; re-tune on the scanned set]
@@ -40,6 +46,11 @@ MIN_SCORE = 0.22
 AMBIGUOUS_MARGIN = 0.02  # top-1 minus top-2 below this: let the user confirm in the dashboard
 
 _model = _preprocess = _tokenizer = None
+
+
+def colour_ok(query_colours: set, obj_colour: str) -> bool:
+    """True if the object's colour is one a person could call by any of the query's colour words."""
+    return any(obj_colour in COMPATIBLE.get(c, {c}) for c in query_colours)
 
 
 def _load():
@@ -82,59 +93,52 @@ def embed_text(text: str) -> np.ndarray:
     return f[0].numpy().astype(np.float32)
 
 
-_NAME_CACHE = {}
-
-
-def _name_emb(name: str) -> np.ndarray:
-    """embed_text() memoised: store votes embed the same few labels/aliases on every query."""
-    if name not in _NAME_CACHE:
-        _NAME_CACHE[name] = embed_text(clean_query(name))
-    return _NAME_CACHE[name]
-
-
 def clean_query(text: str) -> str:
     """Lowercase, strip command verbs ("grasp", "pick up the") and normalise colour aliases."""
     q = re.sub(STOP, "", text.strip().lower())
     return " ".join(ALIASES.get(w, w) for w in q.split())
 
 
-SQUARE_WORDS = {"square", "cube", "box", "block", "brick", "rectangle", "rectangular"}
-ROUND_WORDS = {"round", "circle", "circular", "cylinder", "can", "cup", "ball", "disc", "disk", "roll", "bottle", "jar"}
-# Hull rectangularity measured on sfhack4 frames: rectangular blocks 0.83-0.93 (even when cut by the edge),
-# standing cylinders 0.74-0.80, tape roll 0.79, synthetic disc 0.81. Below this, "square"/"block" is refused.
-# [CONFIDENCE: SINGLE-SRC 65% — 3 frames, narrow gap; retest on the scanned set]
-SQUARE_MIN_FILL = 0.82
-ROUND_MAX_FILL = 0.83
+def _words(text: str) -> set:
+    return set(clean_query(text).split()) - FILLER
 
 
-def _shape_term(words: set, obj) -> float:
+def name_matches(query: str, names: list) -> bool:
     """
-    Small bonus/penalty when shape words agree/disagree with the mask.
+    True if the query names this object: its words are contained in a label/alias or vice versa.
 
-    Rectangularity (rect_fill) separates boxes from round things; aspect separates long from compact.
-    Round words stay soft: a cylinder lying on its side looks rectangular from above.
+    Word containment, not text-embedding similarity: "green cube" and "green cylinder" embed close
+    together, and that closeness is exactly the confusion the library has to remove.
     """
-    fill = getattr(obj, "rect_fill", 1.0)
-    aspect = obj.length_px / max(obj.width_px, 1.0)
-    term = 0.0
-    if words & SQUARE_WORDS:
-        term += SHAPE_BONUS if fill >= SQUARE_MIN_FILL else -SHAPE_BONUS
-        if words & {"square", "cube"}:
-            term += SHAPE_BONUS if aspect < 1.5 else -SHAPE_BONUS
-    if words & ROUND_WORDS:
-        term += SHAPE_BONUS if fill <= ROUND_MAX_FILL else -SHAPE_BONUS
-    if words & {"long", "stick", "pen", "bar"}:
-        term += SHAPE_BONUS if aspect > 2.0 else -SHAPE_BONUS
-    return term
+    q = _words(query)
+    return bool(q) and any(q <= _words(n) or (_words(n) and _words(n) <= q) for n in names)
+
+
+def recognise(emb: np.ndarray, store, k: int = 5) -> tuple:
+    """
+    (label, names, confidence) from the nearest labelled views, or (None, [], 0.0).
+
+    Views closer than KNN_MIN vote with their score; names = the winning label plus every alias seen.
+    """
+    votes, names = {}, {}
+    for v in store.search_views(emb, k=k):
+        if v["score"] < KNN_MIN:
+            continue
+        votes[v["label"]] = votes.get(v["label"], 0.0) + v["score"]
+        names.setdefault(v["label"], {v["label"]}).update(v.get("aliases") or [])
+    if not votes:
+        return None, [], 0.0
+    lab = max(votes, key=votes.get)
+    return lab, sorted(names[lab]), votes[lab] / k
 
 
 def rank(objs: list, text: str, store=None) -> list:
     """
     [(Obj, score)] best first for a free-text description.
 
-    score = CLIP(crop, "a photo of a {query}") + colour term + shape term + store vote.
-    Store vote: the object's crop retrieves its nearest labelled views; each vote is the view's score
-    times how well that view's label matches the query (CLIP text-text cosine).
+    score = CLIP(crop, "a photo of a {query}") + colour term + "long" term + library term.
+    Library term (store given): +LABEL_BONUS if the object is recognised as something the query names,
+    -LABEL_PENALTY if it is confidently recognised as something else. Sets obj.recognised / .recognised_names.
     """
     if not objs:
         return []
@@ -143,7 +147,6 @@ def rank(objs: list, text: str, store=None) -> list:
     img = embed_images([o.crop for o in objs])
     sims = img @ embed_text(q)
     qcol = words & COLOURS
-    qt = embed_text(q) if store is not None else None
     out = []
     for o, emb, s in zip(objs, img, sims):
         score = float(s)
@@ -152,14 +155,14 @@ def rank(objs: list, text: str, store=None) -> list:
                 score += COLOUR_BONUS
             elif o.colour in COLOURS - {"grey", "white", "black"}:
                 score -= COLOUR_PENALTY
-        score += _shape_term(words, o)
+        if words & {"long", "stick", "pen", "bar"}:
+            score += SHAPE_BONUS if o.length_px / max(o.width_px, 1.0) > 2.0 else -SHAPE_BONUS
+        o.recognised, o.recognised_names = None, []
         if store is not None:
-            views = store.search_views(emb, k=5)
-            if views:
-                # A view matches the query by its label or any alias ("green block" for a "green square")
-                votes = [v["score"] * max(float(_name_emb(n) @ qt) for n in [v["label"], *(v.get("aliases") or [])])
-                         for v in views]
-                score += STORE_WEIGHT * max(votes)
+            lab, names, _ = recognise(emb, store)
+            o.recognised, o.recognised_names = lab, names
+            if lab is not None:
+                score += LABEL_BONUS if name_matches(q, names) else -LABEL_PENALTY
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
 
@@ -169,20 +172,23 @@ def best(objs: list, text: str, store=None) -> dict:
     The object to pick for `text`, or a reason not to pick anything.
 
     WHY: rank() always returns something, so "green square" with no green object on the table would grab a
-    laptop key. Returns {"obj", "score", "margin", "ambiguous", "reason"}; obj is None when there is no match.
+    laptop key, and with only the green cylinder in view it would grab the cylinder. Refuses when the colour
+    is wrong, when the library recognises the best candidate as a different object, or when the match is weak.
+    Returns {"obj", "score", "margin", "ambiguous", "reason", "recognised"}; obj is None when refusing.
     """
     r = rank(objs, text, store)
     if not r:
-        return {"obj": None, "score": 0.0, "margin": 0.0, "ambiguous": False, "reason": "no objects on the table"}
+        return {"obj": None, "score": 0.0, "margin": 0.0, "ambiguous": False, "reason": "no objects on the table",
+                "recognised": None}
     (o, s), margin = r[0], (r[0][1] - r[1][1]) if len(r) > 1 else 1.0
+    out = {"obj": None, "score": s, "margin": margin, "ambiguous": False, "reason": "", "recognised": o.recognised}
     qcol = set(clean_query(text).split()) & COLOURS
     if qcol and not colour_ok(qcol, o.colour):
-        return {"obj": None, "score": s, "margin": margin, "ambiguous": False,
-                "reason": f"no {'/'.join(sorted(qcol))} object found"}
-    if set(clean_query(text).split()) & SQUARE_WORDS and getattr(o, "rect_fill", 1.0) < SQUARE_MIN_FILL:
-        # "green square" with only a green cylinder in view must not grab the cylinder
-        return {"obj": None, "score": s, "margin": margin, "ambiguous": False,
-                "reason": f"no box-shaped match (best is round, fill {o.rect_fill:.2f})"}
-    if s < MIN_SCORE:
-        return {"obj": None, "score": s, "margin": margin, "ambiguous": False, "reason": f"best match only {s:.2f}"}
-    return {"obj": o, "score": s, "margin": margin, "ambiguous": margin < AMBIGUOUS_MARGIN, "reason": ""}
+        out["reason"] = f"no {'/'.join(sorted(qcol))} object found"
+    elif o.recognised is not None and not name_matches(text, o.recognised_names):
+        out["reason"] = f"best candidate is recognised as {o.recognised!r}"
+    elif s < MIN_SCORE:
+        out["reason"] = f"best match only {s:.2f}"
+    else:
+        out.update(obj=o, ambiguous=margin < AMBIGUOUS_MARGIN)
+    return out

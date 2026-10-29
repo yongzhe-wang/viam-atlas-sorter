@@ -46,6 +46,10 @@ GROW_HEIGHT_MM = 3.0
 # between, which split one cylinder into a 61 mm and a 28 mm piece on frame e01. Invalid pixels this close
 # to an object bridge pieces for connectivity only; geometry still uses valid pixels.
 BRIDGE_INVALID_PX = 10
+# Top face = pixels within this of the object's top height. Off-centre, a standing object shows its sides
+# too (a cube seen at a corner is a hexagon, fill ~0.75 like a cylinder); its top face is still a square.
+# The user's photos confirm the cylinders stand upright and the green cube is a separate ~30 mm object.
+TOP_BAND_MM = 8.0
 EDGE_MARGIN_PX = 8  # an object this close to the image border is cut off: excluded, not a target
 # Optional workspace polygon in colour pixels at the observe pose: [[u, v], ...]; absent = whole image
 WORKSPACE_FILE = Path(__file__).resolve().parent.parent / "data" / "workspace.json"
@@ -99,7 +103,8 @@ class Obj:
     crop: np.ndarray = field(repr=False)  # uint8 RGB crop around bbox
     touches_edge: bool = False  # cut by the image border: geometry and crop are partial
     colour: str = ""  # dominant colour word of the mask, see colour_name()
-    rect_fill: float = 1.0  # mask area / min-area bounding rectangle: square ~1.0, circle ~0.785
+    rect_fill: float = 1.0  # top face hull / min-area rectangle: square/rectangle ~1.0, disc ~0.81
+    top_centroid_px: tuple = ()  # centroid of the top face: above the object's axis from any view angle
 
 
 @dataclass
@@ -334,11 +339,17 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         mu, mv = int((u1 - u0) * CROP_MARGIN) + 4, int((v1 - v0) * CROP_MARGIN) + 4
         crop = rgb[max(0, v0 - mv):min(H, v1 + mv + 1), max(0, u0 - mu):min(W, u1 + mu + 1)].copy()
         cen, yaw, L, Wd = _geometry(m)
+        # Top face on the colour grid (falls back to the whole mask for low, flat objects)
+        top_m = to_colour(m_d & (height >= top_h - TOP_BAND_MM), model) & m
+        if top_m.sum() < 200:
+            top_m = m
+        tvs, tus = np.nonzero(top_m)
         e = EDGE_MARGIN_PX
         edge = u0 <= e or v0 <= e or u1 >= W - 1 - e or v1 >= H - 1 - e
         o = Obj(id=0, bbox=bbox, centroid_px=cen, yaw_deg=yaw, length_px=L, width_px=Wd, height_mm=top_h,
                 top_depth_mm=float(np.percentile(d[m_d], 10)), mask=m, crop=crop, touches_edge=edge,
-                colour=colour_name(rgb, m)[0], rect_fill=rect_fill(m))
+                colour=colour_name(rgb, m)[0], rect_fill=rect_fill(top_m),
+                top_centroid_px=(float(tus.mean()), float(tvs.mean())))
         # Only fully visible objects inside the workspace are targets; the rest is kept for display/debug
         if edge:
             excluded.append((o, "touches the image edge"))
