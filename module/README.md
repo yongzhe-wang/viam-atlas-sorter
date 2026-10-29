@@ -96,9 +96,13 @@ await sorter.do_command({"reset": True})                    # empty the square (
   Sweep frames are also saved by the executor under `$VIAM_MODULE_DATA/data/sweeps` (the module sets
   `SORTER_DATA_DIR`). Only the newest 30 sweeps (about 8 MB each) are kept.
 - **Observation log** (user: "all data should be saved to continuously form the map"): every frame folded into the
-  live map is appended with `Store.log_observation`. Each record holds time, source/phase, pose, intrinsics, what
-  `update_map` detected (labels, scores, table xy, boxes), square, intruders and map version, plus a JPEG of at
-  most 640 px and a 320×180 16-bit depth PNG. Records go to `$VIAM_MODULE_DATA/data/observations/<YYYYMMDD>/`;
+  live map is appended with `Store.log_observation`. The record is `update_map`'s own
+  `last_update["observation"]`, unchanged (AGENT3: ts, source, pose, intrinsics, detections with embeddings,
+  square, intruders, depth-validity grid), plus epoch and map version. `table_map.fold_observations` replays it
+  to the same map as live; `module/selftest_map.py` checks that on every build. Next to each record go a JPEG of
+  at most 640 px and a 320×180 16-bit depth PNG, kept for the dashboard and debugging. An idle picture enters
+  the map, and so the log, only when what it shows changed (labels, box centres, intruders), or every 20 s:
+  a still table no longer writes a record a second. Records go to `$VIAM_MODULE_DATA/data/observations/<YYYYMMDD>/`;
   with Atlas, also to `observations` (images to `observation_images` up to `SORTER_OBS_ATLAS_MB`, default 300).
   Nothing is ever deleted by Clear map or a restart: they only move the map's epoch. `{"rebuild_map": {"since":
   ts}}` folds the log since `ts` (default: the epoch) back into the live map with AGENT3's
@@ -122,7 +126,7 @@ await sorter.do_command({"reset": True})                    # empty the square (
 - One job at a time. A request while busy returns `{"accepted": false, "error": "busy", "running": {...}}`.
 - Summaries contain `status` (`done`, `failed`, `not_found`, `ambiguous` = two objects match about equally,
   `already_in_square` = the named object is only in the drop square (answered at once, no sweep), `too_wide`,
-  `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
+  `too_close` = too near the arm base, please move it out, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
 - A hand or arm reaching into the workspace pauses the robot; it resumes 2 s after the workspace is clear.
 
 From our web dashboard (no Atlas needed): start it with `DASH_COMMAND_PATH=module` (and `DASH_MODULE_NAME` if

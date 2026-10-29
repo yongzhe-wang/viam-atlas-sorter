@@ -67,6 +67,7 @@ class LiveMap:
         self._gen = 0  # bumped by clear(): an update still running on the old map is thrown away
         params = inspect.signature(update_fn).parameters
         self._takes_recognised, self._takes_seg = "recognised" in params, "seg" in params
+        self._takes_now = "now" in params
         self._newest = None  # newest droppable frame waiting for the worker
         self._keep = deque()  # (frame, future): frames that must all be applied, in order (sweep)
         self._keep_current: Optional[asyncio.Future] = None  # the keep frame being applied right now
@@ -131,6 +132,8 @@ class LiveMap:
         """One update_map call in a worker thread; the result replaces the map, a failure is counted and skipped."""
         rgb, depth, pose, intr, source, recs, seg, taken = frame
         kw = {"recognised": recs} if recs is not None and self._takes_recognised else {}
+        if self._takes_now:
+            kw["now"] = taken  # AGENT3: the record's ts is `now`; the log keeps `taken`, so replay gets the same seen_ts
         if seg is not None and self._takes_seg:
             kw["seg"] = seg
         snapshot, gen = self.map, self._gen  # map: replaced, never mutated in place, so stable in the thread
@@ -163,17 +166,19 @@ class LiveMap:
 
     def _log_observation(self, rgb, depth, pose: dict, intr: dict, source: str, taken: float, lu: dict) -> None:
         """
-        Append the frame just folded in to the Store's observation log (worker thread). What it saw comes from
-        update_map's last_update (AGENT3: detections, square, intruders); the images are made small here.
+        Append the frame just folded in to the Store's observation log (worker thread). The record is update_map's
+        own last_update["observation"] as is (AGENT3: what fold_observations replays, identical to live: ts, pose,
+        source, detections with emb16, square, depth_valid ...), plus our fields; the images are made small here.
         """
         try:
             png, scale = _small_depth(depth) if depth is not None else (None, None)
-            doc = {"ts": taken, "source": source, "pose": pose, "intr": intr,
-                   "detections": lu.get("detections") or [], "detected": lu.get("detected"),
-                   "square": lu.get("square"), "intruders": lu.get("intruders") or [],
-                   "hand_in_view": lu.get("hand_in_view"), "dropped": lu.get("dropped") or [],
-                   "epoch": self.epoch, "map_version": f"{int(self.epoch * 1000)}:{self.stats['updates']}",
-                   "depth_scale": scale}
+            # An update_map without observation records: the light fields, for the dashboard (fold refuses these)
+            rec = lu.get("observation") or {"ts": taken, "source": source, "pose": pose, "intr": intr,
+                                             "detections": lu.get("detections") or [], "square": lu.get("square"),
+                                             "intruders": lu.get("intruders") or []}
+            doc = {**rec, "detected": lu.get("detected"), "hand_in_view": lu.get("hand_in_view"),
+                   "dropped": lu.get("dropped") or [], "epoch": self.epoch,
+                   "map_version": f"{int(self.epoch * 1000)}:{self.stats['updates']}", "depth_scale": scale}
             self.store.log_observation(doc, _small_jpeg(rgb) if rgb is not None else None, png)
             self.stats["logged"] += 1
         except Exception as e:

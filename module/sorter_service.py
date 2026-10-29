@@ -93,6 +93,8 @@ TIMELAPSE_KEEP_S = 2 * 3600.0  # ... kept for the last 2 hours
 MAP_FRESH_S = 60.0  # a live-map object seen this recently is gone to directly; a sweep this recent covers the table
 MAP_PERSIST_S = 2.0  # live map -> Store.put_table_map at most this often (VIAM CENTERAL)
 MAP_TASK_EVERY_S = 1.0  # during a task, at most one executor frame per second goes to the live map (servo keeps CPU)
+IDLE_SIG_PX = 12  # idle pictures differ when a box centre moved this many pixels (or labels / intruders changed)
+IDLE_MAP_KEEPALIVE_S = 20.0  # ... else one idle picture this often still goes into the map and the log
 OBS_THIN_EVERY_S = 60.0  # how often the observation log checks free disk space (thins idle images under 5 GB)
 SWEEPS_KEEP = 30  # saved sweep frame sets (AGENT1, ~8 MB each: 4 x jpg + 1280x720 uint16 depth): keep the newest 30
 
@@ -220,6 +222,7 @@ class GraspByDescription(Generic, EasyResource):
         self._sweeping = False  # while a sweep runs, every frame goes to the live map (none dropped)
         self._task_map_at = 0.0  # when the last other executor frame went to the live map
         self._thinned_at = 0.0  # when the observation log last checked free disk space
+        self._idle_sig, self._idle_fed_at = None, 0.0  # last idle picture fed to the live map: what it showed, when
         self._no_target_warned = False
         self.timelapse_dir = (Path(module_data) if module_data else self.store.data) / "timelapse"
         loop = asyncio.get_event_loop()
@@ -336,8 +339,11 @@ class GraspByDescription(Generic, EasyResource):
             return {"ok": False, "error": "busy", "running": dict(self.job_info)}
         if self.live is None:
             return {"ok": False, "error": "warming up"}
-        async with self._look_lock:
-            res = await self.live.rebuild(float(since if since is not None else self.live.epoch), fold)
+        try:
+            async with self._look_lock:
+                res = await self.live.rebuild(float(since if since is not None else self.live.epoch), fold)
+        except Exception as e:  # e.g. AGENT3's fold refusing a record without its observation fields
+            return {"ok": False, "error": f"rebuild failed: {type(e).__name__}: {e}"[:300]}
         LOGGER.info(f"{self.name}: map rebuilt from {res['observations']} observations: {res['objects']} objects")
         return {"ok": True, **res}
 
@@ -413,7 +419,9 @@ class GraspByDescription(Generic, EasyResource):
         seg = rt.perception.segment_full(rgb, depth)
         ms["segment"] = _ms(t)
         t = time.monotonic()
-        hole = rt.executor.hole_mask(rgb)
+        # With depth, a square cut by the picture's edge (paper pushed) still gives a hole (AGENT1 ce17ecf); without
+        # it, the yellow block already in the square was a frame-path candidate (AGENT3)
+        hole = rt.executor.hole_mask(rgb, depth)
         ms["square"] = _ms(t)
         t = time.monotonic()
         if hasattr(rt.clip_embed, "recognise_all"):
@@ -426,8 +434,9 @@ class GraspByDescription(Generic, EasyResource):
                 lab, names, conf = rt.clip_embed.recognise(emb, self.store, colour=o.colour, height_mm=o.height_mm)
                 recs.append({"obj": o, "label": lab, "names": names, "score": conf, "emb": emb})
         all_recs = recs
+        # Same rule as the executor's look_here: in the square = footprint mostly on its white interior (in_hole)
         recs = [r for r in recs if not r.get("partial") and not r["obj"].touches_edge
-                and (hole is None or (r["obj"].mask & hole).sum() < 0.5 * r["obj"].mask.sum())]
+                and (hole is None or not rt.executor.in_hole(r["obj"], hole))]
         ms["clip"] = _ms(t)
         objects = [{"id": int(r["obj"].id), "label": r["label"],
                     "aliases": [n for n in (r.get("names") or []) if n != r["label"]],
@@ -475,11 +484,27 @@ class GraspByDescription(Generic, EasyResource):
                           "pose": pose}
         self.seen = {"ts": t_cap, "at_observe": True, "pose": pose, "objects": objects, "intruders": intruders,
                      "seen_ms": ms, "watch_period_s": self.watch_period}
-        if self.live is not None:  # every idle picture updates the live map (reusing this frame's recognition)
+        if self.live is not None and self._idle_changed(all_recs, seg):  # reusing this frame's recognition
             self.live.offer(rgb, depth, pose, await self._intrinsics(), "idle", recognised=all_recs, seg=seg)
         # Arm confirmed still: keep each recognised object's last-seen table xy current (AGENT3's where_is)
         if hasattr(rt.clip_embed, "record_sightings"):
             await asyncio.to_thread(rt.clip_embed.record_sightings, self.store, recs, pose, None, "idle")
+
+    def _idle_changed(self, recs: list, seg) -> bool:
+        """
+        Should this idle picture go into the live map (and so the observation log)? Yes when what it shows changed
+        (labels and box centres to IDLE_SIG_PX, intruders) or IDLE_MAP_KEEPALIVE_S passed (seen_ts stays fresh).
+        WHY: a still table at 1 frame/s is ~40 MB/h of log records for nothing (AGENT3); a frame left out of the
+        log must stay out of the map too, so live and replay agree.
+        """
+        sig = tuple(sorted((r.get("label") or "", round((r["obj"].bbox[0] + r["obj"].bbox[2]) / 2 / IDLE_SIG_PX),
+                            round((r["obj"].bbox[1] + r["obj"].bbox[3]) / 2 / IDLE_SIG_PX)) for r in recs))
+        sig += (len(getattr(seg, "intruders", []) or []),)
+        now = time.time()
+        if sig == self._idle_sig and now - self._idle_fed_at < IDLE_MAP_KEEPALIVE_S:
+            return False
+        self._idle_sig, self._idle_fed_at = sig, now
+        return True
 
     async def _watch_loop(self) -> None:
         """Idle perception, every watch_period, once warm and while no job runs."""
