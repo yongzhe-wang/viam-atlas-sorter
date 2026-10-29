@@ -753,14 +753,15 @@ def mark(times: dict, phase: str, t0: float) -> float:
     return now
 
 
-async def pick(rig: Rig, times: dict = None, finder=None) -> tuple:
+async def pick(rig: Rig, times: dict = None, finder=None, verify=None) -> tuple:
     """
     Steps 1-2: align over the block, measure it, descend and grab. Returns (block height, grip depth).
 
     `times` receives seconds per phase (servo, descend, grab) and times["at"] names the phase in progress,
     so a caller can log where a failure happened. Raises PickFailed if the grab closes on nothing.
     `finder` picks which object (default: largest yellow blob; pass a Tracker when other yellow things
-    are on the table).
+    are on the table). `verify` (optional coroutine factory -> (ok, why)) re-checks identity before every
+    descent; on a mismatch the pick is refused rather than grabbing something else.
     """
     times = {} if times is None else times
     finder = finder or find_block
@@ -786,6 +787,11 @@ async def pick(rig: Rig, times: dict = None, finder=None) -> tuple:
         if not 10.0 <= height <= 80.0:
             raise RuntimeError(f"implausible block height {height:.0f} mm")
         grip = min(GRIP_DEPTH, height / 2)
+        if verify is not None:
+            ok, why = await verify()
+            print(f"  identity check: {why}")
+            if not ok:
+                raise PickFailed(f"lost the target, refusing to grab something else: {why}")
         # Never descend into a hand: check the area the jaws are about to enter
         await rig.wait_clear(axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top))
         # Close range re-alignment: fingertips APPROACH_GAP above the block top, where pixel offsets are larger
@@ -795,6 +801,9 @@ async def pick(rig: Rig, times: dict = None, finder=None) -> tuple:
         await rig.descend(z_mid)
         # Too close for the RealSense depth range (~280 mm min), so the block-top depth is carried over
         # from the measurement above; straight vertical moves keep that relation exact
+        if hasattr(finder, "close_target"):
+            # Where the jaws point at this height: the tracker returns it when the close view cuts the object off
+            finder.close_target = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top - (z0 - z_mid))
         await rig.servo(finder, True, "block-close", plane_at=lambda z: top - (z0 - z))
         # Fingertips (TIP_BELOW_CAM past the camera) end `grip` below the block top
         z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
@@ -812,6 +821,9 @@ async def pick(rig: Rig, times: dict = None, finder=None) -> tuple:
             break
         # Missed (or the object was moved): open, re-align from the observation height, try again
         await rig.open()
+        if hasattr(finder, "back_to_far"):
+            # Re-align against the last FAR sighting, never a close-range pixel (that pulled in the blue block)
+            finder.back_to_far()
         if attempt < GRAB_TRIES:
             times["at"] = "servo"
             await rig.servo(finder, True, "block")

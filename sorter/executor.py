@@ -16,7 +16,9 @@ failed pick -> wipe (<= 2 passes) -> verify hole empty by depth -> Store.log_att
 Contract: docs/EXEC_PLAN.md (Command flow, Reset).
 """
 import io
+import json
 import math
+import os
 import random
 import sys
 import time
@@ -49,10 +51,16 @@ PHASES = {"square": "observe", "find": "observe", "check": "place", "start": "ob
 # Flange x/y over the square's centre from the latest locate/place, and when; used when a frame shows no square
 LAST_SQUARE = {"xy": None, "ts": 0.0}
 SQUARE_CACHE_S = 600.0
-# Whole-table sweep: theta 0 poses at SWEEP_Z (field of view ~680 x 380 mm at the table); refined after the
-# high-pose test frames (AGENT3) confirm 30 mm blocks still segment at this height
-SWEEP_Z = 500.0
-SWEEP_XY = [(x, y) for x in (280.0, 460.0) for y in (-250.0, 0.0, 250.0)]
+# Whole-table sweep: theta 0 poses at SWEEP_Z. The first layout (z 500, rows at flange x 280/460) saw x >= 138
+# only, so the green cube near the base (166, 118) was cut by the image edge and dropped, and no frame held the
+# whole square. Raised to z 580 (user: "raise a little higher"): camera ~562 mm above the table, one frame covers
+# ~445 mm in x by ~790 mm in y, centred ~(48, 33) mm from the flange (perception.JAW_IN_CAM_MM). Rows 170/400 and
+# columns -180/+180 overlap ~210 / ~430 mm: green cube, KIND bar corner and the whole square (~(370, 84),
+# 137 x 188 mm) each lie fully inside at least one of the 4 frames.
+SWEEP_Z = 580.0
+SWEEP_XY = [(x, y) for x in (170.0, 400.0) for y in (-180.0, 180.0)]
+# Every sweep frame is saved here for offline debugging (AGENT3); SORTER_DATA_DIR overrides (module data dir)
+SWEEP_DIR = Path(os.environ.get("SORTER_DATA_DIR") or Path(__file__).resolve().parent.parent / "data") / "sweeps"
 
 
 def phase_now(rig) -> str:
@@ -172,97 +180,167 @@ def record_sightings(store, rgb, depth, seg, pose: dict, intrinsics: dict, sourc
 
 class ObjTracker:
     """
-    Finder (rgb -> (u, v, yaw, area) or None) that follows one object of any colour.
+    Finder (rgb -> (u, v, yaw, area) or None) that follows ONE object of any colour, and only that object.
 
-    Far (depth valid, e.g. at ALIGN_Z): nearest object from perception.segment_full, INCLUDING objects cut by
-    the image border: "grasp blue screwdriver" failed with "lost after wrist rotation" because after a 40 deg
-    turn the thin shaft ran out of frame and the screwdriver moved to segment_full().excluded. Excluding cut
-    objects is right for choosing a target, wrong for following one.
-    If the nearest object jumped more than MAX_JUMP_PX (moved by a person, or segmented differently), it
-    re-acquires by recognition: best() with the request text over everything in view, nearest the last pixel.
-    Close (depth blind < ~280 mm, close-range servo): nearest blob near the object's own median colour.
-    Limitation: at close range a table-coloured object cannot be told from the table.
+    WHY (2026-10-29, "grasp blue screwdriver" put the BLUE BLOCK in the square): (1) at close range the hue
+    tracker matched only the handle's blue parts and centred the jaws on the blue end cap, so the grab missed;
+    (2) the re-alignment after the miss started from that close-range pixel, and in the far frame the nearest
+    object to it was the blue block; (3) nothing checked identity before closing. So:
+    - far and close positions are kept apart: far frames are matched against the last FAR position only;
+    - far frames (depth valid): every object incl. edge-cut ones (a turned screwdriver's shaft leaves the frame);
+      when more than one is within reach of the last position, best() with the request text decides; with no
+      candidate in reach it re-acquires by recognition over the whole frame;
+    - close frames (depth blind < ~280 mm): pixels of ANY of the object's dominant colours (a blue+black handle
+      is matched as a whole, not just its blue cap), nearest blob to the last position;
+    - executor.verify_target() re-checks identity by recognition before every descent (ppa.pick verify=).
     """
 
     MAX_JUMP_PX = 260.0
 
     def __init__(self, rig, obj, rgb: np.ndarray, text: str = None, store=None):
-        self.rig = rig
-        self.uv = obj.centroid_px
-        self.text, self.store = text, store
+        self.rig, self.text, self.store = rig, text, store
+        self.far_uv = obj.centroid_px  # last position in a far frame
+        self.close_uv = None  # last position in a close frame; cleared when the arm goes back up
+        self.close_target = None  # jaw pixel for the close servo, set by ppa.pick before it starts
+        self.uv = self.far_uv
         self._learn(rgb, obj.mask)
+
+    def back_to_far(self) -> None:
+        """Called by ppa.pick after a lift: the next frame is a far one, compare it with the last FAR sighting."""
+        self.close_uv = None
+        self.uv = self.far_uv
 
     def _learn(self, rgb: np.ndarray, mask: np.ndarray) -> None:
         """
-        Colour reference for the close range from the object's latest far view (median RGB and HSV).
-
-        WHY: "yellow block" failed with "block-close: not visible": the reference came from the first frame and
-        an RGB tolerance of 45, but up close the block reads much brighter. Refreshed on every far frame, and
-        coloured objects are matched by hue, which brightness hardly changes.
+        Close-range colour model from the object's latest far view: one hue for its saturated part (hue barely
+        changes when the object looks brighter up close) and one RGB median for its unsaturated part (black/grey/
+        white), each kept if it covers >= 15% of the object. A blue+black screwdriver gets both.
         """
-        self.colour = np.median(rgb[mask].astype(float), axis=0)
         hsv = np.asarray(Image.fromarray(rgb).convert("HSV"))[mask].astype(float)
-        self.hsv = np.median(hsv, axis=0)
+        px = rgb[mask].astype(float)
+        sat = (hsv[:, 1] > SAT_REF) & (hsv[:, 2] > 50)
+        self.hue = float(np.median(hsv[sat, 0])) if sat.mean() >= 0.15 else None
+        self.rgb_ref = np.median(px[~sat], axis=0) if (~sat).mean() >= 0.15 else None
+        if self.hue is None and self.rgb_ref is None:
+            self.rgb_ref = np.median(px, axis=0)
 
-    def _seg_objects(self, rgb: np.ndarray, depth: np.ndarray) -> list:
+    def _close_mask(self, rgb: np.ndarray) -> np.ndarray:
+        m = np.zeros(rgb.shape[:2], bool)
+        if self.hue is not None:
+            hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+            dh = np.abs(hsv[..., 0] - int(self.hue))
+            dh = np.minimum(dh, 256 - dh)  # hue is circular
+            m |= (dh <= HUE_TOL) & (hsv[..., 1] > SAT_REF * 0.6) & (hsv[..., 2] > 50)
+        if self.rgb_ref is not None:
+            m |= np.linalg.norm(rgb.astype(float) - self.rgb_ref, axis=2) < COLOUR_TOL
+        m[ppa.FINGER_ROW:] = False
+        return ndimage.binary_closing(ndimage.binary_opening(m, iterations=2), iterations=4)
+
+    def _far(self, rgb: np.ndarray, depth: np.ndarray):
         seg = perception.segment_full(rgb, depth)
-        return list(seg.objects) + [o for o, _ in seg.excluded]
+        objs = list(seg.objects) + [o for o, _ in seg.excluded]
+        if not objs:
+            return None, None
 
-    def _recognise(self, rgb: np.ndarray, objs: list):
-        """Re-acquire by name: best() with the request text, accepted only within 2 x MAX_JUMP_PX of the last pixel."""
+        def dist(o):
+            return math.hypot(o.centroid_px[0] - self.far_uv[0], o.centroid_px[1] - self.far_uv[1])
+
+        near = [o for o in objs if dist(o) <= self.MAX_JUMP_PX]
+        pick = min(near, key=dist) if near else None
+        if len(near) > 1 and self.text:
+            # Several objects in reach (the screwdriver next to the blue block): identity by name, not distance
+            named = self._best(near)
+            if named is not None:
+                pick = named
+        if pick is None:
+            pick = self._best(objs)  # lost: re-acquire by recognition over the whole frame
+            if pick is not None and dist(pick) > 2 * self.MAX_JUMP_PX:
+                pick = None
+            if pick is not None:
+                print("  re-acquired the target by recognition")
+        return pick, objs
+
+    def _best(self, objs: list):
         if not self.text or not objs:
             return None
         try:
-            found = clip_embed.best(objs, self.text, self.store)
+            return clip_embed.best(objs, self.text, self.store).get("obj")
         except Exception as e:
-            print(f"  re-acquire by recognition failed: {e}")
+            print(f"  recognition failed: {e}")
             return None
-        o = found.get("obj")
-        if o is None or math.hypot(o.centroid_px[0] - self.uv[0], o.centroid_px[1] - self.uv[1]) > 2 * self.MAX_JUMP_PX:
-            return None
-        print(f"  re-acquired by recognition ({found.get('label')}, score {found.get('score', 0):.2f})")
-        return (o.centroid_px[0], o.centroid_px[1], o.yaw_deg, int(o.mask.sum()))
 
-    def _candidates(self, rgb: np.ndarray) -> list:
+    def __call__(self, rgb: np.ndarray):
         depth = self.rig.last_depth
         if depth is not None and (depth > 0).mean() > 0.6:
-            self._objs = self._seg_objects(rgb, depth)
-            return [(o.centroid_px[0], o.centroid_px[1], o.yaw_deg, int(o.mask.sum())) for o in self._objs]
-        self._objs = []
-        if self.hsv[1] > SAT_REF:
-            hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
-            dh = np.abs(hsv[..., 0] - int(self.hsv[0]))
-            dh = np.minimum(dh, 256 - dh)  # hue is circular
-            m = (dh <= HUE_TOL) & (hsv[..., 1] > SAT_REF * 0.6) & (hsv[..., 2] > 50)
-        else:
-            m = np.linalg.norm(rgb.astype(float) - self.colour, axis=2) < COLOUR_TOL
-        m[ppa.FINGER_ROW:] = False
-        m = ndimage.binary_opening(m, iterations=2)
-        lab, n = ndimage.label(m)
-        out = []
+            o, _ = self._far(rgb, depth)
+            if o is None:
+                return None
+            self.far_uv = self.uv = o.centroid_px
+            self.close_uv = None
+            if not o.touches_edge:
+                self._learn(rgb, o.mask)
+            return (o.centroid_px[0], o.centroid_px[1], o.yaw_deg, int(o.mask.sum()))
+        ref = self.close_uv or self.far_uv
+        lab, n = ndimage.label(self._close_mask(rgb))
+        cands, self._labels = [], []
         for k in range(1, n + 1):
             vs, us = np.nonzero(lab == k)
             if len(us) < 1500:
                 continue
+            self._labels.append(k)
             cu, cv = us.mean(), vs.mean()
             w, vec = np.linalg.eigh(np.cov(np.vstack([us - cu, vs - cv])))
-            out.append((cu, cv, math.degrees(math.atan2(-vec[1, 1], vec[0, 1])) % 180.0, len(us)))
-        return out
-
-    def __call__(self, rgb: np.ndarray):
-        cands = self._candidates(rgb)
-        best = min(cands, key=lambda c: math.hypot(c[0] - self.uv[0], c[1] - self.uv[1])) if cands else None
-        if best is None or math.hypot(best[0] - self.uv[0], best[1] - self.uv[1]) > self.MAX_JUMP_PX:
-            best = self._recognise(rgb, getattr(self, "_objs", []))
-            if best is None:
-                return None
-        self.uv = (best[0], best[1])
-        # Far frame: refresh the close-range colour reference from this sighting
-        for o in getattr(self, "_objs", []):
-            if abs(o.centroid_px[0] - best[0]) < 1 and abs(o.centroid_px[1] - best[1]) < 1:
-                self._learn(rgb, o.mask)
-                break
+            cands.append((cu, cv, math.degrees(math.atan2(-vec[1, 1], vec[0, 1])) % 180.0, len(us)))
+        if not cands:
+            return None
+        k_best = min(range(len(cands)), key=lambda i: math.hypot(cands[i][0] - ref[0], cands[i][1] - ref[1]))
+        best = cands[k_best]
+        if math.hypot(best[0] - ref[0], best[1] - ref[1]) > self.MAX_JUMP_PX:
+            return None
+        # A long object does not fit the close view: the fingertip band (rows >= FINGER_ROW) and the image edges
+        # crop it, the visible part's centroid slides toward its far end, and chasing it walked the jaws onto the
+        # screwdriver's end cap. When the blob is cut off, trust the far alignment: report the jaw pixel itself.
+        vs, us = np.nonzero(lab == self._labels[k_best])
+        cut = vs.max() >= ppa.FINGER_ROW - 3 or vs.min() <= 2 or us.min() <= 2 or us.max() >= rgb.shape[1] - 3
+        if cut and self.close_target is not None:
+            print("  close view cuts the object off: keeping the far alignment")
+            return (self.close_target[0], self.close_target[1], best[2], best[3])
+        self.close_uv = self.uv = (best[0], best[1])
         return best
+
+
+async def verify_target(rig, text: str, store) -> tuple:
+    """
+    (ok, why) just before a descent: is the object under the jaws the one `text` asks for?
+
+    The object under the jaws is the one nearest the jaw-axis pixel at its own top depth. It passes if best()
+    over everything in view picks it, or (if best() picks nothing) best() over it alone accepts it. Any other
+    winner means the tracker followed the wrong thing: refuse rather than grab it.
+    """
+    rgb, depth = await rig.frame()
+    seg = perception.segment_full(rgb, depth)
+    objs = list(seg.objects) + [o for o, _ in seg.excluded]
+    if not objs:
+        return False, "nothing under the jaws"
+
+    def off_axis(o):
+        au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, o.top_depth_mm)
+        return math.hypot(o.centroid_px[0] - au, o.centroid_px[1] - av)
+
+    under = min(objs, key=off_axis)
+    if off_axis(under) > 80.0:
+        return False, "nothing under the jaws"
+    found = clip_embed.best(objs, text, store)
+    win = found.get("obj")
+    if win is not None:
+        same = math.hypot(win.centroid_px[0] - under.centroid_px[0], win.centroid_px[1] - under.centroid_px[1]) < 40.0
+        if same:
+            return True, "target under the jaws"
+        return False, f"the object under the jaws is not '{text}' ('{found.get('recognised') or win.colour}' is elsewhere)"
+    alone = clip_embed.best([under], text, store)
+    if alone.get("obj") is not None:
+        return True, "target under the jaws (only candidate)"
+    return False, f"the object under the jaws does not look like '{text}'"
 
 
 def hole_mask(rgb: np.ndarray):
@@ -362,6 +440,18 @@ async def look_at(rig, table_xy, text: str, store) -> dict:
     return await look_here(rig, text, store, source="look")
 
 
+def save_frame(out: Path, k: int, fr: dict) -> None:
+    """Sweep frame k to out/: <k>.jpg, <k>_depth.npy (uint16 mm), <k>.json (id, pose, intrinsics, square)."""
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(fr["rgb"]).save(out / f"{k:02d}.jpg", quality=92)
+        np.save(out / f"{k:02d}_depth.npy", fr["depth"])
+        meta = {key: fr[key] for key in ("id", "pose", "intrinsics", "square") if key in fr}
+        (out / f"{k:02d}.json").write_text(json.dumps(meta))
+    except OSError as e:
+        print(f"  could not save sweep frame {k}: {e}")
+
+
 async def sweep_table(rig, progress=None) -> list:
     """
     Frames over the whole reachable table for sorter.table_map.map_from_frames (AGENT3); ends at observe.
@@ -372,6 +462,7 @@ async def sweep_table(rig, progress=None) -> list:
     poses = [q for q in SWEEP_XY if ppa.allowed(*q) and 150.0 <= math.hypot(*q) <= 600.0]
     frames, n = [], len(poses)
     t0 = time.monotonic()
+    out = SWEEP_DIR / time.strftime("%Y%m%d-%H%M%S")
     try:
         for k, (x, y) in enumerate(poses, 1):
             await ppa.travel(rig, x, y, theta=0.0, z=SWEEP_Z)
@@ -384,13 +475,14 @@ async def sweep_table(rig, progress=None) -> list:
             if sq:
                 fr["square"] = sq
             frames.append(fr)
+            save_frame(out, k, fr)
             STATE["sweep"] = {"k": k, "n": n}
             if progress:
                 progress(k, n)
     finally:
         STATE["sweep"] = None
         await back_to_observe(rig)
-    print(f"sweep: {len(frames)} frames in {time.monotonic() - t0:.1f} s")
+    print(f"sweep: {len(frames)} frames in {time.monotonic() - t0:.1f} s -> {out}")
     return frames
 
 
@@ -437,7 +529,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if obj is None:
             doc.update(status="not_found", fail_phase="find", fail_reason=found.get("reason"))
             return doc
-        doc.update(label=found.get("label") or obj.colour or "object", score=round(float(found.get("score", 0.0)), 3),
+        doc.update(label=found.get("recognised") or found.get("label") or obj.colour or "object", colour=obj.colour,
+                   score=round(float(found.get("score", 0.0)), 3),
                    margin=round(float(found.get("margin", 0.0)), 3), img_before=jpeg(found["rgb"]))
         if found.get("ambiguous"):
             doc.update(status="ambiguous", fail_phase="find", fail_reason=found.get("reason"))
@@ -452,7 +545,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         elif LAST_SQUARE["xy"] is not None and time.time() - LAST_SQUARE["ts"] < SQUARE_CACHE_S:
             square_xy, doc["square_path"] = LAST_SQUARE["xy"], "cache"
         tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store)
-        height, grip = await ppa.pick(rig, times, tracker)
+        height, grip = await ppa.pick(rig, times, tracker, verify=lambda: verify_target(rig, text, store))
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy)
         # Released over the hole's centre (place_in_square servos onto it when visible): remember it
@@ -465,10 +558,13 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if seg is not None:
             publish_frame(store, rgb, seg, "place")
         doc["img_after"] = jpeg(rgb)
-        doc["success"] = bool(seen and inside)
-        doc["status"] = "done" if doc["success"] else "failed"
-        if not doc["success"]:
-            doc.update(fail_phase="check", fail_reason="nothing seen inside the hole" if seen else "hole not visible")
+        # Only a success if what is in the hole is what was asked for
+        right = bool(seen and inside) and clip_embed.best(inside, text, store).get("obj") is not None
+        doc["success"] = right
+        doc["status"] = "done" if right else "failed"
+        if not right:
+            why = "hole not visible" if not seen else "nothing seen inside the hole" if not inside else "wrong object in the hole"
+            doc.update(fail_phase="check", fail_reason=why)
     except Exception as e:
         doc.update(status="failed", fail_phase=times.get("at", "start"), fail_reason=f"{type(e).__name__}: {e}")
         await recover(rig, doc)
