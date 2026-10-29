@@ -157,10 +157,22 @@ Then set `MONGODB_URI` for the module. Charts: `dashboard/CHARTS.md`. The live d
 
 ```bash
 sh module/build.sh                                    # -> module/dist/archive.tar.gz (run.sh + meta.json at its root)
+PYTHON=.venv/bin/python sh module/build.sh            # same, plus the import check (needs viam-sdk in that Python)
 ```
 
 The archive must contain `meta.json`: `viam module reload-local` rejects a local tarball without one ("local
 tarballs must contain a meta.json with the 'entrypoint' field"). `build.sh` copies it in.
+
+Every build ends with `module/check_archive.py`, which unpacks the archive into a temp dir and fails the build when
+the module could not start from it. It checks:
+- `meta.json` and an executable entrypoint;
+- `requirements.txt`;
+- that every project import in the shipped `.py` files names a shipped file;
+- that no macOS `._*` metadata files are included;
+- with viam-sdk in `$PYTHON`, that `import module.main` works from the unpacked copy.
+
+A tarball once shipped without `module/live_map.py` and died on the robot with "ModuleNotFoundError: No module
+named 'module.live_map'"; this check now fails such a build first.
 
 First start on a robot: `run.sh` creates a virtualenv in `$VIAM_MODULE_DATA/venv` (kept across module
 versions), installs **CPU-only** torch and torchvision as a pair from `https://download.pytorch.org/whl/cpu` (the
@@ -180,6 +192,10 @@ generic service `sorter`, and `{"status": true}` returns `{"busy": false, "store
 viam login
 viam module reload-local --file module/dist/archive.tar.gz --part-id <machine-part-id> --model-name sorter-team:sorter:grasp-by-description --resource-name sorter
 ```
+
+Right after a viam-server restart, the CLI path (`reload-local`, `upload` to the machine) can fail for about
+10 minutes with "host appears to be offline" from signaling. During that time the SDK still reaches the machine
+over the LAN, so the robot is fine: wait and retry, rather than restarting it again.
 
 Before publishing, create the module under your registry namespace (Viam app → org Settings → public
 namespace, or the CLI), then put that namespace in **both** `meta.json` (`module_id`, `models[].model`) and

@@ -40,5 +40,8 @@ else:
 EOF
 find module/dist/stage -name __pycache__ -prune -exec rm -rf {} +
 chmod +x module/dist/stage/run.sh
-tar -czf module/dist/archive.tar.gz -C module/dist/stage .
+# COPYFILE_DISABLE: macOS tar otherwise adds an AppleDouble ._<name> file next to every file (they shipped to the robot)
+COPYFILE_DISABLE=1 tar -czf module/dist/archive.tar.gz -C module/dist/stage .
 echo "built module/dist/archive.tar.gz"
+# Unpack it and check the module can start from the copy (a file missing from the tarball fails here, not on the robot)
+"${PYTHON:-python3}" module/check_archive.py module/dist/archive.tar.gz
