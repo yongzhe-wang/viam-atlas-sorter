@@ -42,6 +42,10 @@ DEPTH_LEFT_INVALID_U = 60  # RealSense depth is invalid in a band at its left ed
 # A phone (~7 mm body, glossy) and a laptop came out as separate 9-10 mm fragments with one threshold;
 # growing through their low bodies joins each into one object, which then touches the edge and is excluded.
 GROW_HEIGHT_MM = 3.0
+# Tall objects (60 mm cylinders) seen off-centre show top + side with an invalid-depth occlusion band in
+# between, which split one cylinder into a 61 mm and a 28 mm piece on frame e01. Invalid pixels this close
+# to an object bridge pieces for connectivity only; geometry still uses valid pixels.
+BRIDGE_INVALID_PX = 10
 EDGE_MARGIN_PX = 8  # an object this close to the image border is cut off: excluded, not a target
 # Optional workspace polygon in colour pixels at the observe pose: [[u, v], ...]; absent = whole image
 WORKSPACE_FILE = Path(__file__).resolve().parent.parent / "data" / "workspace.json"
@@ -95,6 +99,7 @@ class Obj:
     crop: np.ndarray = field(repr=False)  # uint8 RGB crop around bbox
     touches_edge: bool = False  # cut by the image border: geometry and crop are partial
     colour: str = ""  # dominant colour word of the mask, see colour_name()
+    rect_fill: float = 1.0  # mask area / min-area bounding rectangle: square ~1.0, circle ~0.785
 
 
 @dataclass
@@ -188,6 +193,38 @@ def _startup_alignment(rgb: np.ndarray, above: np.ndarray, table: np.ndarray) ->
     return _ALIGN["model"] or IDENTITY
 
 
+def rect_fill(mask: np.ndarray) -> float:
+    """
+    Convex-hull area over its minimum-area bounding rectangle: square/rectangle ~1.0, disc ~0.785.
+
+    WHY: aspect ratio alone called a round cylinder top "square", so "green square" matched a green cylinder.
+    The raw mask area was useless on real frames (ragged depth edges: a rectangular block scored 0.81, like a
+    disc), so the hull is used; the min rectangle comes from rotating calipers along the hull edges.
+    """
+    from scipy.spatial import ConvexHull
+
+    vs, us = np.nonzero(mask)
+    if len(us) < 10:
+        return 1.0
+    pts = np.column_stack([us, vs]).astype(float)
+    try:
+        hull = ConvexHull(pts)
+    except Exception:
+        return 1.0
+    hp = pts[hull.vertices]
+    best = math.inf
+    for i in range(len(hp)):
+        e = hp[(i + 1) % len(hp)] - hp[i]
+        n = math.hypot(*e)
+        if n == 0:
+            continue
+        ax = e / n
+        a = hp @ ax
+        b = hp @ np.array([-ax[1], ax[0]])
+        best = min(best, np.ptp(a) * np.ptp(b))
+    return float(hull.volume / best) if best > 0 else 1.0  # ConvexHull.volume is the area in 2-D
+
+
 def _geometry(mask: np.ndarray) -> tuple:
     """(centroid, yaw_deg, length_px, width_px) from mask PCA; a w x l rectangle has variance l^2/12."""
     vs, us = np.nonzero(mask)
@@ -264,11 +301,12 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
 
     # Grow seeds (> MIN_HEIGHT_MM) through low pixels (> GROW_HEIGHT_MM) so one thing is one object
     low = ndimage.binary_opening(valid & (height > GROW_HEIGHT_MM) & (height < 300), iterations=2) | above
-    grp, n = ndimage.label(low)
+    bridge = ~valid & ndimage.binary_dilation(above, iterations=BRIDGE_INVALID_PX)
+    grp, n = ndimage.label(low | bridge)
     seeded = np.zeros(n + 1, bool)
     seeded[np.unique(grp[above])] = True
     seeded[0] = False
-    lab_d = np.where(seeded[grp], grp, 0)
+    lab_d = np.where(seeded[grp] & low, grp, 0)
     lab_c = to_colour(lab_d, model)
     _mask_fingers(lab_c)
     H, W = d.shape
@@ -300,7 +338,7 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         edge = u0 <= e or v0 <= e or u1 >= W - 1 - e or v1 >= H - 1 - e
         o = Obj(id=0, bbox=bbox, centroid_px=cen, yaw_deg=yaw, length_px=L, width_px=Wd, height_mm=top_h,
                 top_depth_mm=float(np.percentile(d[m_d], 10)), mask=m, crop=crop, touches_edge=edge,
-                colour=colour_name(rgb, m)[0])
+                colour=colour_name(rgb, m)[0], rect_fill=rect_fill(m))
         # Only fully visible objects inside the workspace are targets; the rest is kept for display/debug
         if edge:
             excluded.append((o, "touches the image edge"))

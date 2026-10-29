@@ -16,6 +16,17 @@ import numpy as np
 MODEL, PRETRAINED = "ViT-B-32", "laion2b_s34b_b79k"
 COLOURS = {"red", "orange", "yellow", "green", "cyan", "blue", "purple", "white", "grey", "black"}
 ALIASES = {"gray": "grey", "violet": "purple", "pink": "red"}
+# What a person calls a colour vs the hue bin perception picks: a light-blue cylinder was binned "cyan" on
+# frame e01, and best("blue cylinder") refused it. A query colour accepts these object colours.
+COMPATIBLE = {"blue": {"blue", "cyan", "purple"}, "cyan": {"cyan", "blue", "green"}, "green": {"green", "cyan"},
+              "yellow": {"yellow", "orange"}, "orange": {"orange", "yellow", "red"}, "red": {"red", "orange", "purple"},
+              "purple": {"purple", "blue", "red"}, "white": {"white", "grey"}, "grey": {"grey", "white", "black"},
+              "black": {"black", "grey"}}
+
+
+def colour_ok(query_colours: set, obj_colour: str) -> bool:
+    """True if the object's colour is one a person could call by any of the query's colour words."""
+    return any(obj_colour in COMPATIBLE.get(c, {c}) for c in query_colours)
 # Command verbs/fillers stripped before embedding; the destination is always the blue square
 STOP = r"^(please\s+)?(grasp|grab|pick( up)?|get|take|move|put|place)\s+(up\s+)?(the\s+|a\s+|an\s+)?"
 COLOUR_BONUS = 0.04  # colour word matches the object's dominant colour (CLIP sims sit around 0.2-0.3)
@@ -77,14 +88,34 @@ def clean_query(text: str) -> str:
     return " ".join(ALIASES.get(w, w) for w in q.split())
 
 
+SQUARE_WORDS = {"square", "cube", "box", "block", "brick", "rectangle", "rectangular"}
+ROUND_WORDS = {"round", "circle", "circular", "cylinder", "can", "cup", "ball", "disc", "disk", "roll", "bottle", "jar"}
+# Hull rectangularity measured on sfhack4 frames: rectangular blocks 0.83-0.93 (even when cut by the edge),
+# standing cylinders 0.74-0.80, tape roll 0.79, synthetic disc 0.81. Below this, "square"/"block" is refused.
+# [CONFIDENCE: SINGLE-SRC 65% — 3 frames, narrow gap; retest on the scanned set]
+SQUARE_MIN_FILL = 0.82
+ROUND_MAX_FILL = 0.83
+
+
 def _shape_term(words: set, obj) -> float:
-    """Small bonus when shape words agree with the footprint (square ~ aspect 1, long ~ aspect > 2.5)."""
+    """
+    Small bonus/penalty when shape words agree/disagree with the mask.
+
+    Rectangularity (rect_fill) separates boxes from round things; aspect separates long from compact.
+    Round words stay soft: a cylinder lying on its side looks rectangular from above.
+    """
+    fill = getattr(obj, "rect_fill", 1.0)
     aspect = obj.length_px / max(obj.width_px, 1.0)
-    if words & {"square", "cube", "box"}:
-        return SHAPE_BONUS if aspect < 1.4 else -SHAPE_BONUS
-    if words & {"long", "stick", "pen", "rectangle", "bar"}:
-        return SHAPE_BONUS if aspect > 2.0 else -SHAPE_BONUS
-    return 0.0
+    term = 0.0
+    if words & SQUARE_WORDS:
+        term += SHAPE_BONUS if fill >= SQUARE_MIN_FILL else -SHAPE_BONUS
+        if words & {"square", "cube"}:
+            term += SHAPE_BONUS if aspect < 1.5 else -SHAPE_BONUS
+    if words & ROUND_WORDS:
+        term += SHAPE_BONUS if fill <= ROUND_MAX_FILL else -SHAPE_BONUS
+    if words & {"long", "stick", "pen", "bar"}:
+        term += SHAPE_BONUS if aspect > 2.0 else -SHAPE_BONUS
+    return term
 
 
 def rank(objs: list, text: str, store=None) -> list:
@@ -107,7 +138,7 @@ def rank(objs: list, text: str, store=None) -> list:
     for o, emb, s in zip(objs, img, sims):
         score = float(s)
         if qcol:
-            if o.colour in qcol:
+            if colour_ok(qcol, o.colour):
                 score += COLOUR_BONUS
             elif o.colour in COLOURS - {"grey", "white", "black"}:
                 score -= COLOUR_PENALTY
@@ -133,9 +164,13 @@ def best(objs: list, text: str, store=None) -> dict:
         return {"obj": None, "score": 0.0, "margin": 0.0, "ambiguous": False, "reason": "no objects on the table"}
     (o, s), margin = r[0], (r[0][1] - r[1][1]) if len(r) > 1 else 1.0
     qcol = set(clean_query(text).split()) & COLOURS
-    if qcol and o.colour not in qcol:
+    if qcol and not colour_ok(qcol, o.colour):
         return {"obj": None, "score": s, "margin": margin, "ambiguous": False,
                 "reason": f"no {'/'.join(sorted(qcol))} object found"}
+    if set(clean_query(text).split()) & SQUARE_WORDS and getattr(o, "rect_fill", 1.0) < SQUARE_MIN_FILL:
+        # "green square" with only a green cylinder in view must not grab the cylinder
+        return {"obj": None, "score": s, "margin": margin, "ambiguous": False,
+                "reason": f"no box-shaped match (best is round, fill {o.rect_fill:.2f})"}
     if s < MIN_SCORE:
         return {"obj": None, "score": s, "margin": margin, "ambiguous": False, "reason": f"best match only {s:.2f}"}
     return {"obj": o, "score": s, "margin": margin, "ambiguous": margin < AMBIGUOUS_MARGIN, "reason": ""}
