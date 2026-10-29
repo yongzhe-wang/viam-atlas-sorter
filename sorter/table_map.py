@@ -101,6 +101,8 @@ def _same(a: dict, m: dict) -> bool:
     # One side unrecognised (or both): require colour and appearance to agree, as for scan grouping
     if not (clip_embed.colour_ok({a["colour"]}, m["colour"]) or clip_embed.colour_ok({m["colour"]}, a["colour"])):
         return False
+    if a.get("emb") is None or m.get("emb") is None:
+        return False  # no appearance to compare (entry from a map saved without embeddings)
     return float(a["emb"] @ m["emb"]) >= MERGE_COS
 
 
@@ -211,8 +213,43 @@ FOOT_MARGIN_PX = 60  # an entry projected closer than this to the image border i
 XY_ALPHA = 0.5  # weight of a new sighting in the entry's xy (objects that move should follow quickly)
 
 
+EMB_DIM = 512  # open_clip ViT-B-32 image embedding size (clip_embed); entries without one get zeros in queries
+
+
 def empty_map() -> dict:
+    """A new map with every field update_map / apply_observation / best_on_map use: start (or clear) with this."""
     return {"ts": time.time(), "objects": [], "next_id": 0, "last_update": None}
+
+
+def _ensure_map(tmap: dict) -> dict:
+    """
+    Fill in, in place, whatever the fold needs that a map made elsewhere may lack; returns the map.
+
+    WHY: AGENT 2's module started from a hand-made {"objects": []} (startup, clear_map, a saved map read back), and
+    update_map raised KeyError: 'next_id' on every frame on sfhack4 (265 times). Any of {}, a cleared map, a
+    map_from_frames() map or a stored one now works: next_id continues after the highest id, entries get their
+    bookkeeping fields (n_seen from frame_ids), an entry without an embedding gets None (it then merges by label only).
+    {VIAM CENTERAL 2026-10-29 "UPDATE_MAP FAILS ON EVERY FRAME WITH KEYERROR: 'NEXT_ID' (265 TIMES)"}
+    [CONFIDENCE: CONFIRMED 90% — tests/test_table_map.py feeds {}, empty_map(), cleared and survey-style maps]
+    """
+    objs = [e for e in tmap.get("objects") or [] if isinstance(e, dict) and e.get("xy") is not None]
+    next_id = max([int(e["id"]) + 1 for e in objs if e.get("id") is not None] + [int(tmap.get("next_id") or 0)])
+    for e in objs:
+        if e.get("id") is None:
+            e["id"], next_id = next_id, next_id + 1
+        e["xy"] = [float(e["xy"][0]), float(e["xy"][1])]
+        for k, v in (("label", None), ("height_mm", 0.0), ("score", 0.0), ("colour", None), ("partial", False),
+                     ("misses", 0), ("emb", None)):
+            e.setdefault(k, v)
+        for k in ("names", "frame_ids"):
+            e[k] = list(e.get(k) or [])
+        e["colours"] = dict(e.get("colours") or {})
+        e["size_mm"] = list(e.get("size_mm") or [0.0, 0.0])
+        e.setdefault("n_seen", len(e["frame_ids"]))
+    tmap["objects"], tmap["next_id"] = objs, next_id
+    tmap.setdefault("last_update", None)
+    tmap.setdefault("ts", 0.0)
+    return tmap
 
 
 def _same_pose(a: dict, b: dict) -> bool:
@@ -323,6 +360,7 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
     Per object, "seen_ts" is the ts of the last observation that saw it; the map's "ts" the last update.
     """
     t0 = time.perf_counter()
+    _ensure_map(tmap)
     now, source, pose = rec["ts"], rec["source"], rec["pose"]
     grid = _grid(rec)
     hand = bool(rec["intruders"])
@@ -347,7 +385,8 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
         touched.add(e["id"])
 
     for d in (det(d) for d in rec["detections"] if not d["partial"]):
-        e = next((e for e in objs if e["id"] not in touched and _same(d, {**e, "emb": np.asarray(e["emb"])})), None)
+        e = next((e for e in objs if e["id"] not in touched
+                  and _same(d, {**e, "emb": None if e["emb"] is None else np.asarray(e["emb"])})), None)
         if e is None and d["label"] and d["score"] >= MOVE_CONF:
             e = next((e for e in objs if e["label"] == d["label"] and e["id"] not in touched), None)  # it moved
         if e is None:
@@ -357,7 +396,7 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
             a = 1.0 if far else XY_ALPHA
             e["xy"] = [(1 - a) * e["xy"][0] + a * d["xy"][0], (1 - a) * e["xy"][1] + a * d["xy"][1]]
             e["height_mm"] = (1 - XY_ALPHA) * e["height_mm"] + XY_ALPHA * d["height_mm"]
-            emb = 0.8 * np.asarray(e["emb"]) + 0.2 * d["emb"]
+            emb = d["emb"] if e["emb"] is None else 0.8 * np.asarray(e["emb"]) + 0.2 * d["emb"]
             e["emb"] = (emb / np.linalg.norm(emb)).tolist()
         if d["label"] and not e["label"]:
             e["label"], e["names"] = d["label"], list(d["names"])
@@ -456,7 +495,7 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
     the segment_full() it came from, so the same frame is not segmented or embedded twice (recognised without seg:
     the frame is segmented again but CLIP is skipped; without include_partial there are just no partial sightings).
     """
-    tmap = tmap if tmap is not None else empty_map()
+    tmap = _ensure_map(tmap if tmap is not None else empty_map())
     now = time.time() if now is None else now
     last = tmap.get("last_update")
     if last and not last.get("skipped") and now - last["ts"] < SKIP_S and _same_pose(last["pose"], pose):
@@ -477,7 +516,7 @@ def fold_observations(observations, tmap: dict = None) -> dict:
     (only last_update.ms differs). The skip rule is not applied: a logged record was never a skipped frame.
     tmap: continue an existing map (None: start empty). Extra fields in a record (_id, paths, epoch) are ignored.
     """
-    tmap = tmap if tmap is not None else empty_map()
+    tmap = _ensure_map(tmap if tmap is not None else empty_map())
     for rec in sorted(observations, key=lambda r: r["ts"]):
         # A record rebuilt from last_update's light fields lacks the embeddings and the depth grid: refuse it
         # rather than fold a different map (no appearance merging, no negative evidence) without saying so
@@ -503,21 +542,24 @@ def best_on_map(table_map: dict, text: str, store=None) -> dict:
     Objects already in the drop square are never picked; if the named object is only found there, the answer is
     a refusal with reason "... is already in the square" and already_in_square=True.
     """
-    cands = [m for m in table_map["objects"] if not m.get("in_square")]
+    # Read-only and tolerant of maps made elsewhere (missing fields get _ensure_map's defaults, the map is not changed)
+    cands = [m for m in table_map.get("objects") or [] if m.get("xy") is not None and not m.get("in_square")]
     recs = []
     for k, m in enumerate(cands):
+        size = m.get("size_mm") or [0.0, 0.0]
         # id = list position: dynamic-map ids are stable and stop matching positions once entries are dropped
-        ns = SimpleNamespace(id=k, colour=m["colour"], colours=m.get("colours", {}),
-                             length_px=m["size_mm"][0], width_px=m["size_mm"][1],
-                             height_mm=m["height_mm"], crop=None, recognised=m["label"], recognised_names=m["names"])
-        recs.append({"obj": ns, "label": m["label"], "names": m["names"] or [], "score": m["score"],
-                     "emb": np.asarray(m["emb"], dtype=np.float32)})
+        ns = SimpleNamespace(id=k, colour=m.get("colour"), colours=m.get("colours") or {},
+                             length_px=size[0], width_px=size[1], height_mm=m.get("height_mm", 0.0), crop=None,
+                             recognised=m.get("label"), recognised_names=m.get("names") or [])
+        emb = m.get("emb")
+        recs.append({"obj": ns, "label": m.get("label"), "names": m.get("names") or [], "score": m.get("score", 0.0),
+                     "emb": np.zeros(EMB_DIM, np.float32) if emb is None else np.asarray(emb, dtype=np.float32)})
     b = clip_embed.best(None, text, store, recognised=recs)
     pick = cands[b["obj"].id] if b["obj"] is not None else None
     done = None
     if pick is None:
-        done = next((m for m in table_map["objects"] if m.get("in_square") and m["label"]
-                     and clip_embed.name_matches(text, [m["label"], *(m["names"] or [])])), None)
+        done = next((m for m in table_map.get("objects") or [] if m.get("in_square") and m.get("label")
+                     and clip_embed.name_matches(text, [m["label"], *(m.get("names") or [])])), None)
         if done is not None:
             b = {**b, "reason": f"{done['label']!r} is already in the square", "searchable": False}
     # look_first: the entry comes from an edge-cut sighting (approximate xy): go there, re-observe, then grasp
