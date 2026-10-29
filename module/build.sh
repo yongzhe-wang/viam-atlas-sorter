@@ -6,6 +6,8 @@ set -e
 cd "$(dirname "$0")/.."
 rm -rf module/dist && mkdir -p module/dist/stage/module module/dist/stage/scripts module/dist/stage/data
 cp module/run.sh module/dist/stage/run.sh
+# viam-server reads the entrypoint from meta.json inside local tarballs (reload-local fails without it)
+cp meta.json module/dist/stage/meta.json
 cp module/main.py module/sorter_service.py module/dist/stage/module/
 cp requirements.txt module/dist/stage/requirements.txt
 cp -R sorter module/dist/stage/sorter
