@@ -9,7 +9,8 @@ Flow: frames {id, rgb, depth, pose, intrinsics?} -> recognise_all per frame -> t
 + depth) -> merge across frames (same label within MERGE_XY_MM is one object) -> map.
 
 Map doc (Store.save_map / latest_map, AGENT 2), latest wins:
-  {ts, frames: [{id, pose}], objects: [{id, label, names, xy, height_mm, score, colour, colours, size_mm, frame_ids, emb}]}
+  {ts, frames: [{id, pose}], objects: [{id, label, names, xy, height_mm, score, colour, colours, size_mm, frame_ids, emb}],
+   square?: {xy, size_mm: [along x, along y], frame_ids}}   (drop zone: white interior of the blue tape, when fully seen)
 label/names are None/[] for objects the library does not know; emb (512 floats) lets open-vocabulary queries run
 on the map without re-embedding crops.
 """
@@ -30,11 +31,18 @@ MERGE_COS = 0.70  # ... and, when not both labelled, their crops look alike (sam
 
 
 def _detections(frames: list, store) -> tuple:
-    """Every target of every frame with table xy, size in mm and embedding; plus ms per frame."""
-    out, ms = [], []
+    """Every target of every frame with table xy, size in mm and embedding; drop-square sightings; ms per frame."""
+    out, squares, ms = [], [], []
     for f in frames:
         t = time.perf_counter()
         intr = {**perception.INTRINSICS, **(f.get("intrinsics") or {})}
+        sq = perception.find_drop_square(f["rgb"], f["depth"])
+        if sq:
+            u0, v0, u1, v1 = sq["bbox"]
+            mm_px = sq["depth_mm"] / intr["fx"]
+            # Image +v is world -x and +u is world -y, so the v extent is the size along x
+            squares.append({"xy": perception.world_xy(f["pose"], intr, *sq["centroid_px"], sq["depth_mm"]),
+                            "size_mm": ((v1 - v0) * mm_px, (u1 - u0) * mm_px), "frame": f["id"]})
         for r in clip_embed.recognise_all(f["rgb"], f["depth"], store):
             o = r["obj"]
             xy = perception.world_xy(f["pose"], intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
@@ -44,7 +52,7 @@ def _detections(frames: list, store) -> tuple:
                         "size_mm": (o.length_px * mm_px, o.width_px * mm_px),
                         "emb": r["emb"], "frame": f["id"]})
         ms.append((time.perf_counter() - t) * 1000)
-    return out, ms
+    return out, squares, ms
 
 
 def _same(a: dict, m: dict) -> bool:
@@ -98,7 +106,7 @@ def map_from_frames(frames: list, store=None) -> dict:
     unrecognised view of a known object joins it instead of becoming a second object.
     Returns the map doc plus "timing_ms" (per frame) for the caller's logs.
     """
-    dets, ms = _detections(frames, store)
+    dets, squares, ms = _detections(frames, store)
     dets.sort(key=lambda d: (d["label"] is None, -d["score"]))
     objs = []
     for d in dets:
@@ -125,8 +133,14 @@ def map_from_frames(frames: list, store=None) -> dict:
                     "colour": m["colour"], "colours": m["colours"], "size_mm": [round(float(x), 1) for x in m["size_mm"]],
                     "frame_ids": sorted(set(m["frame_ids"])),
                     "emb": [round(float(x), 4) for x in e / np.linalg.norm(e)]})  # 4 decimals: ~3x smaller doc
-    return {"ts": time.time(), "frames": [{"id": f["id"], "pose": f["pose"]} for f in frames], "objects": out,
-            "timing_ms": [round(x) for x in ms]}
+    doc = {"ts": time.time(), "frames": [{"id": f["id"], "pose": f["pose"]} for f in frames], "objects": out,
+           "timing_ms": [round(x) for x in ms]}
+    if squares:
+        # Median over the frames that saw the whole square; frames agreed within ~1.3 mm on the z=400 survey
+        doc["square"] = {"xy": [round(float(np.median([q["xy"][k] for q in squares])), 1) for k in (0, 1)],
+                         "size_mm": [round(float(np.median([q["size_mm"][k] for q in squares])), 1) for k in (0, 1)],
+                         "frame_ids": [q["frame"] for q in squares]}
+    return doc
 
 
 def best_on_map(table_map: dict, text: str, store=None) -> dict:

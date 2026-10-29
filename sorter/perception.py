@@ -444,6 +444,50 @@ def look_flange_xy(table_xy: tuple) -> tuple:
     return fx, fy
 
 
+SQUARE_MIN_AREA_PX = 15000  # the white interior is ~290x300 px at the observe pose; scaled with depth like objects
+
+
+def find_drop_square(rgb: np.ndarray, depth: np.ndarray) -> dict:
+    """
+    The drop zone: white interior enclosed by the blue tape, fully in view. {centroid_px, bbox, area, depth_mm} or None.
+
+    Blue tape by hue/saturation, as measured by AGENT1 (tape reads ~(0,64,116), PIL hue ~147).
+    {PICK_PLACE_AUTO.PY "(HSV[..., 0] >= 130) & (HSV[..., 0] <= 165) & (HSV[..., 1] > 120) & (HSV[..., 2] > 50)"}
+    [CONFIDENCE: CONFIRMED 80% — AGENT1's servo uses the same mask on this paper square]
+    The hole must not touch the image border and must be mostly white paper (low saturation, bright).
+    """
+    from PIL import Image
+
+    hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+    blue = (hsv[..., 0] >= 130) & (hsv[..., 0] <= 165) & (hsv[..., 1] > 120) & (hsv[..., 2] > 50)
+    blue = ndimage.binary_closing(blue, iterations=3)
+    lab, n = ndimage.label(~blue)
+    if not n:
+        return None
+    border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
+    d = depth.astype(float)
+    a, b, c = fit_table(d)
+    H, W = d.shape
+    min_area = SQUARE_MIN_AREA_PX * area_scale(float(a * W / 2 + b * H / 2 + c))
+    best = None
+    for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+        if sl is None or i in border:
+            continue
+        m = lab[sl] == i
+        area = int(m.sum())
+        if area < min_area or (best and area <= best["area"]):
+            continue
+        white = (hsv[sl][..., 1][m] < 60).mean() > 0.6 and (hsv[sl][..., 2][m] > 150).mean() > 0.6
+        if not white:
+            continue
+        vs, us = np.nonzero(m)
+        u, v = sl[1].start + us.mean(), sl[0].start + vs.mean()
+        best = {"centroid_px": (float(u), float(v)), "area": area,
+                "bbox": (int(sl[1].start + us.min()), int(sl[0].start + vs.min()), int(sl[1].start + us.max()), int(sl[0].start + vs.max())),
+                "depth_mm": float(a * u + b * v + c)}  # flat paper: the table plane at its centre
+    return best
+
+
 def segment(rgb: np.ndarray, depth: np.ndarray) -> tuple:
     """(table_depth_mm, objects), the EXEC_PLAN contract. Use segment_full() for intruders and alignment."""
     s = segment_full(rgb, depth)
