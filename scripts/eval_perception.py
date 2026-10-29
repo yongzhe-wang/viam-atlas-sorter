@@ -9,7 +9,7 @@ Usage (data in data/eval/, gitignored):
   eval_perception.py capture NAME            read-only; refuses unless the arm is idle at the observe pose
   eval_perception.py annotate NAME           writes NAME_ann.png with object ids for labelling
   eval_perception.py label NAME 0="green square" 2=cup missed=1
-  eval_perception.py report
+  eval_perception.py report [--store] [--absent "green square" ...]
 Env for capture: VIAM_MACHINE_ADDRESS, VIAM_API_KEY_ID, VIAM_API_KEY.
 """
 import asyncio
@@ -94,10 +94,23 @@ def label(name: str, args: list) -> None:
     print("labelled", name, labels, "missed", missed)
 
 
-def report() -> None:
-    """Segmentation recall, and top-1 for each labelled object queried by its own label (with/without cues)."""
+def report(use_store: bool, absent: list) -> None:
+    """
+    Segmentation recall, and top-1 for each labelled object queried by its own label.
+
+    Modes: CLIP only, CLIP + colour/shape cues, and with the store best() as the worker uses it (labelled
+    views vote; a refusal counts as a miss). `absent`: queries for objects NOT on the table (e.g. "green
+    square"); best() should refuse them, and a pick there is counted as a false pick.
+    """
+    store = None
+    if use_store:
+        from sorter.store import Store
+
+        store = Store()
+        print(f"store: online={store.online}")
     found = missed = 0
-    hits = {"clip+cues": 0, "clip only": 0}
+    modes = ["clip only", "clip+cues"] + (["best()+store"] if store is not None else [])
+    hits = {m: 0 for m in modes}
     n_q = 0
     for lf in sorted(EVAL.glob("*_labels.json")):
         name = lf.name[: -len("_labels.json")]
@@ -107,18 +120,24 @@ def report() -> None:
         labels = {int(k): v for k, v in lab["labels"].items()}
         found += len(labels)
         missed += lab["missed"]
+        crops = clip_embed.embed_images([o.crop for o in objs])
         for oid, text in labels.items():
             n_q += 1
-            top = clip_embed.rank(objs, text)[0][0]
-            hits["clip+cues"] += top.id == oid
-            q = clip_embed.embed_text(clip_embed.clean_query(text))
-            sims = clip_embed.embed_images([o.crop for o in objs]) @ q
-            hits["clip only"] += objs[int(np.argmax(sims))].id == oid
-            print(f"  {name}: {text!r} -> top={top.id} (want {oid})")
+            sims = crops @ clip_embed.embed_text(clip_embed.clean_query(text))
+            got = {"clip only": objs[int(np.argmax(sims))].id, "clip+cues": clip_embed.rank(objs, text)[0][0].id}
+            if store is not None:
+                b = clip_embed.best(objs, text, store)
+                got["best()+store"] = b["obj"].id if b["obj"] else None
+            for m in modes:
+                hits[m] += got[m] == oid
+            print(f"  {name}: {text!r} want {oid} -> " + ", ".join(f"{m}={got[m]}" for m in modes))
+        for text in absent:
+            b = clip_embed.best(objs, text, store)
+            print(f"  {name}: absent {text!r} -> {'REFUSED: ' + b['reason'] if b['obj'] is None else 'FALSE PICK ' + str(b['obj'].id)}")
     total = found + missed
     print(f"segmentation recall: {found}/{total} = {found / max(total, 1):.0%}")
-    for k, v in hits.items():
-        print(f"rank top-1 ({k}): {v}/{n_q} = {v / max(n_q, 1):.0%}")
+    for m in modes:
+        print(f"top-1 ({m}): {hits[m]}/{n_q} = {hits[m] / max(n_q, 1):.0%}")
 
 
 if __name__ == "__main__":
@@ -130,4 +149,7 @@ if __name__ == "__main__":
     elif cmd == "label":
         label(sys.argv[2], sys.argv[3:])
     elif cmd == "report":
-        report()
+        # report [--store] [--absent "green square" ...]
+        rest = sys.argv[2:]
+        absent = rest[rest.index("--absent") + 1:] if "--absent" in rest else []
+        report("--store" in rest, absent)
