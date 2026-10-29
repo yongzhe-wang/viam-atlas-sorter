@@ -53,8 +53,6 @@ HOME_XY = (250.0, 0.0)
 MAX_STEP_MM = 250.0
 TOL_PX = 7.0
 SETTLE_S = 1.0  # wait after every move before trusting a camera frame
-# Same block seen at colour (767,284) and depth (707,306) at ~350 mm; good enough to pick the right blob
-DEPTH_DU, DEPTH_DV = -60.0, 22.0
 # Jaw-axis model fitted from released blocks (data/jaw_calib.json); None until `jaw_calib.py fit` has run
 JAW_CAL = jaw_calib.load()
 
@@ -115,8 +113,9 @@ def decode(images) -> tuple:
     Split a get_images() result into (rgb array, depth array in mm or None).
 
     Depth arrives as Viam's DEPTHMAP format: 8-byte magic, uint64 width, uint64 height, then big-endian
-    uint16 millimetres. It is NOT aligned to the colour image (align_color_depth is off), so only depth
-    values are used, never depth-image positions.
+    uint16 millimetres. `align_color_depth: true` is set on `cam`, so depth[v, u] is the same point as
+    rgb[v, u]. {LIVE FRAME 2026-10-29 "YELLOW (704, 476) <-> DEPTH BLOB (707, 482)"}
+    [CONFIDENCE: CONFIRMED 90% — checked on two objects; was a (-60, +22) px shift before the change]
     """
     rgb, depth = None, None
     for im in images:
@@ -150,8 +149,8 @@ def table_and_near(depth: np.ndarray, hint=None, radius: float = 150.0) -> tuple
     if hint is None:
         k = 1 + int(np.argmax(sizes))
     else:
-        # Depth is not aligned to colour; shift the colour pixel into the depth image first
-        hu, hv = hint[0] + DEPTH_DU, hint[1] + DEPTH_DV
+        # Depth is aligned to colour, so the colour pixel indexes the depth map directly
+        hu, hv = hint[0], hint[1]
         cents = ndimage.center_of_mass(near, lab, range(1, n + 1))
         cand = [(math.hypot(c[1] - hu, c[0] - hv), i + 1) for i, c in enumerate(cents) if sizes[i] >= 800]
         if not cand or min(cand)[0] > radius:
