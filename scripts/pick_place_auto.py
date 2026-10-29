@@ -610,7 +610,7 @@ class Rig:
         J^-1 (-offset) with the last measured Jacobian. Used while carrying: the held object covers the
         bottom-right of the image, where the axis pixel is, so the square is aligned somewhere visible.
         """
-        J, prev_err = None, None
+        J = None
         for it in range(8):
             p = await self.pose()
             rgb, depth = await self.frame()
@@ -636,17 +636,9 @@ class Rig:
                     print(f"  {label}: offset step ({move[0]:.0f},{move[1]:.0f}) mm")
                     await self.goto(p.x + move[0], p.y + move[1], p.z)
                 return
-            # Reuse the Jacobian measured earlier in this servo while the error keeps shrinking: the probes
-            # (two moves + two settles each) were most of the servo time
-            if J is not None and prev_err is not None and np.linalg.norm(e) < 0.8 * prev_err:
-                prev_err = float(np.linalg.norm(e))
-                move = np.linalg.solve(J, -e) * 0.85
-                n = np.linalg.norm(move)
-                if n > 60:
-                    move *= 60 / n
-                await self.goto(p.x + move[0], p.y + move[1], p.z)
-                continue
-            prev_err = float(np.linalg.norm(e))
+            # The Jacobian is re-probed every iteration. Reusing it (to save the probe moves) made the servo
+            # oscillate on the arm (414 -> 476 -> 326 -> 372 ... px) and run out of iterations for yellow block
+            # and green cube; fresh probes converged in 2-3 iterations in every trial.
             # Probe +15 mm along arm x then y, record how the target moves in the image
             probe = 15.0
             cols = []
