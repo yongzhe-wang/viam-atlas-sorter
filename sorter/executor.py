@@ -32,7 +32,9 @@ import pick_place_auto as ppa  # noqa: E402  arm library (Rig, pick, place_in_sq
 from sorter import clip_embed, perception  # noqa: E402
 
 MAX_OPEN_MM = 78.0  # jaws open ~84 mm; keep a margin so the fingers clear the sides
-COLOUR_TOL = 45.0  # RGB distance to the object's median colour that still counts as the object (close range)
+COLOUR_TOL = 60.0  # RGB distance that still counts as the object at close range (grey/black/white objects)
+HUE_TOL = 9  # PIL hue units (~13 deg) for saturated objects: hue barely changes when the block looks brighter up close
+SAT_REF = 90  # PIL saturation above which an object is "coloured" and tracked by hue
 # Where to look for objects, flange x/y mm: home first, then the square-search grid
 OBSERVE_XY = [ppa.HOME_XY] + ppa.SEARCH_XY
 # Random drop area for reset, flange x/y mm (see run_trials.RESET_*); place_at refuses occupied/square spots
@@ -187,8 +189,20 @@ class ObjTracker:
     def __init__(self, rig, obj, rgb: np.ndarray, text: str = None, store=None):
         self.rig = rig
         self.uv = obj.centroid_px
-        self.colour = np.median(rgb[obj.mask].astype(float), axis=0)
         self.text, self.store = text, store
+        self._learn(rgb, obj.mask)
+
+    def _learn(self, rgb: np.ndarray, mask: np.ndarray) -> None:
+        """
+        Colour reference for the close range from the object's latest far view (median RGB and HSV).
+
+        WHY: "yellow block" failed with "block-close: not visible": the reference came from the first frame and
+        an RGB tolerance of 45, but up close the block reads much brighter. Refreshed on every far frame, and
+        coloured objects are matched by hue, which brightness hardly changes.
+        """
+        self.colour = np.median(rgb[mask].astype(float), axis=0)
+        hsv = np.asarray(Image.fromarray(rgb).convert("HSV"))[mask].astype(float)
+        self.hsv = np.median(hsv, axis=0)
 
     def _seg_objects(self, rgb: np.ndarray, depth: np.ndarray) -> list:
         seg = perception.segment_full(rgb, depth)
@@ -215,7 +229,13 @@ class ObjTracker:
             self._objs = self._seg_objects(rgb, depth)
             return [(o.centroid_px[0], o.centroid_px[1], o.yaw_deg, int(o.mask.sum())) for o in self._objs]
         self._objs = []
-        m = np.linalg.norm(rgb.astype(float) - self.colour, axis=2) < COLOUR_TOL
+        if self.hsv[1] > SAT_REF:
+            hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+            dh = np.abs(hsv[..., 0] - int(self.hsv[0]))
+            dh = np.minimum(dh, 256 - dh)  # hue is circular
+            m = (dh <= HUE_TOL) & (hsv[..., 1] > SAT_REF * 0.6) & (hsv[..., 2] > 50)
+        else:
+            m = np.linalg.norm(rgb.astype(float) - self.colour, axis=2) < COLOUR_TOL
         m[ppa.FINGER_ROW:] = False
         m = ndimage.binary_opening(m, iterations=2)
         lab, n = ndimage.label(m)
@@ -237,6 +257,11 @@ class ObjTracker:
             if best is None:
                 return None
         self.uv = (best[0], best[1])
+        # Far frame: refresh the close-range colour reference from this sighting
+        for o in getattr(self, "_objs", []):
+            if abs(o.centroid_px[0] - best[0]) < 1 and abs(o.centroid_px[1] - best[1]) < 1:
+                self._learn(rgb, o.mask)
+                break
         return best
 
 
