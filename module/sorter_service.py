@@ -320,7 +320,8 @@ class GraspByDescription(Generic, EasyResource):
         """The one live map (AGENT3's table_map.update_map), empty from the start; part of warm-up."""
         if self.live is None:
             initial = await self._forgotten
-            self.live = LiveMap(self.store, _runtime().table_map.update_map, MAP_PERSIST_S, initial=initial)
+            tm = _runtime().table_map
+            self.live = LiveMap(self.store, tm.update_map, MAP_PERSIST_S, initial=initial, empty_fn=tm.empty_map)
             LOGGER.info(f"{self.name}: live table map on, empty since the module started")
 
     async def _rebuild_map(self, since: Optional[float]) -> Dict[str, ValueTypes]:
@@ -790,8 +791,11 @@ class GraspByDescription(Generic, EasyResource):
                 doc = await rt.executor.clear_square(rig, self.store)
             summary = {k: doc.get(k) for k in SUMMARY_KEYS if doc.get(k) is not None}
         except Exception as e:
-            LOGGER.error(f"{kind} failed: {type(e).__name__}: {e}")
-            summary = {"status": "error", "error": f"{type(e).__name__}: {e}"[:300]}
+            # The cause too: Rig.call's "link still down after N reconnects" hid a refused move (VIAM CENTERAL)
+            cause = e.__cause__ or e.__context__
+            err = f"{type(e).__name__}: {e}" + (f" <- {type(cause).__name__}: {cause}" if cause is not None else "")
+            LOGGER.error(f"{kind} failed: {err}")
+            summary = {"status": "error", "error": err[:300]}
             try:
                 if self.rig is not None:
                     await self.rig.lift()

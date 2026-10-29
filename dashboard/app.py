@@ -461,11 +461,11 @@ def table_map():
         running = ((_module_state().get("status") or {}).get("running") or {})
         sweep = running.get("sweep") or None
         search = {**running["search"], "text": running.get("text")} if running.get("search") else None
-        n_obs = d.get("observations")
+        n_obs, live = d.get("observations"), d.get("live")
     else:
         m, sightings, robot_now = store.get_table_map(with_emb=False), store.list_sightings(), time.time()
         sweep = next((w.get("sweep") for w in workers() if w.get("online") and w.get("sweep")), None)
-        search, n_obs = None, store.observation_stats()["count"]
+        search, n_obs, live = None, store.observation_stats()["count"], None
     if m:
         m["age_s"] = round(robot_now - (m.get("ts") or robot_now), 1)
         # Live map: each object's own age (seen_ts); an older map without it -> the map's age for all
@@ -479,7 +479,7 @@ def table_map():
         s["age_s"] = round(robot_now - (s.get("ts") or robot_now), 1)
     hl = dict(_map_highlight) if _map_highlight.get("until", 0) > time.time() else None
     return {"map": m, "sightings": sightings, "sweep": sweep, "search": search, "reach_mm": [120, 650], "highlight": hl,
-            "observations": n_obs}
+            "observations": n_obs, "live": live}
 
 
 @app.post("/api/clear_map")

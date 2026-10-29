@@ -55,9 +55,12 @@ def _small_depth(depth) -> tuple:
 
 
 class LiveMap:
-    def __init__(self, store, update_fn, persist_s: float = 2.0, initial: Optional[dict] = None):
+    def __init__(self, store, update_fn, persist_s: float = 2.0, initial: Optional[dict] = None, empty_fn=None):
         self.store, self.update_fn, self.persist_s = store, update_fn, persist_s
-        self.map: Optional[dict] = initial  # empty: the cleared map the module starts from (Store.clear_table_map)
+        # Every empty map is AGENT3's own (table_map.empty_map: next_id, last_update, ...) plus our cleared_* fields:
+        # a hand-made {"objects": []} killed every update on sfhack4 with KeyError: 'next_id' (VIAM CENTERAL)
+        self._empty = empty_fn or (lambda: {"objects": []})
+        self.map: Optional[dict] = self._base(initial)  # the cleared map the module starts from
         self.swept_ts = 0.0  # last whole-table sweep
         self.epoch = float((initial or {}).get("cleared_ts") or time.time())  # the fold over the log starts here
         self._log = hasattr(store, "log_observation")
@@ -71,7 +74,12 @@ class LiveMap:
         self._persist_task: Optional[asyncio.Task] = None
         self._saved_at, self._dirty = 0.0, False
         self.stats = {"updates": 0, "dropped": 0, "errors": 0, "last_ms": None, "last_source": None,
-                      "last_error": None, "logged": 0, "log_errors": 0}
+                      "last_error": None, "last_error_ts": None, "last_ok_ts": None, "logged": 0, "log_errors": 0}
+        self._error_logged = (None, 0.0)  # (message, when): repeated failures are logged once a minute, not per frame
+
+    def _base(self, meta: Optional[dict]) -> dict:
+        """AGENT3's empty map with `meta` (a cleared map's fields, or a fold's result) on top."""
+        return {**self._empty(), **(meta or {})}
 
     # ---- feeding --------------------------------------------------------------------------------------
 
@@ -131,9 +139,12 @@ class LiveMap:
             m = await asyncio.to_thread(lambda: self.update_fn(copy.deepcopy(snapshot), rgb, depth, pose, intr,
                                                                self.store, source, **kw))
         except Exception as e:
-            self.stats["errors"] += 1
-            self.stats["last_error"] = f"{type(e).__name__}: {e}"[:200]
-            LOGGER.warning(f"live map: update_map failed on a {source} frame: {self.stats['last_error']}")
+            err = f"{type(e).__name__}: {e}"[:200]
+            self.stats.update(errors=self.stats["errors"] + 1, last_error=err, last_error_ts=time.time())
+            if err != self._error_logged[0] or time.time() - self._error_logged[1] > 60.0:
+                self._error_logged = (err, time.time())
+                LOGGER.warning(f"live map: update_map failed on a {source} frame ({self.stats['errors']} failures "
+                               f"so far): {err}")
             return
         if gen != self._gen:
             return  # the map was cleared while this frame (taken before the clear) was being applied
@@ -141,7 +152,7 @@ class LiveMap:
             m["ts"] = time.time()  # last update; each object keeps its own seen_ts
             m["swept_ts"] = self.swept_ts
             self.map = m
-        self.stats.update(updates=self.stats["updates"] + 1, last_source=source,
+        self.stats.update(updates=self.stats["updates"] + 1, last_source=source, last_ok_ts=time.time(),
                           last_ms=int((time.monotonic() - t0) * 1000))
         lu = (m or {}).get("last_update") or {}
         if self._log and not lu.get("skipped"):  # a skipped frame (same pose, < 0.5 s) added nothing to the map
@@ -178,7 +189,7 @@ class LiveMap:
         m = await asyncio.to_thread(fold_fn, obs)
         self._gen += 1
         self._newest = None
-        m = {**(m or {"objects": []}), "ts": time.time(), "epoch": since, "rebuilt_from": since, "swept_ts": 0.0}
+        m = {**self._base(m), "ts": time.time(), "epoch": since, "rebuilt_from": since, "swept_ts": 0.0}
         self.map, self.epoch, self.swept_ts = m, float(since), 0.0
         await asyncio.to_thread(self.store.put_table_map, self.map, True)
         self._dirty, self._saved_at = False, time.time()
@@ -212,7 +223,7 @@ class LiveMap:
         self._keep.clear()
         if self.map is not None:  # the in-memory map is up to persist_s newer than the saved one: that one goes to history
             await asyncio.to_thread(self.store.put_table_map, self.map, False)
-        self.map = await asyncio.to_thread(self.store.clear_table_map, reason)
+        self.map = self._base(await asyncio.to_thread(self.store.clear_table_map, reason))
         self.swept_ts, self._dirty, self._saved_at = 0.0, False, time.time()
         self.epoch = float(self.map.get("cleared_ts") or time.time())  # the fold starts again here; the log is kept
         return self.map
@@ -246,6 +257,8 @@ class LiveMap:
                 "updated_s_ago": round(now - m["ts"], 1) if m.get("ts") else None,
                 "cleared_s_ago": round(now - m["cleared_ts"], 1) if m.get("cleared_ts") else None,
                 "epoch": self.epoch,
+                # failing: the last update failed and none worked since (a dead map, shown on the dashboard)
+                "failing": (self.stats["last_error_ts"] or 0) > (self.stats["last_ok_ts"] or 0),
                 "swept_s_ago": round(now - self.swept_ts, 1) if self.swept_ts else None,
                 "pending": len(self._keep) + (self._newest is not None), **self.stats}
 

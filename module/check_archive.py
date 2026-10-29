@@ -7,7 +7,9 @@ from there (VIAM CENTERAL: a tarball without module/live_map.py died on sfhack4 
   2. every project import in the shipped .py files (module.*, sorter.*, scripts' modules such as
      pick_place_auto) names a file that is in the archive; needs nothing installed, so it always runs;
   3. if this Python has viam-sdk: import module.main and module.sorter_service from the unpacked copy in a clean
-     subprocess (-I, cwd = the copy), so the working tree cannot stand in for a missing file.
+     subprocess (-I, cwd = the copy), so the working tree cannot stand in for a missing file;
+  4. with numpy and Pillow there too: module/selftest_map.py from the copy, i.e. the shipped live map on the
+     shipped table_map.update_map (a dead map on sfhack4: "KeyError: 'next_id'" on every frame).
 
 build.sh runs it on every build; a problem fails the build. Usage: python3 module/check_archive.py [archive]
 """
@@ -109,6 +111,16 @@ def check(archive: Path) -> list:
                                 + "\n".join(r.stderr.strip().splitlines()[-4:]))
             else:
                 print("check_archive: module.main + module.sorter_service import from the unpacked archive")
+        if all(importlib.util.find_spec(m) is not None for m in ("numpy", "PIL")):
+            r = subprocess.run([sys.executable, "-I", "module/selftest_map.py"], cwd=root, capture_output=True,
+                               text=True, timeout=300)
+            if r.returncode != 0:
+                problems.append("live map self-test failed in the unpacked archive:\n"
+                                + "\n".join((r.stderr or r.stdout).strip().splitlines()[-4:]))
+            else:
+                print("check_archive: " + r.stdout.strip().splitlines()[-1])
+        else:
+            print("check_archive: no numpy / Pillow in this Python, skipped the live map self-test")
     return problems
 
 

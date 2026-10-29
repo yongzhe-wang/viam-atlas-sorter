@@ -189,7 +189,13 @@ the module could not start from it. It checks:
 - `requirements.txt`;
 - that every project import in the shipped `.py` files names a shipped file;
 - that no macOS `._*` metadata files are included;
-- with viam-sdk in `$PYTHON`, that `import module.main` works from the unpacked copy.
+- with viam-sdk in `$PYTHON`, that `import module.main` works from the unpacked copy;
+- with numpy and Pillow there too, `module/selftest_map.py` from the copy. It runs the shipped live map on the
+  shipped `table_map.update_map` (real segmentation on a synthetic frame) for a just-started and a just-cleared
+  map. On sfhack4 a hand-made empty map once failed every update with `KeyError: 'next_id'`; this catches that.
+
+`build.sh` also lists any uncommitted changes under `module/`, `sorter/` and `scripts/` that go into the archive.
+It packs the working tree, so another agent's half-done edit would otherwise ship unnoticed.
 
 A tarball once shipped without `module/live_map.py` and died on the robot with "ModuleNotFoundError: No module
 named 'module.live_map'"; this check now fails such a build first.

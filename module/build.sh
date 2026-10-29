@@ -4,6 +4,13 @@
 # specific to one camera mount, so another team should build after calibrating their own.
 set -e
 cd "$(dirname "$0")/.."
+# The archive is built from the working tree: name any uncommitted change that goes into it (another agent's
+# half-done edit would otherwise ship unnoticed)
+dirty=$(git status --porcelain -- module sorter scripts meta.json requirements.txt 2>/dev/null || true)
+if [ -n "$dirty" ]; then
+  echo "WARNING: uncommitted changes go into this archive:"
+  echo "$dirty"
+fi
 rm -rf module/dist && mkdir -p module/dist/stage/module module/dist/stage/scripts module/dist/stage/data
 cp module/run.sh module/dist/stage/run.sh
 # viam-server reads the entrypoint from meta.json inside local tarballs (reload-local fails without it)
