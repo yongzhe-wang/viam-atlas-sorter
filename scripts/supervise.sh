@@ -12,7 +12,10 @@ export RUN_ID=${RUN_ID:-$(date +%Y%m%d-%H%M%S)}  # same run id across restarts
 cd "$(dirname "$0")/.." || exit 1
 pid=""
 trap 'if [ -n "$pid" ]; then kill "$pid" 2>/dev/null; fi; exit 130' INT TERM
-mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+# GNU stat first: on Linux "stat -f" means filesystem info, so it printed garbage instead of failing
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+# A wrong interpreter path would otherwise burn all 20 restarts in seconds
+command -v "$PY" >/dev/null 2>&1 || { echo "supervise: python not found: $PY"; exit 2; }
 for attempt in $(seq 1 20); do
   ALIVE_FILE="$(mktemp -t alive.XXXXXX)"
   export ALIVE_FILE
