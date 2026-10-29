@@ -51,28 +51,59 @@ Parameters (all relative to the object, never absolute poses): `yaw_offset`, `z_
 
 1. **Known object** (nearest neighbour similarity ≥ τ): candidates are that object's stored grasps. Overnight, choose with Thompson sampling on `Beta(n_ok+1, n_fail+1)` so it keeps exploring. At demo time choose the best mean (greedy).
 2. **Unknown object:** geometry rules pick the primitive; params come from the top-3 neighbours' best grasps.
-3. **After each attempt:** update `n_try / n_ok`. On failure, add a perturbed copy as a new candidate (yaw ±10°, z ±5 mm, width ±5 mm).
+3. **After each attempt:** update `n_try / n_ok`. On failure, add a repaired copy as a new candidate, chosen by the phase where it failed (section 3).
 
 **Success check (all three):** `grab()` result, the gripper's own holding bit (G2 `IsHoldingSomething`), and after the lift the depth at the original spot is back to table height.
 
-## 3. Atlas data model
+## 3. History: how past attempts and trajectories are reused
+
+Every attempt is recorded in full, and the history is used in five ways. Raw trajectories are stored **relative to the object**, never as absolute poses, because the object is somewhere different every time.
+
+**What gets recorded per attempt**
+
+- Object pose at observation: `(x, y, yaw, h)` in the arm base frame.
+- The grasp used: primitive + params.
+- Trajectory as phased waypoints: `observe → servo → pre_grasp → descend → close → lift → transport → place → retreat`. Each waypoint has the flange pose, joint angles, gripper state (open/closed, holding bit) and a timestamp.
+- High-rate joint stream: Viam data capture on the arm (~10 Hz), synced to the Viam cloud and joined to the attempt by timestamp. Atlas keeps the per-attempt summary; Viam keeps the raw stream.
+- Outcome: `success`, plus `fail_phase` and `fail_reason` on failure; images at observe, at close, and after.
+
+**How it is used**
+
+1. **Trajectory templates in the object frame.** For a successful attempt, subtract the object's `(x, y)` and rotate by `-yaw` to get the waypoints in the object's own frame, then store them on that grasp (`waypoints_obj`). Next time, wherever the object is, transform them back with the new `(x, y, yaw)` and execute. The pre-grasp height, approach direction and lift path that worked are reused exactly.
+2. **Choosing the grasp.** `n_try / n_ok` per grasp candidate feeds Thompson sampling overnight and the greedy choice at demo time (section 2).
+3. **Repair by failure phase** instead of random perturbation:
+
+| `fail_phase` | What it means | Next candidate |
+|---|---|---|
+| `close`, holding bit false | missed: position or yaw off | tighter servo tolerance; `z_offset` 5 mm deeper |
+| `lift` / `transport`, holding lost | slipped | more force, lower grasp point, slower lift |
+| `descend`, arm error or stall | hit the object or the table | raise `z_offset`; switch primitive (e.g. `TOP_PINCH` → `RIM`) |
+| `servo`, did not converge | perception problem | not a grasp problem: flag the object, skip it |
+
+4. **Unseen objects borrow history.** kNN on the embedding returns the neighbours' best grasps with their `waypoints_obj`, scaled by the new object's height and width.
+5. **Replay and debugging.** The dashboard can replay any attempt (images + 3D path) and filter failures by phase, which shows what to fix in the morning.
+
+Not in scope for the hackathon: training a policy (e.g. ACT/VLA) on these trajectories. The overnight log is already a dataset (images + actions + outcomes) that could be exported to LeRobot format later.
+
+## 4. Atlas data model
 
 ```
 views     { object_id, label, embedding[512], cam_pose, img_path }            # vector index on embedding, filter: label
 objects   { _id, label, aliases[], geometry{l,w,h,hollow},
-            grasps: [{ id, primitive, params{...}, n_try, n_ok }] }
-attempts  { ts, run_id, mode: overnight|demo|teach, object_id, sim, grasp_id, primitive, params,
-            success, fail_reason, img_before, img_after, duration_s }
+            grasps: [{ id, primitive, params{...}, waypoints_obj[], n_try, n_ok }] }
+attempts  { ts, run_id, mode: overnight|demo|teach, object_id, sim, obj_pose{x,y,yaw,h}, grasp_id, primitive, params,
+            waypoints[{phase, t, flange_pose, joints[6], gripper, holding}],
+            success, fail_phase, fail_reason, img_observe, img_close, img_after, duration_s }
 commands  { ts, text, chosen_object, score, margin, corrected_to, success }
 ```
 
 Several `views` per object (multi-angle), so a query takes the top-k views and votes by label.
 
-## 4. Object library pre-collection (Day 1 afternoon)
+## 5. Object library pre-collection (Day 1 afternoon)
 
 `scripts/scan_object.py`: put an object in the centre → the arm visits 8 poses (2 heights × 4 wrist angles) → 8 views embedded → asks for label and aliases → writes `views` + `objects`. About 1 minute per object. Target 15–25 objects: everything the organizers provide plus our own.
 
-## 5. Overnight autonomy (organizers confirmed overnight running is allowed)
+## 6. Overnight autonomy (organizers confirmed overnight running is allowed)
 
 Loop: observe → pick a random object in the workspace → choose grasp (Thompson) → execute → success check → **place it at a random free spot in the workspace** (self-reset, not into the square) → log → repeat. 4–6 different objects on the table for variety.
 
@@ -87,7 +118,7 @@ Before leaving (by ~8:30 PM): 30 attended minutes with no table hits and no obje
 
 Expected volume: ~12 h × (3600 / ~50 s per attempt) ≈ 850 attempts (cycle time not measured yet).
 
-## 6. Language: describe the object, it goes in the blue square
+## 7. Language: describe the object, it goes in the blue square
 
 The destination is always the blue square, so there is nothing to parse. No LLM, no templates.
 
@@ -97,11 +128,11 @@ The destination is always the blue square, so there is nothing to parse. No LLM,
 4. That click is the teach-once step: store the clicked crop's embedding with the typed text as a label/alias, so the same words find it next time.
 5. Run the normal grasp pipeline → drop in the blue square; log to `commands`.
 
-## 7. UI (laptop browser)
+## 8. UI (laptop browser)
 
 Live camera with detection boxes and the chosen grasp drawn on top · command box · click-to-correct on the live view · embedded Atlas Charts (success over time, per object, per primitive, language success).
 
-## 8. Timeline
+## 9. Timeline
 
 | When | A: robot / executor | B: perception / Atlas | C: language / UI |
 |---|---|---|---|
