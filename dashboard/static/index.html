@@ -65,7 +65,7 @@
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--chip); white-space: nowrap; }
   .badge.pending { color: var(--warn); } .badge.running { color: var(--accent); }
   .badge.done { color: var(--ok); } .badge.failed, .badge.not_found, .badge.error { color: var(--bad); }
-  .badge.busy, .badge.rejected, .badge.ambiguous, .badge.too_wide, .badge.too_close { color: var(--warn); }
+  .badge.busy, .badge.rejected, .badge.ambiguous, .badge.too_wide, .badge.too_close, .badge.square_full { color: var(--warn); }
   .badge.sending { color: var(--accent); } .badge.already_in_square { color: var(--ok); }
   .cmdfail { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
   #known { margin-top: 8px; font-size: 12px; line-height: 2; }
@@ -291,7 +291,8 @@ async function refreshCommands() {
     const decided = c.decide_ms != null ? `decided in ${c.decide_ms} ms` : "";
     left.appendChild(el("div", [hhmm(c.ts), chosen, decided, took].filter(Boolean).join(" · "), "muted"));
     // Last result straight from the module (or the worker): why it failed, so the demo needs no Atlas
-    if (c.fail_reason) left.appendChild(el("div", c.fail_reason, "cmdfail"));
+    // square_full (AGENT1): the object went back where it was; the way on is to clear the square
+    if (c.fail_reason) left.appendChild(el("div", c.fail_reason + (c.status === "square_full" ? " · press Clear square" : ""), "cmdfail"));
     li.appendChild(left);
     li.appendChild(el("span", (c.status || "").replace(/_/g, " "), "badge " + c.status));  // "already in square"
     ul.appendChild(li);
@@ -536,11 +537,17 @@ async function refreshMap() {
     const [sx, sy] = mapXY(...m.square.xy), size = [].concat(m.square.size_mm || [200, 200]);
     const w = (size[1] ?? size[0]) * MAP.s, h = size[0] * MAP.s;
     // partial (AGENT3): the square was cut by the picture's edge; xy/size cover only the part in view: dashed
-    const sq = mk("rect", {x: sx - w / 2, y: sy - h / 2, width: w, height: h, fill: "none", stroke: "#2457d6", "stroke-width": 4,
-                           ...(m.square.partial ? {"stroke-dasharray": "10 6"} : {})});
-    sq.appendChild(mk("title", {}, m.square.partial ? "drop square, only partly in view so far" : "drop square"));
+    const style = {fill: "none", stroke: "#2457d6", "stroke-width": 4, ...(m.square.partial ? {"stroke-dasharray": "10 6"} : {})};
+    // corners (AGENT3: the square at any rotation, [[x, y] table mm] x 4) -> its real outline; else the axis box
+    const pts = Array.isArray(m.square.corners) && m.square.corners.length >= 3 ? m.square.corners.map((c) => mapXY(c[0], c[1])) : null;
+    const sq = pts ? mk("polygon", {points: pts.map((p) => p.join(",")).join(" "), ...style})
+                   : mk("rect", {x: sx - w / 2, y: sy - h / 2, width: w, height: h, ...style});
+    const conf = m.square.confidence != null ? ` · confidence ${Number(m.square.confidence).toFixed(2)}` : "";
+    const yaw = m.square.yaw_deg != null ? ` · ${Number(m.square.yaw_deg).toFixed(0)}°` : "";
+    sq.appendChild(mk("title", {}, (m.square.partial ? "drop square, only partly in view so far" : "drop square") + yaw + conf));
     svg.appendChild(sq);
-    frames.push({x0: sx - w / 2 - 2, y0: sy - h / 2 - 2, x1: sx + w / 2 + 2, y1: sy + h / 2 + 2});
+    const xs = pts ? pts.map((p) => p[0]) : [sx - w / 2, sx + w / 2], ys = pts ? pts.map((p) => p[1]) : [sy - h / 2, sy + h / 2];
+    frames.push({x0: Math.min(...xs) - 2, y0: Math.min(...ys) - 2, x1: Math.max(...xs) + 2, y1: Math.max(...ys) + 2});
   }
   const pick = (label) => { if (label) { $("t").value = label; $("t").focus(); } };
   const onMap = new Map();  // label -> its map object (xy, age_s)

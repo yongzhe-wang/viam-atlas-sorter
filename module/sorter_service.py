@@ -82,7 +82,7 @@ BUNDLE_DIR = Path(__file__).resolve().parent.parent / "library"
 BUILD_INFO_PATH = Path(__file__).resolve().parent.parent / "BUILD_INFO.json"
 # find_path / square_path (AGENT1 0d3c817): how the executor really found the object and the square, for status.last
 SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "duration_s", "fail_phase", "fail_reason",
-                "find_path", "find_views", "square_path", "objects")
+                "find_path", "find_views", "square_path", "objects", "check")
 # A grasp that fails by accident (slipped, closed on air) is tried this many times in all, each from a fresh
 # search {USER 2026-10-29 "I ALSO WANT RETRY WHEN FAIL"} [CONFIDENCE: SINGLE-SRC 90% — 3 is my pick: a 4th
 # try past ~45 s of retries loses the demo minute anyway]
@@ -793,7 +793,7 @@ class GraspByDescription(Generic, EasyResource):
 
     async def _run(self, kind: str, text: Optional[str], target: Optional[dict] = None,
                    decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
-                   chosen: Optional[dict] = None) -> dict:
+                   chosen: Optional[dict] = None, skip_current: bool = False) -> dict:
         """
         Run one grasp, reset or table scan to completion and return its summary; never raises.
 
@@ -801,6 +801,8 @@ class GraspByDescription(Generic, EasyResource):
         live-map entry) -> AGENT1's search_and_find looks there first; neither -> it searches the table. The
         search stops at the first view whose best() accepts and the pick starts right there: no scan first.
         chosen: {"label", "colour"} of the object decided on (map path); the frame path fills it here.
+        skip_current: a fresh idle frame from where the arm still is already showed it is not in view, so the
+        search starts at the hint / first pose instead of looking there again (AGENT1: ~3.6 s saved).
         The summary's "label" is that recognised library name and "colour" its colour, because the executor's
         own "label" falls back to the colour (VIAM CENTERAL: a blue screwdriver came back as "label": "black").
         Retries (_retryable): up to GRASP_ATTEMPTS in all, each later one searching afresh; job_info["attempt"]
@@ -812,7 +814,8 @@ class GraspByDescription(Generic, EasyResource):
         attempts: list = []
         for n in range(1, tries + 1):
             self.job_info.update(attempt=n, attempts_max=tries)
-            summary, run_via = await self._once(kind, text, target, target_xy)
+            # skip_current only for the first try: a failed try moved the arm, so a retry looks from where it is
+            summary, run_via = await self._once(kind, text, target, target_xy, skip_current and n == 1)
             # The first attempt's path names the job (frame / map / search); retries always search
             via = run_via if n == 1 else via
             if n == tries or not self._retryable(kind, summary):
@@ -853,7 +856,7 @@ class GraspByDescription(Generic, EasyResource):
         return not any(s in reason for s in ("MoveRefused", "link", "recovery failed", "still holding"))
 
     async def _once(self, kind: str, text: Optional[str], target: Optional[dict],
-                    target_xy: Optional[list]) -> tuple:
+                    target_xy: Optional[list], skip_current: bool = False) -> tuple:
         """One grasp attempt, reset or table scan -> (summary, via); never raises (an exception becomes "error")."""
         via = "scan" if kind == "scan" else "search"
         try:
@@ -873,6 +876,8 @@ class GraspByDescription(Generic, EasyResource):
                 elif (target is not None or target_xy is not None) and not self._no_target_warned:
                     LOGGER.warning("executor.execute lacks target=/target_xy=: using its own search instead")
                     self._no_target_warned = True
+                if skip_current and target is None and "skip_current" in params:
+                    kwargs["skip_current"] = True
                 doc = await rt.executor.execute(rig, text, self.store, mode="demo", **kwargs)
             elif kind == "scan":
                 doc = await self._scan(rt, rig)
@@ -897,7 +902,7 @@ class GraspByDescription(Generic, EasyResource):
 
     async def _start(self, kind: str, text: Optional[str], wait: bool, target: Optional[dict] = None,
                      decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
-                     chosen: Optional[dict] = None) -> Dict[str, ValueTypes]:
+                     chosen: Optional[dict] = None, skip_current: bool = False) -> Dict[str, ValueTypes]:
         if self._busy():
             return {"accepted": False, "error": "busy", "running": dict(self.job_info)}
         job_id = uuid.uuid4().hex[:12]
@@ -905,7 +910,8 @@ class GraspByDescription(Generic, EasyResource):
                else "search")
         self.job_info = {"job": job_id, "kind": kind, "text": text or "", "started": time.time(), "via": via,
                          "fast_path": target is not None, "target_xy": target_xy}
-        self.job = asyncio.get_event_loop().create_task(self._run(kind, text, target, decide_ms, target_xy, chosen))
+        self.job = asyncio.get_event_loop().create_task(
+            self._run(kind, text, target, decide_ms, target_xy, chosen, skip_current))
         if wait:
             return {"accepted": True, "job": job_id, **(await self.job)}
         return {"accepted": True, "job": job_id}
@@ -940,6 +946,9 @@ class GraspByDescription(Generic, EasyResource):
                          "fail_phase": "find", "fail_reason": refusal[1], "decide_ms": decide_ms, "decided_from_cache": True}
             return {"ok": False, "accepted": False, "status": "ambiguous", "reason": refusal[1], "decide_ms": decide_ms,
                     "decided_from_cache": True}
+        # The fresh idle frame was decided on and does not show it; the arm has not moved since (only jobs move
+        # it): the search need not look from here again
+        seen_miss = pick is not None and pick.get("obj") is None
         found = await self._from_map(text)
         if found is not None and not found["found"]:  # already in the drop square
             self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": found["status"],
@@ -948,14 +957,15 @@ class GraspByDescription(Generic, EasyResource):
                     "decide_ms": found["decide_ms"], "via": "map"}
         if found is not None:
             res = await self._start("grasp", text, wait, target_xy=found["xy"], decide_ms=found["decide_ms"],
-                                    chosen={"label": found["label"], "colour": found.get("colour")})
+                                    chosen={"label": found["label"], "colour": found.get("colour")},
+                                    skip_current=seen_miss)
             return {**res, "ok": bool(res.get("accepted")), "via": "map", "status_text": "searching",
                     "message": self._map_message(found) + " · looking there first"
                                + (", then searching" if found["stale"] else ""), "stale": found["stale"],
                     "target_xy": found["xy"], "label": found["label"], "map_age_s": found["map_age_s"],
                     "seen_s_ago": found["seen_s_ago"], "look_first": found["look_first"],
                     "decide_ms": found["decide_ms"]}
-        res = await self._start("grasp", text, wait)
+        res = await self._start("grasp", text, wait, skip_current=seen_miss)
         return {**res, "ok": bool(res.get("accepted")), "via": "search", "status_text": "searching",
                 "message": "searching the table… (grasps at the first view that shows it)",
                 "why": "not in the cached frame" if pick is not None
