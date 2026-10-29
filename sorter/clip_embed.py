@@ -82,6 +82,16 @@ def embed_text(text: str) -> np.ndarray:
     return f[0].numpy().astype(np.float32)
 
 
+_NAME_CACHE = {}
+
+
+def _name_emb(name: str) -> np.ndarray:
+    """embed_text() memoised: store votes embed the same few labels/aliases on every query."""
+    if name not in _NAME_CACHE:
+        _NAME_CACHE[name] = embed_text(clean_query(name))
+    return _NAME_CACHE[name]
+
+
 def clean_query(text: str) -> str:
     """Lowercase, strip command verbs ("grasp", "pick up the") and normalise colour aliases."""
     q = re.sub(STOP, "", text.strip().lower())
@@ -146,7 +156,9 @@ def rank(objs: list, text: str, store=None) -> list:
         if store is not None:
             views = store.search_views(emb, k=5)
             if views:
-                votes = [v["score"] * float(embed_text(v["label"]) @ qt) for v in views]
+                # A view matches the query by its label or any alias ("green block" for a "green square")
+                votes = [v["score"] * max(float(_name_emb(n) @ qt) for n in [v["label"], *(v.get("aliases") or [])])
+                         for v in views]
                 score += STORE_WEIGHT * max(votes)
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
