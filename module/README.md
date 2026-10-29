@@ -79,15 +79,22 @@ await sorter.do_command({"reset": True})                    # empty the square (
   Otherwise, for example right after a move, it falls back to the executor's own observe (`"why_slow"`).
   `{"seen_image": true}` returns that frame as a small base64 JPEG with the boxes scaled to it.
 - **Live table map** (`module/live_map.py`): every picture the module sees updates one in-memory map through
-  `sorter/table_map.py`'s `update_map`. That covers idle frames, every sweep frame, and executor frames during a
-  task (tapped in `ModuleRig.frame()`, at most one per second, theta 0 only). Each object keeps its `seen_ts`, and
-  objects that are gone drop out. One update runs at a time in a worker thread; a newer frame replaces one still
-  waiting (sweep frames are never dropped), so a slow update only drops pictures and never holds up the arm.
-  The map is saved with `Store.put_table_map` at most every 2 s and loaded back on restart.
-  `{"status": true}` → `"map"` reports objects, `updates`, `dropped` and `last_ms`.
+  `sorter/table_map.py`'s `update_map` (AGENT3: negative evidence drops what is gone; `partial` = seen only cut by
+  a picture's edge, position approximate). Sources:
+  - idle frames, passed with their `seg` and `recognise_all` output, so the update costs about 40 ms;
+  - executor frames through AGENT1's `Rig.on_map_frame` hook, with the pose each frame was taken at and the
+    executor phase as source. Outside a sweep at most one per second; theta 0 only while
+    `ppa.MAP_ONLY_THETA0`;
+  - every sweep frame, none dropped, applied while the arm moves on.
+
+  One update runs at a time in a worker thread, and a newer frame replaces one still waiting, so a slow update
+  only drops pictures and never holds up the arm. The map is saved with `Store.put_table_map` at most every 2 s
+  and loaded back on restart. `{"status": true}` → `"map"` reports objects, `updates`, `dropped` and `last_ms`.
+  Sweep frames are also saved by the executor under `$VIAM_MODULE_DATA/data/sweeps` (the module sets
+  `SORTER_DATA_DIR`). Only the newest 30 sweeps (about 8 MB each) are kept.
 - **Finding objects anywhere on the table**, in this order: (1) the cached idle frame → go at once; (2) the
   live map has the object, seen within the last 60 s → `"remembered at (x, y) on the table map, seen N s ago ·
-  going there"`; if the whole table was swept within the last 60 s and the map does not have it, the answer is
+  going there"` (an edge-only sighting adds "looking there first"); if the whole table was swept within the last 60 s and the map does not have it, the answer is
   an immediate "not on the table"; (3) otherwise the arm sweeps the table (`"scanning the table…"`, progress
   `pose k/N` in status), every frame goes into the map, and it picks from it. The idle loop also records each
   recognised object's last-seen table position (`Store.log_sighting`). `{"table_map": true}` returns the live

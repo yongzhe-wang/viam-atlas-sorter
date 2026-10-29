@@ -86,6 +86,7 @@ TIMELAPSE_KEEP_S = 2 * 3600.0  # ... kept for the last 2 hours
 MAP_FRESH_S = 60.0  # a live-map object seen this recently is gone to directly; a sweep this recent covers the table
 MAP_PERSIST_S = 2.0  # live map -> Store.put_table_map at most this often (VIAM CENTERAL)
 MAP_TASK_EVERY_S = 1.0  # during a task, at most one executor frame per second goes to the live map (servo keeps CPU)
+SWEEPS_KEEP = 30  # saved sweep frame sets (AGENT1, ~8 MB each: 4 x jpg + 1280x720 uint16 depth): keep the newest 30
 
 
 def seed_library(bundle: Path, data: Path) -> str:
@@ -187,6 +188,10 @@ class GraspByDescription(Generic, EasyResource):
         uri = attrs.get("mongodb_uri") or os.environ.get("MONGODB_URI") or ""
         module_data = os.environ.get("VIAM_MODULE_DATA")
         data_dir = Path(module_data) / "data" if module_data else None
+        if data_dir is not None:
+            # AGENT1's executor saves every sweep frame under $SORTER_DATA_DIR/sweeps, read when it is imported
+            # (warm-up, later): next to the Store data, kept across versions, not inside the replaced package
+            os.environ.setdefault("SORTER_DATA_DIR", str(data_dir))
         if not uri and data_dir is not None:
             LOGGER.info(f"{config.name}: {seed_library(BUNDLE_DIR, data_dir)} into {data_dir}")
         self.store = Store(uri=uri, data_dir=str(data_dir) if data_dir else None)
@@ -204,8 +209,8 @@ class GraspByDescription(Generic, EasyResource):
         self._look_lock = asyncio.Lock()  # one look at a time: the idle loop and a grasp that needs a fresh frame
         self.live: Optional[LiveMap] = None  # the live table map, once warm and if AGENT3's update_map exists
         self._intr: Optional[dict] = None  # camera intrinsics for update_map, read once through the Rig
-        self._sweeping = False  # sweep frames go to the live map losslessly after the sweep, not via the frame tap
-        self._task_map_at = 0.0  # when the last executor frame went to the live map
+        self._sweeping = False  # while a sweep runs, every frame goes to the live map (none dropped)
+        self._task_map_at = 0.0  # when the last other executor frame went to the live map
         self._no_target_warned = False
         self.timelapse_dir = (Path(module_data) if module_data else self.store.data) / "timelapse"
         loop = asyncio.get_event_loop()
@@ -239,7 +244,6 @@ class GraspByDescription(Generic, EasyResource):
         if self.attrs.get("tip_below_cam_mm"):
             ppa.TIP_BELOW_CAM = float(self.attrs["tip_below_cam_mm"])
         handles = (self.arm, self.camera, self.gripper)
-        svc = self
 
         class ModuleRig(ppa.Rig):
             async def connect(self) -> None:
@@ -251,11 +255,6 @@ class GraspByDescription(Generic, EasyResource):
 
             async def close(self) -> None:
                 return None  # viam-server owns these connections
-
-            async def frame(self) -> tuple:
-                rgb, depth = await super().frame()
-                await svc._map_task_frame(self, rgb, depth)  # executor frames update the live map too
-                return rgb, depth
 
         rig = ModuleRig()
         await rig.start()
@@ -269,31 +268,29 @@ class GraspByDescription(Generic, EasyResource):
             self._intr = {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}
         return self._intr
 
-    async def _map_task_frame(self, rig, rgb, depth) -> None:
+    def _on_map_frame(self, rig, rgb, depth, pose: dict) -> None:
         """
-        A frame the executor just took during a task (ModuleRig.frame): offer it to the live map. At most one per
-        MAP_TASK_EVERY_S and only while no update is running, so the servo keeps its CPU and its pace; the pose
-        read it needs happens only for a frame that is used. Theta-0 frames only: pixel->world holds there.
-        Never raises: a map problem must not fail the motion.
+        Rig.on_map_frame (AGENT1): called inside the arm's control loop for every frame with depth, with the pose
+        it was taken at (theta 0 only while ppa.MAP_ONLY_THETA0). It must not block, so it only hands the frame to
+        the live map's worker: during a sweep every frame (keep, none dropped, applied while the arm moves on);
+        otherwise at most one per MAP_TASK_EVERY_S while no update runs, so update_map's 150-300 ms per frame
+        does not compete with every servo probe for the CPU. The source is the executor's phase (servo, check...).
         """
-        try:
-            if (self.live is None or not self._busy() or self._sweeping or depth is None or self.live.busy()
-                    or time.time() - self._task_map_at < MAP_TASK_EVERY_S):
-                return
-            p = await rig.pose()
-            if abs(((p.theta + 180.0) % 360.0) - 180.0) > OBSERVE_TOL_DEG:
+        if self.live is None or depth is None:
+            return
+        if not self._sweeping:
+            if self.live.busy() or time.time() - self._task_map_at < MAP_TASK_EVERY_S:
                 return
             self._task_map_at = time.time()
-            self.live.offer(rgb, depth, {"x": p.x, "y": p.y, "z": p.z, "theta": p.theta},
-                            {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}, "task")
-        except Exception as e:
-            LOGGER.debug(f"live map: task frame skipped: {type(e).__name__}: {e}")
+        rt = _runtime()
+        intr = self._intr or {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}
+        phase = rt.executor.phase_now(rig) if hasattr(rt.executor, "phase_now") else "task"
+        self.live.offer(rgb, depth, pose, intr, "sweep" if self._sweeping else phase, keep=self._sweeping)
 
     def _start_live_map(self) -> None:
-        """From warm-up on, one live map, if AGENT3's table_map.update_map exists (else a map per sweep, as before)."""
-        update = getattr(_runtime().table_map, "update_map", None)
-        if update is not None and self.live is None:
-            self.live = LiveMap(self.store, update, MAP_PERSIST_S)
+        """The one live map (AGENT3's table_map.update_map), carried over from the saved map; part of warm-up."""
+        if self.live is None:
+            self.live = LiveMap(self.store, _runtime().table_map.update_map, MAP_PERSIST_S)
             n = len((self.live.map or {}).get("objects") or [])
             LOGGER.info(f"{self.name}: live table map on ({n} objects carried over from the saved map)")
 
@@ -326,9 +323,9 @@ class GraspByDescription(Generic, EasyResource):
             t0 = time.monotonic()
             try:
                 await asyncio.to_thread(self._warm_sync)
+                self._start_live_map()
                 self.warm, self.warm_ms, self.warm_error = True, _ms(t0), None
                 LOGGER.info(f"{self.name}: warm in {self.warm_ms} ms ({self.library['views']} library views)")
-                self._start_live_map()
             except Exception as e:
                 self.warm_error = f"{type(e).__name__}: {e}"[:300]
                 LOGGER.error(f"{self.name}: warm-up failed, retrying in {WARM_RETRY_S:.0f} s: {self.warm_error}")
@@ -336,10 +333,13 @@ class GraspByDescription(Generic, EasyResource):
 
     def _perceive(self, rt, rgb, depth) -> tuple:
         """
-        Targets in one frame with their library labels: (recs, [summaries], [intruders], step timings ms).
+        Targets in one frame with their library labels:
+        (recs, [summaries], [intruders], step timings ms, seg, all_recs).
 
         recs = clip_embed.recognise_all() output (one CLIP batch for all crops), reused by best() at grasp time.
         Same filter as executor.find_target: nothing cut by the image border, nothing already in the square.
+        all_recs (with the edge-cut "partial" ones, AGENT3) and seg go to update_map, which then neither segments
+        nor embeds again (38 ms instead of ~210 ms, AGENT3's measurement) and can keep edge sightings.
         """
         ms = {}
         t = time.monotonic()
@@ -350,14 +350,16 @@ class GraspByDescription(Generic, EasyResource):
         ms["square"] = _ms(t)
         t = time.monotonic()
         if hasattr(rt.clip_embed, "recognise_all"):
-            recs = rt.clip_embed.recognise_all(rgb, depth, self.store, seg=seg)
+            partial = {"include_partial": True} if "include_partial" in inspect.signature(rt.clip_embed.recognise_all).parameters else {}
+            recs = rt.clip_embed.recognise_all(rgb, depth, self.store, seg=seg, **partial)
         else:  # older clip_embed without the batched call
             objs = list(seg.objects)
             recs = []
             for o, emb in zip(objs, rt.clip_embed.embed_images([o.crop for o in objs])):
                 lab, names, conf = rt.clip_embed.recognise(emb, self.store, colour=o.colour, height_mm=o.height_mm)
                 recs.append({"obj": o, "label": lab, "names": names, "score": conf, "emb": emb})
-        recs = [r for r in recs if not r["obj"].touches_edge
+        all_recs = recs
+        recs = [r for r in recs if not r.get("partial") and not r["obj"].touches_edge
                 and (hole is None or (r["obj"].mask & hole).sum() < 0.5 * r["obj"].mask.sum())]
         ms["clip"] = _ms(t)
         objects = [{"id": int(r["obj"].id), "label": r["label"],
@@ -365,7 +367,7 @@ class GraspByDescription(Generic, EasyResource):
                     "confidence": round(float(r.get("score") or 0.0), 3), "colour": r["obj"].colour,
                     "height_mm": round(float(r["obj"].height_mm), 1), "bbox": _box(r["obj"].bbox)} for r in recs]
         intruders = [{"bbox": _box(i["bbox"]), "reason": i.get("reason", "")} for i in seg.intruders]
-        return recs, objects, intruders, ms
+        return recs, objects, intruders, ms, seg, all_recs
 
     async def _pose(self, rt) -> tuple:
         """(pose dict, at_observe) from the arm's current end position."""
@@ -396,7 +398,7 @@ class GraspByDescription(Generic, EasyResource):
         frame_ms = _ms(t_all)
         if rgb is None or depth is None:
             raise RuntimeError("camera returned no colour + depth frame")
-        recs, objects, intruders, ms = await asyncio.to_thread(self._perceive, rt, rgb, depth)
+        recs, objects, intruders, ms, seg, all_recs = await asyncio.to_thread(self._perceive, rt, rgb, depth)
         ms = {"frame": frame_ms, **ms, "total": _ms(t_all)}
         self.watch_period = SLOW_WATCH_PERIOD_S if ms["total"] > SLOW_LOOP_MS else WATCH_PERIOD_S
         pose2, still = await self._pose(rt)
@@ -407,7 +409,7 @@ class GraspByDescription(Generic, EasyResource):
         self.seen = {"ts": t_cap, "at_observe": True, "pose": pose, "objects": objects, "intruders": intruders,
                      "seen_ms": ms, "watch_period_s": self.watch_period}
         if self.live is not None:  # every idle picture updates the live map (reusing this frame's recognition)
-            self.live.offer(rgb, depth, pose, await self._intrinsics(), "idle", recognised=recs)
+            self.live.offer(rgb, depth, pose, await self._intrinsics(), "idle", recognised=all_recs, seg=seg)
         # Arm confirmed still: keep each recognised object's last-seen table xy current (AGENT3's where_is)
         if hasattr(rt.clip_embed, "record_sightings"):
             await asyncio.to_thread(rt.clip_embed.record_sightings, self.store, recs, pose, None, "idle")
@@ -488,8 +490,18 @@ class GraspByDescription(Generic, EasyResource):
                 label = (f"{self.job_info.get('kind')}: {self.job_info.get('text') or 'square'}" if self._busy()
                          else "idle")
                 await asyncio.to_thread(self._timelapse_save, jpeg, time.time(), label)
+                await asyncio.to_thread(self._prune_sweeps)
             except Exception as e:
                 LOGGER.warning(f"timelapse frame skipped: {type(e).__name__}: {e}")
+
+    def _prune_sweeps(self) -> None:
+        """Keep the newest SWEEPS_KEEP saved sweeps (timestamped dirs), so the robot's disk does not fill up."""
+        root = getattr(_runtime().executor, "SWEEP_DIR", None)
+        if root is None or not Path(root).is_dir():
+            return
+        dirs = sorted((d for d in Path(root).iterdir() if d.is_dir()), key=lambda d: d.name)
+        for d in dirs[:-SWEEPS_KEEP]:
+            shutil.rmtree(d, ignore_errors=True)
 
     def _timelapse_stats(self) -> dict:
         stamps = sorted(int(p.stem) for p in self.timelapse_dir.glob("*.jpg") if p.stem.isdigit()) \
@@ -560,16 +572,13 @@ class GraspByDescription(Generic, EasyResource):
         best_on_map() on the live map (VIAM CENTERAL: live entry fresh -> go; else sweep):
         {"found", "xy", "label", "seen_s_ago", "status", "reason", "decide_ms", "map_age_s"}, or None = sweep.
 
-        Found and that object seen within MAP_FRESH_S -> go there. Not found / ambiguous -> refuse only when a
-        whole-table sweep is that recent too (only then does the map cover the whole table); otherwise sweep.
-        Without update_map (AGENT3) the latest saved map stands in, whole: its age is every object's age.
+        Found and that object seen within MAP_FRESH_S -> go there (look_first: AGENT3 only saw it cut by the
+        image edge, xy approximate; the executor's target_xy path looks there before it grasps anyway).
+        Not found / ambiguous -> refuse only when a whole-table sweep is that recent too (only then does the map
+        cover the whole table); otherwise sweep.
         """
         now = time.time()
-        if self.live is not None:
-            m, swept_ago = self.live.map, now - self.live.swept_ts
-        else:
-            m = self.store.get_table_map()
-            swept_ago = m["age_s"] if m else float("inf")
+        m, swept_ago = self.live.map, now - self.live.swept_ts
         if not m:
             return None
         t0 = time.monotonic()
@@ -582,7 +591,7 @@ class GraspByDescription(Generic, EasyResource):
                 return None  # remembered, but too long ago to drive there blind: sweep
             return {**out, "found": True, "xy": [round(float(v), 1) for v in b["xy"]], "label": o.get("label"),
                     "colour": o.get("colour"), "score": round(float(b.get("score") or 0.0), 3),
-                    "seen_s_ago": round(seen_ago, 1)}
+                    "seen_s_ago": round(seen_ago, 1), "look_first": bool(b.get("look_first"))}
         if swept_ago > MAP_FRESH_S:
             return None
         if b.get("ambiguous"):
@@ -590,6 +599,13 @@ class GraspByDescription(Generic, EasyResource):
                     "reason": f"two objects on the table match {text!r} about equally; be more specific"}
         return {**out, "found": False, "status": "not_found",
                 "reason": f"no {text!r} on the table (whole-table map, scanned {swept_ago:.0f} s ago)"}
+
+    @staticmethod
+    def _map_message(found: dict) -> str:
+        """'remembered at (x, y) on the table map, seen N s ago', plus why it looks first for an edge sighting."""
+        x, y = found["xy"]
+        edge = " (only seen at a picture's edge: looking there first)" if found.get("look_first") else ""
+        return f"remembered at ({x:.0f}, {y:.0f}) on the table map, seen {found['seen_s_ago']:.0f} s ago{edge}"
 
     async def _preview(self, text: str) -> Dict[str, ValueTypes]:
         """
@@ -614,10 +630,9 @@ class GraspByDescription(Generic, EasyResource):
                     "reason": f"{text!r} is not in view and the table map has not seen it in the last "
                               f"{MAP_FRESH_S:.0f} s: a grasp would scan the table"}
         if found["found"]:
-            x, y = found["xy"]
             return {"ok": True, "via": "map", "target_xy": found["xy"], "label": found["label"],
                     "decide_ms": found["decide_ms"], "map_age_s": found["map_age_s"], "seen_s_ago": found["seen_s_ago"],
-                    "message": f"remembered at ({x:.0f}, {y:.0f}) on the table map, seen {found['seen_s_ago']:.0f} s ago"}
+                    "look_first": found["look_first"], "message": self._map_message(found)}
         return {"ok": False, "status": found["status"], "reason": found["reason"], "decide_ms": found["decide_ms"]}
 
     def _sweep_progress(self, k: int, n: int):
@@ -639,9 +654,9 @@ class GraspByDescription(Generic, EasyResource):
         Run one grasp or reset to completion and return its summary; never raises.
 
         Grasp, in order of what is known: target (from the cached frame) -> executor skips its own first look;
-        target_xy (from a fresh table map) -> executor looks there and picks; sweep -> executor scans the whole
-        table, we build and save the map (AGENT3's map_from_frames) and pick from it. Each step needs the matching
-        executor entry point (AGENT1); without it the executor's own search (find_target) is used instead.
+        target_xy (from the live map) -> executor looks there and picks; sweep -> executor scans the whole table,
+        every frame updates the live map (through Rig.on_map_frame), and we pick from it. Each step needs the
+        matching executor entry point (AGENT1); without it the executor's own search (find_target) is used instead.
         chosen: {"label", "colour"} of the object decided on (map path); frame and sweep paths fill it here.
         The summary's "label" is that recognised library name and "colour" its colour, because the executor's
         own "label" falls back to the colour (VIAM CENTERAL: a blue screwdriver came back as "label": "black").
@@ -652,24 +667,19 @@ class GraspByDescription(Generic, EasyResource):
         try:
             rt = _runtime()
             rig = await self._get_rig()
+            # Every frame the executor takes from here on also updates the live map (AGENT1's hook in Rig.frame)
+            rig.on_map_frame = lambda rgb, depth, pose: self._on_map_frame(rig, rgb, depth, pose)
             if kind == "grasp":
                 params = inspect.signature(rt.executor.execute).parameters
                 if sweep and hasattr(rt.executor, "sweep_table"):
-                    self._sweeping = True
+                    self._sweeping = True  # sweep frames reach the live map through the hook, none dropped
                     try:
-                        frames = await rt.executor.sweep_table(rig, progress=self._sweep_progress)
+                        await rt.executor.sweep_table(rig, progress=self._sweep_progress)
                     finally:
                         self._sweeping = False
-                    if self.live is not None:
-                        # Every sweep frame into the live map, none dropped; then the map covers the whole table
-                        for fr in frames:
-                            self.live.offer(fr["rgb"], fr["depth"], fr["pose"], fr["intrinsics"], "sweep", keep=True)
-                        await self.live.drain()
-                        await self.live.mark_swept()
-                        m = self.live.map or {"objects": []}
-                    else:
-                        m = await asyncio.to_thread(rt.table_map.map_from_frames, frames, self.store)
-                        self.store.put_table_map(m)
+                    await self.live.drain()
+                    await self.live.mark_swept()  # the map now covers the whole table
+                    m = self.live.map or {"objects": []}
                     b = await asyncio.to_thread(rt.table_map.best_on_map, m, text, self.store)
                     if b.get("map_obj") is None or b.get("ambiguous"):
                         status = "ambiguous" if b.get("ambiguous") else "not_found"
@@ -767,14 +777,12 @@ class GraspByDescription(Generic, EasyResource):
             return {"ok": False, "accepted": False, "status": found["status"], "reason": found["reason"],
                     "decide_ms": found["decide_ms"], "via": "map"}
         if found is not None:
-            x, y = found["xy"]
             res = await self._start("grasp", text, wait, target_xy=found["xy"], decide_ms=found["decide_ms"],
                                     chosen={"label": found["label"], "colour": found.get("colour")})
             return {**res, "ok": bool(res.get("accepted")), "via": "map", "status_text": "going_to_map",
-                    "message": f"remembered at ({x:.0f}, {y:.0f}) on the table map, seen {found['seen_s_ago']:.0f} s ago"
-                               " · going there",
+                    "message": self._map_message(found) + " · going there",
                     "target_xy": found["xy"], "label": found["label"], "map_age_s": found["map_age_s"],
-                    "seen_s_ago": found["seen_s_ago"],
+                    "seen_s_ago": found["seen_s_ago"], "look_first": found["look_first"],
                     "decide_ms": found["decide_ms"]}
         has_sweep = hasattr(rt.executor, "sweep_table")
         res = await self._start("grasp", text, wait, sweep=True)

@@ -32,7 +32,8 @@ class LiveMap:
         if self.map:
             self.map.pop("age_s", None)
         self.swept_ts = float((self.map or {}).get("swept_ts") or 0.0)  # last whole-table sweep
-        self._takes_recognised = "recognised" in inspect.signature(update_fn).parameters
+        params = inspect.signature(update_fn).parameters
+        self._takes_recognised, self._takes_seg = "recognised" in params, "seg" in params
         self._newest = None  # newest droppable frame waiting for the worker
         self._keep = deque()  # (frame, future): frames that must all be applied, in order (sweep)
         self._keep_current: Optional[asyncio.Future] = None  # the keep frame being applied right now
@@ -44,9 +45,14 @@ class LiveMap:
 
     # ---- feeding --------------------------------------------------------------------------------------
 
-    def offer(self, rgb, depth, pose: dict, intr: dict, source: str, recognised=None, keep: bool = False) -> None:
-        """Queue one frame for update_map and return at once. keep=False: replaces a frame still waiting."""
-        frame = (rgb, depth, dict(pose), dict(intr), source, recognised)
+    def offer(self, rgb, depth, pose: dict, intr: dict, source: str, recognised=None, seg=None,
+              keep: bool = False) -> None:
+        """
+        Queue one frame for update_map and return at once. keep=False: replaces a frame still waiting.
+        recognised / seg: that frame's recognise_all / segment_full output when the caller has it (idle loop),
+        so update_map does not run them again.
+        """
+        frame = (rgb, depth, dict(pose), dict(intr), source, recognised, seg)
         if keep:
             self._keep.append((frame, asyncio.get_event_loop().create_future()))
         else:
@@ -85,8 +91,10 @@ class LiveMap:
 
     async def _apply(self, frame: tuple) -> None:
         """One update_map call in a worker thread; the result replaces the map, a failure is counted and skipped."""
-        rgb, depth, pose, intr, source, recs = frame
+        rgb, depth, pose, intr, source, recs, seg = frame
         kw = {"recognised": recs} if recs is not None and self._takes_recognised else {}
+        if seg is not None and self._takes_seg:
+            kw["seg"] = seg
         snapshot = self.map  # replaced, never mutated in place, so the reference is stable in the thread
         t0 = time.monotonic()
         try:
