@@ -11,9 +11,11 @@ Intruders (hands, arms) are reported separately so the executor can pause; see f
 
 Contract: docs/EXEC_PLAN.md (Obj, segment). segment_full() also returns intruders and the alignment used.
 """
+import json
 import math
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 from scipy import ndimage
@@ -30,9 +32,19 @@ IDENTITY = (1.0, 0.0, 0.0)  # align_color_depth on
 # {FRAME f01 2026-10-29 overlay test} {PICK_PLACE_AUTO.PY "SAME BLOCK SEEN AT COLOUR (767,284) AND DEPTH (707,306)"}
 # [CONFIDENCE: SINGLE-SRC 75% — one frame at ~378 mm; parallax makes the shift depth dependent]
 UNALIGNED = (1.35, 37.0, -3.0)
-GRIPPER_BAND_V = 640  # fingers / held object occupy the image below this row (colour grid)
-GRIPPER_U = (400, 1280)  # ... and these columns
+# Fingertips seen by the wrist camera (colour grid). A held object needs no mask: it is inside the depth
+# blind range. A full-width bottom band here once erased a block sitting in the square near the bottom.
+# {FRAMES 2026-10-29 "CLOSED FINGERS (830,673)+(891,677)" "OPEN FINGERS (555,697)+(1181,696)"}
+# [CONFIDENCE: CONFIRMED 85% — finger pixels measured by AGENT1; boxes padded ~60 px]
+FINGER_BOXES = ((480, 640, 640, 720), (1100, 640, 1280, 720), (770, 630, 950, 720))
 DEPTH_LEFT_INVALID_U = 60  # RealSense depth is invalid in a band at its left edge (stereo baseline)
+# Hysteresis: an object is a connected region > GROW_HEIGHT_MM that contains a seed > MIN_HEIGHT_MM.
+# A phone (~7 mm body, glossy) and a laptop came out as separate 9-10 mm fragments with one threshold;
+# growing through their low bodies joins each into one object, which then touches the edge and is excluded.
+GROW_HEIGHT_MM = 3.0
+EDGE_MARGIN_PX = 8  # an object this close to the image border is cut off: excluded, not a target
+# Optional workspace polygon in colour pixels at the observe pose: [[u, v], ...]; absent = whole image
+WORKSPACE_FILE = Path(__file__).resolve().parent.parent / "data" / "workspace.json"
 INTRUDER_MIN_AREA_PX = 6000  # blind-range hole this large could be a hand
 SKIN_FRAC = 0.30  # fraction of skin-coloured pixels that turns a hole or blob into an intruder
 # An intruder must reach this far into the image: a hand reaching for an object does, while static tall
@@ -45,6 +57,28 @@ def _reaches_inside(bbox: tuple, shape: tuple) -> bool:
     u0, v0, u1, v1 = bbox
     m, (h, w) = INTRUDER_INNER_MARGIN_PX, shape
     return u1 > m and u0 < w - m and v1 > m and v0 < h - m
+
+
+def _mask_fingers(img: np.ndarray) -> None:
+    """Zero the fingertip boxes in place (labels or bool masks on the colour grid)."""
+    for u0, v0, u1, v1 in FINGER_BOXES:
+        img[v0:v1, u0:u1] = 0
+
+
+def load_workspace():
+    """Workspace polygon [(u, v), ...] from data/workspace.json, or None (whole image)."""
+    if WORKSPACE_FILE.exists():
+        return [tuple(p) for p in json.loads(WORKSPACE_FILE.read_text())]
+    return None
+
+
+def _inside(poly, u: float, v: float) -> bool:
+    """Ray-casting point-in-polygon test."""
+    inside = False
+    for (u1, v1), (u2, v2) in zip(poly, poly[1:] + poly[:1]):
+        if (v1 > v) != (v2 > v) and u < (u2 - u1) * (v - v1) / (v2 - v1) + u1:
+            inside = not inside
+    return inside
 
 
 @dataclass
@@ -66,7 +100,8 @@ class Obj:
 @dataclass
 class Segmentation:
     table_depth_mm: float  # fitted plane at the image centre
-    objects: list
+    objects: list  # fully visible, inside the workspace: the only things the arm may target
+    excluded: list  # [(Obj, reason)]: cut by the image border or outside the workspace (debug / dashboard)
     intruders: list  # [{"bbox", "area", "reason"}]: pause the arm while non-empty
     align: tuple  # depth -> colour model that was used (IDENTITY or UNALIGNED)
     plane: tuple  # (a, b, c): table depth = a*u + b*v + c on the depth grid
@@ -191,8 +226,9 @@ def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple) -> list:
     hole = ndimage.binary_opening(~valid, iterations=6)
     hole[:, :DEPTH_LEFT_INVALID_U] = False
     hole = to_colour(hole, model)
-    hole[GRIPPER_BAND_V:, GRIPPER_U[0]:GRIPPER_U[1]] = False
+    _mask_fingers(hole)
     lab, n = ndimage.label(hole)
+    H = hole.shape[0]
     out = []
     for i in range(1, n + 1):
         m = lab == i
@@ -201,6 +237,9 @@ def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple) -> list:
             continue
         vs, us = np.nonzero(m)
         bbox = (int(us.min()), int(vs.min()), int(us.max()), int(vs.max()))
+        # Attached to the bottom edge under the gripper = the held object itself, not a person
+        if bbox[3] >= H - 3 and 450 <= us.mean() <= 1280:
+            continue
         sk = skin_fraction(rgb, m)
         if sk >= SKIN_FRAC and _reaches_inside(bbox, m.shape):
             out.append({"bbox": bbox, "area": area, "reason": f"blind-range hole, skin {sk:.0%}"})
@@ -223,18 +262,25 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
     table = valid & (np.abs(height) < 3)
     model = align if align is not None else _startup_alignment(rgb, above, table)
 
-    lab_d, n = ndimage.label(above)
+    # Grow seeds (> MIN_HEIGHT_MM) through low pixels (> GROW_HEIGHT_MM) so one thing is one object
+    low = ndimage.binary_opening(valid & (height > GROW_HEIGHT_MM) & (height < 300), iterations=2) | above
+    grp, n = ndimage.label(low)
+    seeded = np.zeros(n + 1, bool)
+    seeded[np.unique(grp[above])] = True
+    seeded[0] = False
+    lab_d = np.where(seeded[grp], grp, 0)
     lab_c = to_colour(lab_d, model)
-    lab_c[GRIPPER_BAND_V:, GRIPPER_U[0]:GRIPPER_U[1]] = 0
+    _mask_fingers(lab_c)
     H, W = d.shape
-    objs, intruders = [], []
+    poly = load_workspace()
+    objs, excluded, intruders = [], [], []
     for i in range(1, n + 1):
         m_d = lab_d == i
         if m_d.sum() < MIN_AREA_PX:
             continue
         m = lab_c == i
         if m.sum() < MIN_AREA_PX // 2:
-            continue  # mapped outside the colour view or into the gripper zone
+            continue  # mapped outside the colour view or onto the fingertips
         top_h = float(np.percentile(height[m_d], 90))
         vs, us = np.nonzero(m)
         bbox = (int(us.min()), int(vs.min()), int(us.max()), int(vs.max()))
@@ -250,13 +296,24 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         mu, mv = int((u1 - u0) * CROP_MARGIN) + 4, int((v1 - v0) * CROP_MARGIN) + 4
         crop = rgb[max(0, v0 - mv):min(H, v1 + mv + 1), max(0, u0 - mu):min(W, u1 + mu + 1)].copy()
         cen, yaw, L, Wd = _geometry(m)
-        objs.append(Obj(id=len(objs), bbox=bbox, centroid_px=cen, yaw_deg=yaw, length_px=L, width_px=Wd,
-                        height_mm=top_h, top_depth_mm=float(np.percentile(d[m_d], 10)), mask=m, crop=crop,
-                        touches_edge=u0 <= 2 or v0 <= 2 or u1 >= W - 3 or v1 >= H - 3,
-                        colour=colour_name(rgb, m)[0]))
+        e = EDGE_MARGIN_PX
+        edge = u0 <= e or v0 <= e or u1 >= W - 1 - e or v1 >= H - 1 - e
+        o = Obj(id=0, bbox=bbox, centroid_px=cen, yaw_deg=yaw, length_px=L, width_px=Wd, height_mm=top_h,
+                top_depth_mm=float(np.percentile(d[m_d], 10)), mask=m, crop=crop, touches_edge=edge,
+                colour=colour_name(rgb, m)[0])
+        # Only fully visible objects inside the workspace are targets; the rest is kept for display/debug
+        if edge:
+            excluded.append((o, "touches the image edge"))
+        elif poly and not _inside(poly, *cen):
+            excluded.append((o, "outside the workspace"))
+        else:
+            o.id = len(objs)
+            objs.append(o)
+    for k, (o, _) in enumerate(excluded):
+        o.id = -1 - k  # negative ids never collide with targets
     intruders += find_intruders(rgb, valid, model)
-    return Segmentation(table_depth_mm=float(a * W / 2 + b * H / 2 + c), objects=objs, intruders=intruders,
-                        align=model, plane=(a, b, c))
+    return Segmentation(table_depth_mm=float(a * W / 2 + b * H / 2 + c), objects=objs, excluded=excluded,
+                        intruders=intruders, align=model, plane=(a, b, c))
 
 
 def segment(rgb: np.ndarray, depth: np.ndarray) -> tuple:
