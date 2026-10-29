@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pymongo
+viam-sdk
+numpy
+pillow
+scipy

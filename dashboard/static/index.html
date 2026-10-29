@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sorter Dashboard</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
+    --ok: #1f8a4c; --bad: #c4372c; --warn: #b7791f; --accent: #2457d6; --chip: #efeee9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141413; --panel: #1e1e1c; --ink: #ecebe6; --muted: #9a988f; --line: #2f2e2b;
+            --ok: #4cc07a; --bad: #ef6b5f; --warn: #e0a64a; --accent: #7aa2ff; --chip: #2a2927; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line);
+           flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0 8px 0 0; letter-spacing: .2px; }
+  .pill { padding: 3px 10px; border-radius: 999px; background: var(--chip); color: var(--muted); font-size: 12px; }
+  .pill.ok { color: var(--ok); } .pill.bad { color: var(--bad); } .pill.warn { color: var(--warn); }
+  main { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px;
+         max-width: 1500px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 10px; }
+  #cam { width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #000; border-radius: 8px; display: block; }
+  #camnote { color: var(--muted); font-size: 12px; margin-top: 6px; min-height: 18px; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; }
+  input[type=text] { flex: 1 1 220px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+                     background: var(--bg); color: var(--ink); font-size: 15px; }
+  button { padding: 9px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--chip);
+           color: var(--ink); font-size: 14px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #msg { min-height: 20px; color: var(--muted); font-size: 12px; margin-top: 6px; }
+  ul.cmds { list-style: none; margin: 10px 0 0; padding: 0; }
+  ul.cmds li { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--chip); white-space: nowrap; }
+  .badge.pending { color: var(--warn); } .badge.running { color: var(--accent); }
+  .badge.done { color: var(--ok); } .badge.failed, .badge.not_found, .badge.error { color: var(--bad); }
+  .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
+  .kpi { background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+  .kpi b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+  .kpi span { color: var(--muted); font-size: 12px; }
+  svg text { fill: var(--muted); font-size: 11px; }
+  .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .sw { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 5px; }
+  .full { grid-column: 1 / -1; }
+  .tablewrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-top: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; border-top: 0; }
+  td img { height: 54px; border-radius: 4px; display: block; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  iframe { width: 100%; height: 360px; border: 0; border-radius: 8px; background: var(--bg); }
+  .bars div { display: grid; grid-template-columns: 120px 1fr 60px; gap: 8px; align-items: center; margin: 4px 0; font-size: 12px; }
+  .bar { height: 8px; border-radius: 4px; background: var(--chip); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sorter Dashboard</h1>
+  <span id="p-atlas" class="pill">Atlas …</span>
+  <span id="p-cam" class="pill">Camera …</span>
+  <span id="p-perc" class="pill">Perception …</span>
+</header>
+<main>
+  <section class="card">
+    <h2>What the arm sees</h2>
+    <img id="cam" alt="live camera">
+    <div id="camnote"></div>
+  </section>
+
+  <section class="card">
+    <h2>Command</h2>
+    <form id="f">
+      <input id="t" type="text" placeholder="grasp green square" autocomplete="off" maxlength="200">
+      <button class="primary" type="submit">Grasp</button>
+      <button type="button" id="b-prev">Preview</button>
+      <button type="button" id="b-reset">Clear square</button>
+    </form>
+    <div id="msg"></div>
+    <ul class="cmds" id="cmds"></ul>
+  </section>
+
+  <section class="card">
+    <h2>Success rate</h2>
+    <div class="kpis">
+      <div class="kpi"><b id="k-n">–</b><span>attempts</span></div>
+      <div class="kpi"><b id="k-rate">–</b><span>success</span></div>
+      <div class="kpi"><b id="k-time">–</b><span>mean time (success)</span></div>
+    </div>
+    <svg id="chart" viewBox="0 0 520 180" width="100%" role="img" aria-label="success rate over attempts"></svg>
+    <div class="legend"><span><i class="sw" style="background:var(--accent)"></i>cumulative</span>
+      <span><i class="sw" style="background:var(--ok)"></i>last 10</span></div>
+  </section>
+
+  <section class="card">
+    <h2>By object</h2>
+    <div class="bars" id="bars"><span class="muted">no attempts yet</span></div>
+  </section>
+
+  <section class="card full" id="charts-card" hidden>
+    <h2>Atlas Charts</h2>
+    <div id="charts"></div>
+  </section>
+
+  <section class="card full">
+    <h2>Attempts</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Time</th><th>Mode</th><th>Asked</th><th>Picked</th><th>Score</th><th>Result</th>
+          <th>Fail phase</th><th>Seconds</th><th>Before</th><th>After</th></tr></thead>
+        <tbody id="att"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; };
+const hhmm = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"}) : "";
+const pct = (x) => x == null ? "–" : Math.round(x * 100) + "%";
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  return r.json();
+}
+function setPill(id, text, cls) { const p = $(id); p.textContent = text; p.className = "pill " + (cls || ""); }
+
+// Camera: swap in a new frame only once it has loaded, so the image never flickers
+let camBusy = false;
+function refreshCam() {
+  if (camBusy) return;
+  camBusy = true;
+  const img = new Image();
+  img.onload = () => { $("cam").src = img.src; camBusy = false; };
+  img.onerror = () => { camBusy = false; };
+  img.src = "/api/snapshot.jpg?t=" + Date.now();
+}
+
+async function refreshStatus() {
+  try {
+    const s = await api("/api/status");
+    const q = Object.values(s.queued).reduce((a, b) => a + b, 0);
+    setPill("p-atlas", s.atlas ? "Atlas online" : `Atlas offline · ${q} queued locally`, s.atlas ? "ok" : "warn");
+    const c = s.camera;
+    setPill("p-cam", c.connected ? `Camera live · ${c.frame_age_s ?? "–"} s` : "Camera reconnecting", c.connected ? "ok" : "bad");
+    setPill("p-perc", c.perception ? `Perception · ${c.objects} objects` : "Perception off", c.perception ? "ok" : "warn");
+    $("camnote").textContent = c.error || c.perception_error || "";
+    const box = $("charts");
+    if (s.charts.length && !box.childElementCount) {
+      $("charts-card").hidden = false;
+      for (const u of s.charts) { const f = el("iframe"); f.src = u; box.appendChild(f); }
+    }
+  } catch (e) { setPill("p-atlas", "dashboard server unreachable", "bad"); }
+}
+
+async function refreshCommands() {
+  const list = await api("/api/commands?limit=12");
+  const ul = $("cmds"); ul.replaceChildren();
+  for (const c of list) {
+    const li = el("li");
+    const left = el("div");
+    left.appendChild(el("div", c.text === "__reset__" ? "Clear square" : c.text));
+    const chosen = c.chosen ? `picked ${c.chosen.label ?? "#" + c.chosen.id}${c.chosen.score != null ? " · " + Number(c.chosen.score).toFixed(2) : ""}` : "";
+    left.appendChild(el("div", [hhmm(c.ts), chosen].filter(Boolean).join(" · "), "muted"));
+    li.appendChild(left);
+    li.appendChild(el("span", c.status, "badge " + c.status));
+    ul.appendChild(li);
+  }
+  if (!list.length) ul.appendChild(el("li", "No commands yet", "muted"));
+}
+
+function drawChart(series) {
+  const svg = $("chart"), W = 520, H = 180, L = 34, R = 8, T = 10, B = 24;
+  const ns = "http://www.w3.org/2000/svg";
+  const mk = (tag, attrs) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+  svg.replaceChildren();
+  const x = (i) => L + (series.length > 1 ? (i - 1) / (series.length - 1) : 0.5) * (W - L - R);
+  const y = (v) => T + (1 - v) * (H - T - B);
+  for (const v of [0, 0.5, 1]) {
+    svg.appendChild(mk("line", {x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: "var(--line)"}));
+    const t = mk("text", {x: L - 6, y: y(v) + 4, "text-anchor": "end"}); t.textContent = Math.round(v * 100) + "%"; svg.appendChild(t);
+  }
+  if (!series.length) { const t = mk("text", {x: W / 2, y: H / 2, "text-anchor": "middle"}); t.textContent = "no attempts yet"; svg.appendChild(t); return; }
+  const path = (key) => series.map((p, k) => (k ? "L" : "M") + x(p.i).toFixed(1) + " " + y(p[key]).toFixed(1)).join(" ");
+  svg.appendChild(mk("path", {d: path("roll10"), fill: "none", stroke: "var(--ok)", "stroke-width": 2}));
+  svg.appendChild(mk("path", {d: path("cum_rate"), fill: "none", stroke: "var(--accent)", "stroke-width": 2.5}));
+  for (const p of series) svg.appendChild(mk("circle", {cx: x(p.i), cy: p.success ? T + 2 : H - B - 2, r: 2.5, fill: p.success ? "var(--ok)" : "var(--bad)"}));
+  const t = mk("text", {x: W - R, y: H - 6, "text-anchor": "end"}); t.textContent = `attempt ${series.length}`; svg.appendChild(t);
+}
+
+async function refreshStats() {
+  const s = await api("/api/stats");
+  $("k-n").textContent = s.n; $("k-rate").textContent = pct(s.rate);
+  $("k-time").textContent = s.mean_success_s ? s.mean_success_s.toFixed(0) + " s" : "–";
+  drawChart(s.series);
+  const bars = $("bars"); bars.replaceChildren();
+  for (const p of s.per_label) {
+    const row = el("div"); row.appendChild(el("span", p.label));
+    const bar = el("div", null, "bar"); const fill = el("i"); fill.style.width = (p.rate * 100) + "%"; bar.appendChild(fill);
+    row.appendChild(bar); row.appendChild(el("span", `${p.ok}/${p.n}`, "muted")); bars.appendChild(row);
+  }
+  if (!s.per_label.length) bars.appendChild(el("span", "no attempts yet", "muted"));
+}
+
+async function refreshAttempts() {
+  const list = await api("/api/attempts?limit=30");
+  const tb = $("att"); tb.replaceChildren();
+  for (const a of list) {
+    const tr = el("tr");
+    const cells = [hhmm(a.ts), a.mode ?? "", a.target_text ?? "", a.label ?? "", a.score != null ? Number(a.score).toFixed(2) : ""];
+    for (const c of cells) tr.appendChild(el("td", c));
+    tr.appendChild(el("td", a.success ? "success" : "fail", a.success ? "ok" : "bad"));
+    tr.appendChild(el("td", a.fail_phase ? `${a.fail_phase}${a.fail_reason ? ": " + a.fail_reason : ""}` : ""));
+    tr.appendChild(el("td", a.duration_s != null ? Number(a.duration_s).toFixed(0) : ""));
+    for (const f of ["img_before", "img_after"]) {
+      const td = el("td");
+      if (a[f]) { const i = el("img"); i.loading = "lazy"; i.alt = f; i.src = `/api/image/attempts/${encodeURIComponent(a._id)}/${f}`; td.appendChild(i); }
+      tr.appendChild(td);
+    }
+    tb.appendChild(tr);
+  }
+  if (!list.length) { const tr = el("tr"); const td = el("td", "No attempts yet", "muted"); td.colSpan = 10; tr.appendChild(td); tb.appendChild(tr); }
+}
+
+async function send(text) {
+  const r = await api("/api/commands", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text})});
+  refreshCommands();
+  return r;
+}
+$("f").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = $("t").value.trim();
+  if (!text) return;
+  try { await send(text); $("msg").textContent = `queued: "${text}"`; $("t").value = ""; }
+  catch (err) { $("msg").textContent = "error: " + err.message; }
+});
+$("b-reset").addEventListener("click", async () => {
+  try { await send("__reset__"); $("msg").textContent = "queued: clear the blue square"; }
+  catch (err) { $("msg").textContent = "error: " + err.message; }
+});
+$("b-prev").addEventListener("click", async () => {
+  const text = $("t").value.trim();
+  if (!text) { $("msg").textContent = "type what to grasp first"; return; }
+  try {
+    const r = await api("/api/preview", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text})});
+    $("msg").textContent = "best match: " + r.slice(0, 3).map((o) => `#${o.id} ${o.score.toFixed(2)}`).join(", ");
+    refreshCam();
+  } catch (err) { $("msg").textContent = "preview: " + err.message; }
+});
+
+const safe = (fn) => () => fn().catch(() => {});
+refreshCam(); refreshStatus(); safe(refreshCommands)(); safe(refreshStats)(); safe(refreshAttempts)();
+setInterval(refreshCam, 1000);
+setInterval(refreshStatus, 2000);
+setInterval(safe(refreshCommands), 1500);
+setInterval(safe(refreshStats), 3000);
+setInterval(safe(refreshAttempts), 3000);
+</script>
+</body>
+</html>

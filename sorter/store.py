@@ -50,6 +50,15 @@ def _small_jpeg(data: bytes) -> bytes:
     return out.getvalue()
 
 
+def _with_date(doc: dict) -> dict:
+    """Add `at` (a BSON Date from `ts`) for Atlas: Charts can bin time only on Date fields, not epoch floats."""
+    from datetime import datetime, timezone
+
+    if isinstance(doc.get("ts"), (int, float)):
+        doc["at"] = datetime.fromtimestamp(doc["ts"], timezone.utc)
+    return doc
+
+
 def _cosine01(matrix: np.ndarray, q: np.ndarray) -> np.ndarray:
     """Cosine similarity mapped to [0, 1] as (1 + cos) / 2, the same scale Atlas reports for cosine indexes."""
     m = matrix / np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
@@ -137,7 +146,7 @@ class Store:
             if field in doc:
                 doc[field] = self._image_in(doc[field])
         if self.online:
-            self.db[coll].insert_one(doc)
+            self.db[coll].insert_one(_with_date(doc))
         else:
             self._append(coll, doc)
         return doc["_id"]
@@ -296,7 +305,7 @@ class Store:
                     img = d.get(field)
                     if isinstance(img, dict) and "path" in img and (self.data / img["path"]).exists():
                         d[field] = {"jpeg": Binary((self.data / img["path"]).read_bytes())}
-                self.db[coll].replace_one({"_id": d["_id"]}, d, upsert=True)
+                self.db[coll].replace_one({"_id": d["_id"]}, _with_date(d), upsert=True)
             if docs:
                 self._file(coll).rename(self.data / f"{coll}.jsonl.flushed-{int(time.time())}")
             counts[coll] = len(docs)
