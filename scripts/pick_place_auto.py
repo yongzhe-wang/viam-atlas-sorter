@@ -59,7 +59,8 @@ TOL_PX = 7.0
 # hangs into the bottom-right (it hid the hole twice on 2026-10-29); then one J^-1 step to the real target
 CARRY_OFFSET_PX = (-276.0, -232.0)
 GRAB_TRIES = 3  # first grab + 2 retries
-SETTLE_S = 1.0  # wait after every move before trusting a camera frame
+# Wait after every move before trusting a camera frame: the lag test measured ~0.5 s of stale frames
+SETTLE_S = 0.6
 # Jaw-axis model fitted from released blocks (data/jaw_calib.json); None until `jaw_calib.py fit` has run
 JAW_CAL = jaw_calib.load()
 
@@ -409,6 +410,7 @@ class Rig:
         self.last_depth = None  # depth map of the latest frame(), for finders that need it
         self.last_pose = None  # latest pose read, for status reports
         self.status = None  # "reconnecting" / "paused_person" while that is happening, else None
+        self.on_frame = None  # optional recorder(phase, rgb, meta), set per attempt by sorter.executor
 
     async def connect(self) -> None:
         # The SDK's own reconnect loop is off: it fought call()'s backoff, and its native layer can abort the
@@ -494,6 +496,15 @@ class Rig:
     async def pose(self):
         self.last_pose = await self.call("get pose", lambda: self.arm.get_end_position())
         return self.last_pose
+
+    def record(self, phase: str, rgb: np.ndarray, **meta) -> None:
+        """Hand a frame already grabbed to the attempt recorder (no extra photos); never fails the motion."""
+        if self.on_frame is None:
+            return
+        try:
+            self.on_frame(phase, rgb, meta)
+        except Exception as e:
+            print(f"  recording failed: {e}")
 
     async def open(self) -> None:
         await self.call("open", lambda: self.gripper.open())
@@ -599,7 +610,7 @@ class Rig:
         J^-1 (-offset) with the last measured Jacobian. Used while carrying: the held object covers the
         bottom-right of the image, where the axis pixel is, so the square is aligned somewhere visible.
         """
-        J = None
+        J, prev_err = None, None
         for it in range(8):
             p = await self.pose()
             rgb, depth = await self.frame()
@@ -616,6 +627,8 @@ class Rig:
             tu, tv = tu + offset[0], tv + offset[1]
             e = np.array([hit[0] - tu, hit[1] - tv])
             print(f"  {label} iter {it}: px=({hit[0]:.0f},{hit[1]:.0f}) want=({tu:.0f},{tv:.0f}) depth={plane:.0f} err={np.linalg.norm(e):.0f}px")
+            self.record(label, rgb, iter=it, px=[round(hit[0]), round(hit[1])], want=[round(tu), round(tv)],
+                        err_px=round(float(np.linalg.norm(e)), 1), depth_mm=round(float(plane)))
             if np.linalg.norm(e) < TOL_PX and (J is not None or not any(offset)):
                 if any(offset):
                     # Final blind step from the visible alignment point onto the real axis pixel
@@ -623,6 +636,17 @@ class Rig:
                     print(f"  {label}: offset step ({move[0]:.0f},{move[1]:.0f}) mm")
                     await self.goto(p.x + move[0], p.y + move[1], p.z)
                 return
+            # Reuse the Jacobian measured earlier in this servo while the error keeps shrinking: the probes
+            # (two moves + two settles each) were most of the servo time
+            if J is not None and prev_err is not None and np.linalg.norm(e) < 0.8 * prev_err:
+                prev_err = float(np.linalg.norm(e))
+                move = np.linalg.solve(J, -e) * 0.85
+                n = np.linalg.norm(move)
+                if n > 60:
+                    move *= 60 / n
+                await self.goto(p.x + move[0], p.y + move[1], p.z)
+                continue
+            prev_err = float(np.linalg.norm(e))
             # Probe +15 mm along arm x then y, record how the target moves in the image
             probe = 15.0
             cols = []
@@ -713,11 +737,16 @@ class Rig:
             await asyncio.sleep(0.5)
 
     async def descend(self, z_target: float) -> None:
-        """Straight down in <=50 mm steps so a wrong target can be interrupted before contact."""
+        """
+        Straight down to z_target, in as few moves as MAX_STEP_MM allows (one, in practice).
+
+        Was 50 mm steps; the hand pause (wait_clear) runs before every descent and goto() still enforces the
+        measured floor, so the steps only added move/settle time.
+        """
         p = await self.pose()
         z = p.z
         while z > z_target + 0.5:
-            z = max(z_target, z - 50.0)
+            z = max(z_target, z - (MAX_STEP_MM - 10.0))
             await self.goto(p.x, p.y, z)
 
 
@@ -877,6 +906,11 @@ SEARCH_XY = [(x, y) for x in (250.0, 380.0, 500.0) for y in (-300.0, -150.0, 0.0
              if 150.0 <= math.hypot(x, y) <= 600.0]
 SQUARE_CLEAR_PX = 145.0  # ~60 mm at the 378 mm observe depth (~2.4 px/mm)
 SPOT_MIN_H_MM = 4.0  # anything this far above the fitted table plane occupies a drop spot
+# One clearance radius for the live check (spot_free) and the survey map (survey_scan): ~83 mm at the 378 mm
+# table depth = block half-length ~45 mm + ~40 mm gap. They differed (220 vs 150 px), so the survey offered
+# spots the live check had to reject.
+SPOT_CLEAR_PX = 200.0
+REJECTED_DIR = Path(__file__).resolve().parent.parent / "data" / "scan" / "rejected"
 
 
 # Horizontal reach of the tool around the flange axis: camera body ~85 mm out (cam frame -83, 14) plus its
@@ -955,7 +989,7 @@ def near_square(rgb: np.ndarray, uv, radius: float = SQUARE_CLEAR_PX) -> bool:
     return bool(((blue | paper) & disk).sum() > 400)
 
 
-def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = 220.0) -> tuple:
+def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = SPOT_CLEAR_PX) -> tuple:
     """
     (free?, reason) for putting an object down where pixel `uv` meets the table.
 
@@ -996,6 +1030,20 @@ def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = 220.0) -> 
     return True, "clear"
 
 
+def save_rejected(rgb: np.ndarray, depth: np.ndarray, uv, x: float, y: float, why: str) -> None:
+    """Keep the frame of a refused drop spot (jpg + depth + json) so a false rejection can be inspected."""
+    import json
+
+    try:
+        REJECTED_DIR.mkdir(parents=True, exist_ok=True)
+        stem = REJECTED_DIR / time.strftime("%H%M%S")
+        Image.fromarray(rgb).save(f"{stem}.jpg", quality=85)
+        np.save(f"{stem}_depth.npy", np.clip(depth, 0, 65535).astype(np.uint16))
+        Path(f"{stem}.json").write_text(json.dumps({"xy": [x, y], "uv": [float(uv[0]), float(uv[1])], "why": why}))
+    except OSError as e:
+        print(f"  could not save rejected spot frame: {e}")
+
+
 async def search_square(rig: Rig) -> None:
     """
     Leave the arm at ALIGN_Z with the whole tape hole in view; raise if it is nowhere on the table.
@@ -1018,16 +1066,16 @@ async def search_square(rig: Rig) -> None:
     raise RuntimeError("square: not found anywhere on the table")
 
 
-async def travel(rig: Rig, x: float, y: float, theta: float = None) -> None:
-    """Move at ALIGN_Z to (x, y) in legs short enough for the MAX_STEP_MM guard."""
+async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = ALIGN_Z) -> None:
+    """Move at height z (default ALIGN_Z) to (x, y) in legs short enough for the MAX_STEP_MM guard."""
     if not allowed(x, y):
         raise RuntimeError(f"refusing ({x:.0f},{y:.0f}): inside an obstacle keep-out zone")
     p = await rig.pose()
-    if p.z < ALIGN_Z - 1:
-        await rig.goto(p.x, p.y, ALIGN_Z)
+    if p.z < z - 1:
+        await rig.goto(p.x, p.y, z)
     legs = max(1, math.ceil(math.hypot(x - p.x, y - p.y) / 200.0))
     for i in range(1, legs + 1):
-        await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, ALIGN_Z, theta=theta)
+        await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, z, theta=theta)
 
 
 async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> bool:
@@ -1044,10 +1092,10 @@ async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> 
         return False
     table, _ = table_and_near(depth)
     hint = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
-    # ~220 px is ~90 mm at ALIGN_Z: keeps the open jaws (84 mm stroke) clear of neighbours
     free, why = spot_free(rgb, depth, hint)
     if not free:
         print(f"  spot ({x:.0f},{y:.0f}) not free: {why}")
+        save_rejected(rgb, depth, hint, x, y, why)
         return False
     await release_here(rig, height, grip)
     return True

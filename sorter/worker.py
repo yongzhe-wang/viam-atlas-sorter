@@ -28,7 +28,7 @@ async def beat(store, rig, current: dict) -> None:
             p = rig.last_pose
             store.heartbeat(executor.WORKER_ID, executor.phase_now(rig),
                             holding=executor.ppa.load_state().get("holding"), error=executor.STATE.get("error"),
-                            command_id=current.get("id"),
+                            command_id=current.get("id"), sweep=executor.STATE.get("sweep"),
                             pose=None if p is None else {"x": round(p.x), "y": round(p.y), "z": round(p.z)})
         except Exception as e:
             print(f"heartbeat failed: {e}")

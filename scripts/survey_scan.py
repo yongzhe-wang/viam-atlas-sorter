@@ -33,7 +33,7 @@ GRID_X = (220.0, 310.0, 400.0, 490.0)
 GRID_Y = (-330.0, -240.0, -150.0, -60.0, 30.0, 120.0, 210.0, 300.0)
 MERGE_MM = 60.0  # objects closer than this across frames are the same object
 FREE_STEP_PX = 40  # candidate spacing for free spots in each frame
-FREE_CLEAR_PX = 150.0  # ~60 mm at the table depth seen from z=400: object/paper clearance
+FREE_CLEAR_PX = ppa.SPOT_CLEAR_PX  # same clearance as the live check (pick_place_auto.spot_free)
 REACH = (150.0, 600.0)  # flange distance from the base the arm has used safely
 VETO_MM = 15.0  # a "not free" sample this close to a free one (another frame, same place) vetoes it
 

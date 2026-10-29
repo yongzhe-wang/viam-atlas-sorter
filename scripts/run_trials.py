@@ -164,6 +164,11 @@ async def main(n: int) -> None:
     rig = ppa.Rig()
     await rig.start()
     results = []
+    # Same 2 s heartbeat as the worker, so the dashboard's arm panel shows trial phases too
+    beater = None
+    if store is not None and hasattr(store, "heartbeat"):
+        from sorter.worker import beat
+        beater = asyncio.create_task(beat(store, rig, {"id": f"trials:{run_id}"}))
     try:
         # Obstacles (walls) shrink the search grid and reset area; ranges are printed for the log
         await executor.apply_limits(rig)
@@ -193,6 +198,8 @@ async def main(n: int) -> None:
             print(f"reset: {cleared['status']} removed={cleared['removed']} wipes={cleared['wipes']} {cleared['duration_s']}s")
         await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
     finally:
+        if beater is not None:
+            beater.cancel()
         await rig.close()
         ok = [d for d in results if d["success"]]
         if results:
