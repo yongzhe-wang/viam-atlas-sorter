@@ -327,8 +327,9 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
     seeded[np.unique(grp[above])] = True
     seeded[0] = False
     lab_d = np.where(seeded[grp] & low, grp, 0)
+    # No fingertip mask for objects: the fingers are ~140 mm from the camera, inside the depth blind range, so they
+    # never become objects; masking them erased a real 30 mm cube that a z=500 sweep saw in that corner
     lab_c = to_colour(lab_d, model)
-    _mask_fingers(lab_c)
     H, W = d.shape
     table_depth = float(a * W / 2 + b * H / 2 + c)
     ascale = area_scale(table_depth)

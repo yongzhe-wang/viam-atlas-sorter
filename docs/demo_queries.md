@@ -7,7 +7,7 @@ otherwise.
 | # | Query | Expected | Checked on arm-scan frames (score / lead over runner-up) |
 |---|---|---|---|
 | 1 | `grasp green square` | green cube (not the green cylinder next to it) | 3/3, 0.52–0.53 / 0.33–0.37 |
-| 2 | `pick up the yellow block` | yellow block | 4/4, 0.51–0.54 / ≥ 0.37 (old and moved position) |
+| 2 | `pick up the yellow block` | yellow block | 4/4, ≥ 0.37 lead (frames where it is fully in view) |
 | 3 | `trick or treat: candy` | KIND bar ("candy" is an alias) | 3/3, 0.37–0.38 / 0.24–0.30 |
 | 4 | `the blue cylinder` | blue cylinder | 3/3, 0.47–0.51 / 0.25–0.28 |
 | 5 | `red ball` | refuses: "no red object found" | 3/3 refused |

@@ -100,7 +100,8 @@ def label(name: str, args: list) -> None:
 # Rehearsal queries (docs/demo_queries.md): (query, label the pick must be recognised as or None = must refuse,
 # arm-scan frames where the target is fully visible at z=400)
 DEMO = [("grasp green square", "green cube", ["033", "034", "035"]),
-        ("pick up the yellow block", "yellow block", ["006", "007", "036", "038"]),
+        # 006/007 dropped: the block is cut by the bottom edge there (an old fingertip mask hid that)
+        ("pick up the yellow block", "yellow block", ["036", "038", "066", "073"]),
         ("trick or treat: candy", "kind bar", ["014", "015", "035"]),
         ("the blue cylinder", "blue cylinder", ["010", "011", "012"]),
         ("red ball", None, ["032", "035", "036"])]
