@@ -221,7 +221,8 @@ def _pick_frame():
 
 @app.get("/")
 def index():
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
+    # no-cache: after a dashboard restart with new code, a plain reload must show it (a cached page did not)
+    return FileResponse(Path(__file__).parent / "static" / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/status")
@@ -441,7 +442,7 @@ def _set_map_highlight(res: dict, text: str) -> None:
 @app.get("/api/table_map")
 def table_map():
     """
-    Top-down table view: latest whole-table map (objects with table xy, no embeddings), each object's last
+    Top-down table view: the live table map (objects with table xy and age, no embeddings), each object's last
     sighting, and sweep progress. Module mode: from the module (via the robot link), ages on the robot's clock.
     """
     if MODULE_MODE:
@@ -460,6 +461,11 @@ def table_map():
         sweep = next((w.get("sweep") for w in workers() if w.get("online") and w.get("sweep")), None)
     if m:
         m["age_s"] = round(robot_now - (m.get("ts") or robot_now), 1)
+        # Live map: each object's own age (seen_ts); an older map without it -> the map's age for all
+        for o in m.get("objects") or []:
+            o["age_s"] = round(robot_now - (o.get("seen_ts") or m.get("ts") or robot_now), 1)
+        if m.get("swept_ts"):
+            m["swept_s_ago"] = round(robot_now - m["swept_ts"], 1)
     for s in sightings:
         s["age_s"] = round(robot_now - (s.get("ts") or robot_now), 1)
     hl = dict(_map_highlight) if _map_highlight.get("until", 0) > time.time() else None

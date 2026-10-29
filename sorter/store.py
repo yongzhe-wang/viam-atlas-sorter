@@ -454,16 +454,19 @@ class Store:
 
     TABLE_MAP_HISTORY = 10
 
-    def put_table_map(self, table_map: dict) -> None:
+    def put_table_map(self, table_map: dict, history: bool = True) -> None:
         """
         Save a whole-table map {ts, frames, objects, square?} as the latest, keeping the previous ones as a short
         history. Online: table_map collection ({_id: "latest"} + history docs); offline: data/table_map.json and
-        data/table_maps/<ts_ms>.json.
+        data/table_maps/<ts_ms>.json. history=False only replaces the latest: the module's live map is saved
+        every 2 s, which would otherwise push every sweep out of the history within 20 s.
         """
         doc = {**table_map, "ts": table_map.get("ts") or time.time()}
         doc.pop("_id", None)
         if self.online:
             self.db.table_map.replace_one({"_id": "latest"}, _with_date({**doc, "_id": "latest"}), upsert=True)
+            if not history:
+                return
             self.db.table_map.insert_one(_with_date({**doc, "_id": f"h-{int(doc['ts'] * 1000)}-{_new_id()[:6]}"}))
             old = list(self.db.table_map.find({"_id": {"$ne": "latest"}}, {"_id": 1}).sort("ts", -1)
                        .skip(self.TABLE_MAP_HISTORY))
@@ -472,6 +475,8 @@ class Store:
             return
         data = json.dumps(doc, default=str).encode()
         _write_atomic(self.data / "table_map.json", data)
+        if not history:
+            return
         hist = self.data / "table_maps"
         hist.mkdir(exist_ok=True)
         _write_atomic(hist / f"{int(doc['ts'] * 1000)}.json", data)

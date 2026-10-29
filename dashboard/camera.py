@@ -267,7 +267,7 @@ class ModuleBridge:
 
     STATUS_EVERY_S = 1.5
     SEEN_EVERY_S = 1.0  # the module's idle look runs about once a second
-    MAP_EVERY_S = 3.0  # the whole-table map changes only after a sweep; sightings every idle look
+    MAP_EVERY_S = 2.0  # the live map changes with every picture; the module saves it every 2 s, same pace here
     CMD_TIMEOUT_S = 15.0
     MAX_FAILURES = 5  # consecutive failed calls -> raise, so the connection is rebuilt
 

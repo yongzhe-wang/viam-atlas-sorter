@@ -20,9 +20,9 @@ DoCommand:
   {"grasp": "...", "wait": true}     same, but block until done -> the attempt summary
   {"preview": "green square"}        the same decision without moving: what would be picked, or why not
   {"reset": true}                    clear the square (pick-out, wipe fallback, verify empty)
-  {"status": true}                   busy / running / last / warm / seen / library / store mode
+  {"status": true}                   busy / running / last / warm / seen / library / store mode / live map stats
   {"seen_image": true}               last idle frame as base64 JPEG (<= 640 px) with the seen boxes scaled to it
-  {"table_map": true}                latest whole-table map (no embeddings), object sightings, sweep progress
+  {"table_map": true}                the live table map (no embeddings; each object's seen_ts), sightings, sweep progress
 One job at a time; a second request while busy returns {"accepted": false, "error": "busy"}.
 
 Config attributes (all optional except where the defaults don't match your machine):
@@ -62,6 +62,8 @@ from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
 from viam.utils import ValueTypes, struct_to_dict
 
+from module.live_map import LiveMap
+
 NAMESPACE = "sorter-team"  # must match "module_id" in meta.json; change both to your registry namespace
 LOGGER = getLogger(__name__)
 SUPPORTED_SQUARES = ("blue",)  # executor/pick_place_auto find the drop square by blue tape
@@ -81,7 +83,9 @@ SEEN_IMAGE_WIDTH = 640
 WARM_RETRY_S = 30.0
 TIMELAPSE_EVERY_S = 5.0  # rolling timelapse for a backup demo video: one frame every 5 s ...
 TIMELAPSE_KEEP_S = 2 * 3600.0  # ... kept for the last 2 hours
-MAP_FRESH_S = 60.0  # a whole-table map younger than this is trusted for "where is it" (VIAM CENTERAL)
+MAP_FRESH_S = 60.0  # a live-map object seen this recently is gone to directly; a sweep this recent covers the table
+MAP_PERSIST_S = 2.0  # live map -> Store.put_table_map at most this often (VIAM CENTERAL)
+MAP_TASK_EVERY_S = 1.0  # during a task, at most one executor frame per second goes to the live map (servo keeps CPU)
 
 
 def seed_library(bundle: Path, data: Path) -> str:
@@ -198,6 +202,10 @@ class GraspByDescription(Generic, EasyResource):
         self._seen_raw = None  # {"ts", "recs", "objs", "rgb", "depth", "pose"} behind self.seen, for a fast grasp
         self._jpeg_cache = (None, None, 1.0)  # (frame ts, base64 jpeg, scale) for seen_image
         self._look_lock = asyncio.Lock()  # one look at a time: the idle loop and a grasp that needs a fresh frame
+        self.live: Optional[LiveMap] = None  # the live table map, once warm and if AGENT3's update_map exists
+        self._intr: Optional[dict] = None  # camera intrinsics for update_map, read once through the Rig
+        self._sweeping = False  # sweep frames go to the live map losslessly after the sweep, not via the frame tap
+        self._task_map_at = 0.0  # when the last executor frame went to the live map
         self._no_target_warned = False
         self.timelapse_dir = (Path(module_data) if module_data else self.store.data) / "timelapse"
         loop = asyncio.get_event_loop()
@@ -231,6 +239,7 @@ class GraspByDescription(Generic, EasyResource):
         if self.attrs.get("tip_below_cam_mm"):
             ppa.TIP_BELOW_CAM = float(self.attrs["tip_below_cam_mm"])
         handles = (self.arm, self.camera, self.gripper)
+        svc = self
 
         class ModuleRig(ppa.Rig):
             async def connect(self) -> None:
@@ -243,10 +252,50 @@ class GraspByDescription(Generic, EasyResource):
             async def close(self) -> None:
                 return None  # viam-server owns these connections
 
+            async def frame(self) -> tuple:
+                rgb, depth = await super().frame()
+                await svc._map_task_frame(self, rgb, depth)  # executor frames update the live map too
+                return rgb, depth
+
         rig = ModuleRig()
         await rig.start()
         self.rig = rig
         return rig
+
+    async def _intrinsics(self) -> dict:
+        """Camera intrinsics {fx, fy, cx, cy} for update_map, read once (by the Rig, from the camera)."""
+        if self._intr is None:
+            rig = await self._get_rig()
+            self._intr = {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}
+        return self._intr
+
+    async def _map_task_frame(self, rig, rgb, depth) -> None:
+        """
+        A frame the executor just took during a task (ModuleRig.frame): offer it to the live map. At most one per
+        MAP_TASK_EVERY_S and only while no update is running, so the servo keeps its CPU and its pace; the pose
+        read it needs happens only for a frame that is used. Theta-0 frames only: pixel->world holds there.
+        Never raises: a map problem must not fail the motion.
+        """
+        try:
+            if (self.live is None or not self._busy() or self._sweeping or depth is None or self.live.busy()
+                    or time.time() - self._task_map_at < MAP_TASK_EVERY_S):
+                return
+            p = await rig.pose()
+            if abs(((p.theta + 180.0) % 360.0) - 180.0) > OBSERVE_TOL_DEG:
+                return
+            self._task_map_at = time.time()
+            self.live.offer(rgb, depth, {"x": p.x, "y": p.y, "z": p.z, "theta": p.theta},
+                            {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}, "task")
+        except Exception as e:
+            LOGGER.debug(f"live map: task frame skipped: {type(e).__name__}: {e}")
+
+    def _start_live_map(self) -> None:
+        """From warm-up on, one live map, if AGENT3's table_map.update_map exists (else a map per sweep, as before)."""
+        update = getattr(_runtime().table_map, "update_map", None)
+        if update is not None and self.live is None:
+            self.live = LiveMap(self.store, update, MAP_PERSIST_S)
+            n = len((self.live.map or {}).get("objects") or [])
+            LOGGER.info(f"{self.name}: live table map on ({n} objects carried over from the saved map)")
 
     # ---- always ready: warm-up and idle perception ---------------------------------------------------
 
@@ -279,6 +328,7 @@ class GraspByDescription(Generic, EasyResource):
                 await asyncio.to_thread(self._warm_sync)
                 self.warm, self.warm_ms, self.warm_error = True, _ms(t0), None
                 LOGGER.info(f"{self.name}: warm in {self.warm_ms} ms ({self.library['views']} library views)")
+                self._start_live_map()
             except Exception as e:
                 self.warm_error = f"{type(e).__name__}: {e}"[:300]
                 LOGGER.error(f"{self.name}: warm-up failed, retrying in {WARM_RETRY_S:.0f} s: {self.warm_error}")
@@ -356,6 +406,8 @@ class GraspByDescription(Generic, EasyResource):
                           "pose": pose}
         self.seen = {"ts": t_cap, "at_observe": True, "pose": pose, "objects": objects, "intruders": intruders,
                      "seen_ms": ms, "watch_period_s": self.watch_period}
+        if self.live is not None:  # every idle picture updates the live map (reusing this frame's recognition)
+            self.live.offer(rgb, depth, pose, await self._intrinsics(), "idle", recognised=recs)
         # Arm confirmed still: keep each recognised object's last-seen table xy current (AGENT3's where_is)
         if hasattr(rt.clip_embed, "record_sightings"):
             await asyncio.to_thread(rt.clip_embed.record_sightings, self.store, recs, pose, None, "idle")
@@ -505,23 +557,39 @@ class GraspByDescription(Generic, EasyResource):
 
     async def _from_map(self, text: str) -> Optional[dict]:
         """
-        best_on_map() on the whole-table map when it is at most MAP_FRESH_S old:
-        {"found", "xy", "label", "status", "reason", "decide_ms", "map_age_s"}, or None when there is no fresh map.
+        best_on_map() on the live map (VIAM CENTERAL: live entry fresh -> go; else sweep):
+        {"found", "xy", "label", "seen_s_ago", "status", "reason", "decide_ms", "map_age_s"}, or None = sweep.
+
+        Found and that object seen within MAP_FRESH_S -> go there. Not found / ambiguous -> refuse only when a
+        whole-table sweep is that recent too (only then does the map cover the whole table); otherwise sweep.
+        Without update_map (AGENT3) the latest saved map stands in, whole: its age is every object's age.
         """
-        m = self.store.get_table_map()
-        if not m or m["age_s"] > MAP_FRESH_S:
+        now = time.time()
+        if self.live is not None:
+            m, swept_ago = self.live.map, now - self.live.swept_ts
+        else:
+            m = self.store.get_table_map()
+            swept_ago = m["age_s"] if m else float("inf")
+        if not m:
             return None
         t0 = time.monotonic()
         b = await asyncio.to_thread(_runtime().table_map.best_on_map, m, text, self.store)
-        out = {"decide_ms": _ms(t0), "map_age_s": m["age_s"]}
-        if b.get("map_obj") is not None and not b.get("ambiguous"):
-            return {**out, "found": True, "xy": [round(float(v), 1) for v in b["xy"]], "label": b["map_obj"].get("label"),
-                    "colour": b["map_obj"].get("colour"), "score": round(float(b.get("score") or 0.0), 3)}
+        out = {"decide_ms": _ms(t0), "map_age_s": round(now - float(m.get("ts") or 0.0), 1)}
+        o = b.get("map_obj")
+        if o is not None and not b.get("ambiguous"):
+            seen_ago = now - float(o.get("seen_ts") or m.get("ts") or 0.0)
+            if seen_ago > MAP_FRESH_S:
+                return None  # remembered, but too long ago to drive there blind: sweep
+            return {**out, "found": True, "xy": [round(float(v), 1) for v in b["xy"]], "label": o.get("label"),
+                    "colour": o.get("colour"), "score": round(float(b.get("score") or 0.0), 3),
+                    "seen_s_ago": round(seen_ago, 1)}
+        if swept_ago > MAP_FRESH_S:
+            return None
         if b.get("ambiguous"):
             return {**out, "found": False, "status": "ambiguous",
                     "reason": f"two objects on the table match {text!r} about equally; be more specific"}
         return {**out, "found": False, "status": "not_found",
-                "reason": f"no {text!r} on the table (whole-table map {m['age_s']:.0f} s old)"}
+                "reason": f"no {text!r} on the table (whole-table map, scanned {swept_ago:.0f} s ago)"}
 
     async def _preview(self, text: str) -> Dict[str, ValueTypes]:
         """
@@ -543,12 +611,13 @@ class GraspByDescription(Generic, EasyResource):
         found = await self._from_map(text)
         if found is None:
             return {"ok": False, "via": "sweep", "status": "would_scan",
-                    "reason": f"{text!r} is not in view and there is no fresh table map: a grasp would scan the table"}
+                    "reason": f"{text!r} is not in view and the table map has not seen it in the last "
+                              f"{MAP_FRESH_S:.0f} s: a grasp would scan the table"}
         if found["found"]:
             x, y = found["xy"]
             return {"ok": True, "via": "map", "target_xy": found["xy"], "label": found["label"],
-                    "decide_ms": found["decide_ms"], "map_age_s": found["map_age_s"],
-                    "message": f"remembered at ({x:.0f}, {y:.0f}) on the table map"}
+                    "decide_ms": found["decide_ms"], "map_age_s": found["map_age_s"], "seen_s_ago": found["seen_s_ago"],
+                    "message": f"remembered at ({x:.0f}, {y:.0f}) on the table map, seen {found['seen_s_ago']:.0f} s ago"}
         return {"ok": False, "status": found["status"], "reason": found["reason"], "decide_ms": found["decide_ms"]}
 
     def _sweep_progress(self, k: int, n: int):
@@ -586,9 +655,21 @@ class GraspByDescription(Generic, EasyResource):
             if kind == "grasp":
                 params = inspect.signature(rt.executor.execute).parameters
                 if sweep and hasattr(rt.executor, "sweep_table"):
-                    frames = await rt.executor.sweep_table(rig, progress=self._sweep_progress)
-                    m = await asyncio.to_thread(rt.table_map.map_from_frames, frames, self.store)
-                    self.store.put_table_map(m)
+                    self._sweeping = True
+                    try:
+                        frames = await rt.executor.sweep_table(rig, progress=self._sweep_progress)
+                    finally:
+                        self._sweeping = False
+                    if self.live is not None:
+                        # Every sweep frame into the live map, none dropped; then the map covers the whole table
+                        for fr in frames:
+                            self.live.offer(fr["rgb"], fr["depth"], fr["pose"], fr["intrinsics"], "sweep", keep=True)
+                        await self.live.drain()
+                        await self.live.mark_swept()
+                        m = self.live.map or {"objects": []}
+                    else:
+                        m = await asyncio.to_thread(rt.table_map.map_from_frames, frames, self.store)
+                        self.store.put_table_map(m)
                     b = await asyncio.to_thread(rt.table_map.best_on_map, m, text, self.store)
                     if b.get("map_obj") is None or b.get("ambiguous"):
                         status = "ambiguous" if b.get("ambiguous") else "not_found"
@@ -690,8 +771,10 @@ class GraspByDescription(Generic, EasyResource):
             res = await self._start("grasp", text, wait, target_xy=found["xy"], decide_ms=found["decide_ms"],
                                     chosen={"label": found["label"], "colour": found.get("colour")})
             return {**res, "ok": bool(res.get("accepted")), "via": "map", "status_text": "going_to_map",
-                    "message": f"remembered at ({x:.0f}, {y:.0f}) on the table map · going there",
+                    "message": f"remembered at ({x:.0f}, {y:.0f}) on the table map, seen {found['seen_s_ago']:.0f} s ago"
+                               " · going there",
                     "target_xy": found["xy"], "label": found["label"], "map_age_s": found["map_age_s"],
+                    "seen_s_ago": found["seen_s_ago"],
                     "decide_ms": found["decide_ms"]}
         has_sweep = hasattr(rt.executor, "sweep_table")
         res = await self._start("grasp", text, wait, sweep=True)
@@ -708,7 +791,8 @@ class GraspByDescription(Generic, EasyResource):
         return {"busy": self._busy(), "running": dict(self.job_info) if self._busy() else {}, "last": dict(self.last),
                 "store": "atlas" if self.store.online else "jsonl", "worker_id": self.worker_id,
                 "library": dict(self.library), "warm": self.warm, "warm_ms": self.warm_ms,
-                "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats()}
+                "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats(),
+                "map": self.live.summary() if self.live is not None else {"live": False}}
 
     async def do_command(self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None,
                          **kwargs) -> Mapping[str, ValueTypes]:
@@ -717,11 +801,13 @@ class GraspByDescription(Generic, EasyResource):
         if command.get("seen_image"):
             return self._seen_image()
         if command.get("table_map"):
-            # Dashboard top-down view: latest whole-table map (no embeddings) + each object's latest sighting
-            m = self.store.get_table_map(with_emb=False)
-            return {"ok": m is not None, "map": m or {}, "sightings": self.store.list_sightings()[:40],
+            # Dashboard top-down view: the live map (no embeddings, each object with its seen_ts; up to
+            # MAP_PERSIST_S newer than the saved one) + each object's latest sighting
+            m = self.live.light() if self.live is not None else self.store.get_table_map(with_emb=False)
+            return {"ok": bool(m), "map": m or {}, "sightings": self.store.list_sightings()[:40],
                     "sweep": dict(self.job_info.get("sweep") or {}) if self._busy() else {},
-                    "now": time.time()}  # robot clock, so the dashboard can age sightings without clock skew
+                    "live": self.live.summary() if self.live is not None else {"live": False},
+                    "now": time.time()}  # robot clock, so the dashboard can age objects without clock skew
         for key in ("grasp", "preview"):
             if key in command:
                 text = _runtime().clean(str(command.get(key) or ""))
@@ -773,3 +859,5 @@ class GraspByDescription(Generic, EasyResource):
     async def close(self) -> None:
         for t in self.tasks + ([self.job] if self.job else []):
             t.cancel()
+        if self.live is not None:
+            await self.live.close()
