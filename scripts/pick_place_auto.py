@@ -420,6 +420,12 @@ class Rig:
         # pose: the last read pose, or the last commanded one (probe frames are taken right after goto()).
         self.on_map_frame = None
         self.at = None
+        # () -> the live table map dict ({"objects", "square"}) or None; set by the module next to on_map_frame.
+        # The executor reads it for drop spots (avoid mapped objects) and the newest square position.
+        self.live_map = None
+        # (x, y, theta) of the flange at the last successful grab: the one spot known to be free for this object,
+        # where a failed carry or reset puts it back instead of opening the gripper anywhere else
+        self.picked_at = None
 
     async def connect(self) -> None:
         # The SDK's own reconnect loop is off: it fought call()'s backoff, and its native layer can abort the
@@ -773,26 +779,36 @@ def mark(times: dict, phase: str, t0: float) -> float:
     return now
 
 
-async def pick(rig: Rig, times: dict = None, finder=None, verify=None) -> tuple:
+async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None) -> tuple:
     """
     Steps 1-2: align over the block, measure it, descend and grab. Returns (block height, grip depth).
 
     `times` receives seconds per phase (servo, descend, grab) and times["at"] names the phase in progress,
     so a caller can log where a failure happened. Raises PickFailed if the grab closes on nothing.
     `finder` picks which object (default: largest yellow blob; pass a Tracker when other yellow things
-    are on the table). `verify` (optional coroutine factory -> (ok, why)) re-checks identity before every
-    descent; on a mismatch the pick is refused rather than grabbing something else.
+    are on the table). Identity (optional coroutine factories -> (ok, why); a False refuses the pick rather
+    than grabbing something else): `verify` once, centred over the object at theta 0 where the whole object
+    is in view; `check` before every descent, after the wrist turn, where a long object is cut off by the
+    fingertips and only continuity can be judged. Before (2026-10-29) one full check ran before each descent
+    and refused the blue screwdriver it was centred on: at theta -50 only its handle was in view.
     """
     times = {} if times is None else times
     finder = finder or find_block
     t = time.monotonic()
     times["at"] = "servo"
+    rig.picked_at = None  # set again only by this pick's successful grab
     await rig.open()
     p = await rig.pose()
     await rig.goto(p.x, p.y, ALIGN_Z, theta=0.0)
 
     print("1/5 find + align over block")
     await rig.servo(finder, True, "block")
+    if verify is not None:
+        # Centred at theta 0: the frame where the whole object is visible, so recognition is fair
+        ok, why = await verify()
+        print(f"  identity check: {why}")
+        if not ok:
+            raise PickFailed(f"lost the target, refusing to grab something else: {why}")
     await rig.align_wrist(finder)
     await rig.servo(finder, True, "block")
     t = mark(times, "servo", t)
@@ -807,9 +823,9 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None) -> tuple:
         if not 10.0 <= height <= 80.0:
             raise RuntimeError(f"implausible block height {height:.0f} mm")
         grip = min(GRIP_DEPTH, height / 2)
-        if verify is not None:
-            ok, why = await verify()
-            print(f"  identity check: {why}")
+        if check is not None:
+            ok, why = await check()
+            print(f"  continuity check: {why}")
             if not ok:
                 raise PickFailed(f"lost the target, refusing to grab something else: {why}")
         # Never descend into a hand: check the area the jaws are about to enter
@@ -835,12 +851,17 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None) -> tuple:
         grabbed = await rig.grab()
         print(f"  grab {attempt}/{GRAB_TRIES} returned", grabbed)
         p = await rig.pose()
+        if grabbed:
+            rig.picked_at = (p.x, p.y, rig.theta)
+        else:
+            # Open down here, where the object stands: if the holding sensor missed a thin object, it stays put
+            # instead of falling from ALIGN_Z
+            await rig.open()
         await rig.goto(p.x, p.y, ALIGN_Z)
         t = mark(times, "grab", t)
         if grabbed:
             break
-        # Missed (or the object was moved): open, re-align from the observation height, try again
-        await rig.open()
+        # Missed (or the object was moved): re-align from the observation height, try again
         if hasattr(finder, "back_to_far"):
             # Re-align against the last FAR sighting, never a close-range pixel (that pulled in the blue block)
             finder.back_to_far()
@@ -892,24 +913,29 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     """
     Steps 3-4: carry to the square, release over its hole (with calibration samples).
 
-    With `square_xy` (from locate_square, empty gripper) go there and only refine by servo if the hole is
-    still seen; the paper may have been moved meanwhile, and then the servo follows it. Without it, search
-    and servo while holding (works when the held object does not hide the hole).
+    With `square_xy` (a frame or cache, empty gripper) go there and refine by servo; if the hole is not seen
+    there the paper was moved, so search and servo while holding, exactly as without `square_xy` (works when
+    the held object does not hide the hole). Before 2026-10-29 an unseen hole at square_xy still got the release
+    there: a moved paper meant an object put down at the old spot. Raises (still holding) if the hole is nowhere.
     """
     times = {} if times is None else times
     t = time.monotonic()
     print("3/5 carry to the blue square")
     times["at"] = "carry"
+    seen = False
     if square_xy is not None:
         # Wrist back to 0 so the nominal Jacobian holds if a probe loses the square behind the held object
         await travel(rig, *square_xy, theta=0.0)
-        if find_square((await rig.frame())[0]):
+        seen = find_square((await rig.frame())[0]) is not None
+        if seen:
             try:
                 await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX)
             except RuntimeError as e:
                 print(f"  refine skipped ({e}); placing at the located square")
                 await travel(rig, *square_xy)
-    else:
+        else:
+            print(f"  no square at ({square_xy[0]:.0f},{square_xy[1]:.0f}): the paper moved, searching")
+    if not seen:
         # The square is on paper that people move around: never assume where it is
         q = await rig.pose()
         await rig.goto(q.x, q.y, ALIGN_Z, theta=0.0)
@@ -1102,13 +1128,14 @@ async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = A
         await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, z, theta=theta)
 
 
-async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> bool:
+async def place_at(rig: Rig, x: float, y: float, height: float, grip: float, clear_mm: float = None) -> bool:
     """
     Put the held block down at flange (x, y) if the spot is clear; False (still holding, at ALIGN_Z) if not.
 
     WHY: self-reset for unattended trials, so each run starts from a new spot without a person.
-    "Clear" = no depth blob 10-80 mm above the table near where the jaw axis meets the table. The held
-    block itself is closer than the RealSense minimum range (~280 mm) at ALIGN_Z, so it reads as invalid.
+    "Clear" = spot_free() within `clear_mm` of where the jaw axis meets the table (default SPOT_CLEAR_PX,
+    ~83 mm); the held block itself is closer than the RealSense minimum range at ALIGN_Z, so it reads as
+    invalid. Every look is recorded (phase "drop") so a reset's clip shows where it tried and why it refused.
     """
     await travel(rig, x, y)
     rgb, depth = await rig.frame()
@@ -1116,7 +1143,9 @@ async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> 
         return False
     table, _ = table_and_near(depth)
     hint = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
-    free, why = spot_free(rgb, depth, hint)
+    radius = SPOT_CLEAR_PX if clear_mm is None else clear_mm * rig.fx / table
+    free, why = spot_free(rgb, depth, hint, radius=radius)
+    rig.record("drop", rgb, xy=[round(x), round(y)], radius_px=round(radius), free=free, why=why)
     if not free:
         print(f"  spot ({x:.0f},{y:.0f}) not free: {why}")
         save_rejected(rgb, depth, hint, x, y, why)

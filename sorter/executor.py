@@ -15,18 +15,19 @@ Flow, clear_square(): find square -> each object in the hole: pick (<= 2 tries) 
 failed pick -> wipe (<= 2 passes) -> verify hole empty by depth -> Store.log_attempt(mode="reset").
 Contract: docs/EXEC_PLAN.md (Command flow, Reset).
 """
+import inspect
 import io
 import json
 import math
 import os
-import random
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 from scipy import ndimage
+from scipy.spatial import ConvexHull
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import pick_place_auto as ppa  # noqa: E402  arm library (Rig, pick, place_in_square, place_at, ...)
@@ -37,9 +38,6 @@ MAX_OPEN_MM = 78.0  # jaws open ~84 mm; keep a margin so the fingers clear the s
 COLOUR_TOL = 60.0  # RGB distance that still counts as the object at close range (grey/black/white objects)
 HUE_TOL = 9  # PIL hue units (~13 deg) for saturated objects: hue barely changes when the block looks brighter up close
 SAT_REF = 90  # PIL saturation above which an object is "coloured" and tracked by hue
-# Random drop area for reset, flange x/y mm (see run_trials.RESET_*); place_at refuses occupied/square spots
-RESET_X = (230.0, 380.0)
-RESET_Y = (-220.0, 220.0)
 WIPE_CLEAR_MM = 10.0  # fingertips this far above the table during a wipe
 WIPE_STEP_MM = 20.0  # wipe in short moves = slow, and interruptible between steps
 WORKER_ID = "sfhack4-worker"  # heartbeat / frame id; AGENT 2's Viam module uses "module:<name>"
@@ -85,18 +83,10 @@ def publish_frame(store, rgb: np.ndarray, seg, phase: str, scores: dict = None) 
 
 
 async def apply_limits(rig) -> None:
-    """Obstacle keep-outs (ppa.apply_workspace_limits) applied to the sweep/search poses and the reset rectangle; logged."""
+    """Obstacle keep-outs (ppa.apply_workspace_limits) applied to the sweep/search poses; drop spots check ppa.allowed."""
     await ppa.apply_workspace_limits(rig)
     SWEEP_XY[:] = [q for q in SWEEP_XY if ppa.allowed(*q)]
-    global RESET_X, RESET_Y
-    for x0, x1, y0, y1 in ppa.KEEP_OUT:
-        # A keep-out spanning the whole rectangle in one axis cuts the other axis; partial ones are point-checked
-        if y0 <= RESET_Y[0] and y1 >= RESET_Y[1] and x1 > RESET_X[0] and x0 < RESET_X[1]:
-            RESET_X = (x1, RESET_X[1]) if x0 <= RESET_X[0] else (RESET_X[0], x0)
-        if x0 <= RESET_X[0] and x1 >= RESET_X[1] and y1 > RESET_Y[0] and y0 < RESET_Y[1]:
-            RESET_Y = (y1, RESET_Y[1]) if y0 <= RESET_Y[0] else (RESET_Y[0], y0)
-    print(f"  workspace: {len(SWEEP_XY)} search poses, reset x[{RESET_X[0]:.0f},{RESET_X[1]:.0f}] "
-          f"y[{RESET_Y[0]:.0f},{RESET_Y[1]:.0f}]")
+    print(f"  workspace: {len(SWEEP_XY)} search poses")
 
 
 def intr(rig) -> dict:
@@ -207,6 +197,7 @@ class ObjTracker:
         self.far_uv = obj.centroid_px  # last position in a far frame
         self.close_uv = None  # last position in a close frame; cleared when the arm goes back up
         self.close_target = None  # jaw pixel for the close servo, set by ppa.pick before it starts
+        self.ref = None  # {"xy", "area"} of the object verify_target() accepted; still_target() compares with it
         self.uv = self.far_uv
         self._learn(rgb, obj.mask)
 
@@ -314,27 +305,80 @@ class ObjTracker:
         return best
 
 
-async def verify_target(rig, text: str, store) -> tuple:
-    """
-    (ok, why) just before a descent: is the object under the jaws the one `text` asks for?
+CONT_XY_MM = 35.0  # continuity: the object under the jaws is within this of the verified one's table xy
+CONT_AREA = (0.35, 2.5)  # ...and its footprint this fraction of the verified one (a long shaft cut off ~halves it)
 
-    The object under the jaws is the one nearest the jaw-axis pixel at its own top depth. It passes if best()
-    over everything in view picks it, or (if best() picks nothing) best() over it alone accepts it. Any other
-    winner means the tracker followed the wrong thing: refuse rather than grab it.
-    """
+
+async def under_jaws(rig) -> tuple:
+    """(object nearest the jaw-axis pixel at its own top depth or None, every object in view, frame pose)."""
     rgb, depth = await rig.frame()
+    pose = pose_dict(await rig.pose())
     seg = perception.segment_full(rgb, depth)
     objs = list(seg.objects) + [o for o, _ in seg.excluded]
-    if not objs:
-        return False, "nothing under the jaws"
 
     def off_axis(o):
         au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, o.top_depth_mm)
         return math.hypot(o.centroid_px[0] - au, o.centroid_px[1] - av)
 
-    under = min(objs, key=off_axis)
-    if off_axis(under) > 80.0:
+    under = min(objs, key=off_axis) if objs else None
+    return (under if under is not None and off_axis(under) <= 80.0 else None), objs, pose
+
+
+def footprint(rig, o, pose: dict) -> dict:
+    """Table xy of the object's top and its area scaled to REF_TABLE_DEPTH_MM, for continuity checks."""
+    xy = perception.world_xy(pose, intr(rig), *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+    return {"xy": (float(xy[0]), float(xy[1])),
+            "area": float(o.mask.sum()) * (o.top_depth_mm / perception.REF_TABLE_DEPTH_MM) ** 2}
+
+
+async def verify_target(rig, text: str, store, tracker=None) -> tuple:
+    """
+    (ok, why) centred over the object at theta 0, where the whole object is in view: is it the one `text` asks for?
+
+    The object under the jaws is the one nearest the jaw-axis pixel at its own top depth. It passes if best()
+    over everything in view picks it, or (if best() picks nothing) best() over it alone accepts it. Any other
+    winner means the tracker followed the wrong thing: refuse rather than grab it. On a pass the object's
+    footprint is kept on `tracker` (tracker.ref) for still_target() before each descent.
+    """
+    under, objs, pose = await under_jaws(rig)
+    if under is None:
         return False, "nothing under the jaws"
+    ok, why = identity(under, objs, text, store)
+    if ok and tracker is not None:
+        tracker.ref = footprint(rig, under, pose)
+    return ok, why
+
+
+async def still_target(rig, text: str, store, tracker) -> tuple:
+    """
+    (ok, why) just before a descent, after the wrist turn: still the object verify_target() accepted?
+
+    WHY (2026-10-29, "blue screwdriver" refused at theta -50 with its handle centred under the jaws): with the
+    wrist turned, the fingertip band cut the shaft off and recognition of the handle alone failed. So here only
+    continuity: the object nearest the jaw pixel stands where the verified one stood (CONT_XY_MM, full pose incl.
+    theta) with a similar footprint (CONT_AREA). If not provable (a missed grab moved it, or nothing was verified),
+    full recognition on this frame decides, so a different object (the blue block, clips_sd2) is still refused.
+    """
+    under, objs, pose = await under_jaws(rig)
+    if under is None:
+        return False, "nothing under the jaws"
+    ref, why = getattr(tracker, "ref", None), "no verified footprint"
+    if ref is not None:
+        now = footprint(rig, under, pose)
+        d = math.hypot(now["xy"][0] - ref["xy"][0], now["xy"][1] - ref["xy"][1])
+        ratio = now["area"] / max(ref["area"], 1.0)
+        if d <= CONT_XY_MM and CONT_AREA[0] <= ratio <= CONT_AREA[1]:
+            return True, f"same object under the jaws ({d:.0f} mm from the verified spot, area x{ratio:.2f})"
+        why = f"object under the jaws {d:.0f} mm from the verified spot, area x{ratio:.2f}"
+    ok, why2 = identity(under, objs, text, store)
+    if ok:
+        tracker.ref = footprint(rig, under, pose)
+        return True, f"{why2} (re-identified: {why})"
+    return False, f"{why2} ({why})"
+
+
+def identity(under, objs: list, text: str, store) -> tuple:
+    """(ok, why): best() over all objects in view picks `under`, or picks nothing and accepts `under` alone."""
     found = clip_embed.best(objs, text, store)
     win = found.get("obj")
     if win is not None:
@@ -348,8 +392,18 @@ async def verify_target(rig, text: str, store) -> tuple:
     return False, f"the object under the jaws does not look like '{text}'"
 
 
+INSIDE_FRAC = 0.7  # an object is "in the square" when this much of its footprint lies on the white interior
+
+
 def hole_mask(rgb: np.ndarray):
-    """Bool mask of the tape hole incl. anything standing in it (even a blue object), or None if not in view."""
+    """
+    Bool mask of the white interior inside the blue tape (incl. anything standing on it), or None if not in view.
+
+    WHY (2026-10-29): a yellow block standing half on the tape border counted as "in the square": the hole was
+    the non-blue region enclosed by tape, and the block's own pixels joined it. Now the interior is the convex
+    hull of the region's white paper pixels, which stops at the tape's inner edge; anything inside the paper
+    (even a blue or white object) is still covered by the hull.
+    """
     blue = ndimage.binary_closing(ppa.blue_mask(rgb), iterations=3)
     lab, n = ndimage.label(~blue)
     border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
@@ -362,15 +416,36 @@ def hole_mask(rgb: np.ndarray):
             best = (i, size)
     if best is None:
         return None
-    # Fill so that an object inside the hole that is itself blue still counts as inside
-    return ndimage.binary_fill_holes(lab == best[0])
+    region = ndimage.binary_fill_holes(lab == best[0])
+    hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+    grey = region & (hsv[..., 1] < 60)
+    if grey.sum() < 1000:
+        return region
+    # Paper relative to its own brightness (exposure changes); objects are a minority of the region
+    paper = grey & (hsv[..., 2] > 0.7 * np.median(hsv[..., 2][grey]))
+    vs, us = np.nonzero(paper)
+    if len(us) < 1000:
+        return region
+    pts = np.column_stack([us, vs])[:: max(1, len(us) // 4000)]
+    try:
+        hull = pts[ConvexHull(pts).vertices]
+    except Exception:
+        return region
+    img = Image.new("L", (rgb.shape[1], rgb.shape[0]), 0)
+    ImageDraw.Draw(img).polygon([tuple(map(int, p)) for p in hull], fill=1)
+    return np.asarray(img, dtype=bool)
+
+
+def in_hole(o, hole: np.ndarray) -> bool:
+    """Object footprint mostly on the square's white interior (INSIDE_FRAC); on the tape border does not count."""
+    return (o.mask & hole).sum() >= INSIDE_FRAC * o.mask.sum()
 
 
 def objects_in_hole(rgb: np.ndarray, depth: np.ndarray) -> tuple:
     """
     (hole visible?, [Obj inside the hole], segmentation) from a frame taken above the square at z >= 400.
 
-    Inside = >= half the mask. Must be looked at from ALIGN_Z: below ~280 mm depth is blind and a block in
+    Inside = in_hole(). Must be looked at from ALIGN_Z: below ~280 mm depth is blind and a block in
     the square is invisible. Edge-cut objects are counted too (a full square can push one to the border).
     """
     seg = perception.segment_full(rgb, depth) if depth is not None else None
@@ -378,7 +453,7 @@ def objects_in_hole(rgb: np.ndarray, depth: np.ndarray) -> tuple:
     if hole is None or seg is None:
         return False, [], seg
     objs = list(seg.objects) + [o for o, _ in seg.excluded]
-    return True, [o for o in objs if (o.mask & hole).sum() >= 0.5 * o.mask.sum()], seg
+    return True, [o for o in objs if in_hole(o, hole)], seg
 
 
 def jpeg(rgb: np.ndarray) -> bytes:
@@ -407,7 +482,7 @@ async def look_here(rig, text: str, store, source: str = "demo") -> dict:
     if abs(pose["theta"]) <= 1.0:
         record_sightings(store, rgb, depth, seg, pose, intr(rig), source)
     hole = hole_mask(rgb)
-    objs = [o for o in seg.objects if not o.touches_edge and (hole is None or (o.mask & hole).sum() < 0.5 * o.mask.sum())]
+    objs = [o for o in seg.objects if not o.touches_edge and (hole is None or not in_hole(o, hole))]
     found = clip_embed.best(objs, text, store) if objs else {"obj": None, "reason": "nothing seen", "searchable": True}
     found.update(rgb=rgb, depth=depth, pose=pose, square=square_from_frame(rgb, depth, pose, intr(rig)))
     return found
@@ -423,7 +498,7 @@ def hint_for(text: str, store):
     return tuple(w["xy"]) if w else None
 
 
-async def search_and_find(rig, text: str, store, hint_xy=None) -> dict:
+async def search_and_find(rig, text: str, store, hint_xy=None, progress=None) -> dict:
     """
     Look for `text`, stopping at the FIRST frame whose best() accepts an object; no whole-table sweep first.
 
@@ -437,6 +512,8 @@ async def search_and_find(rig, text: str, store, hint_xy=None) -> dict:
     once (another view does not make two equal matches unequal). "Not found" only after every pose was seen.
     Returns look_here()'s dict + "path" (current / hint / sweep) and "views"; when the found frame has no
     square but an earlier one did, "square" is that one and "square_from" is "search".
+    progress(k, n, path, found) after each look (AGENT 2's module status: "searching... pose k/n", "found at
+    pose k"); n = 1 + planned poses. Called plainly; an awaitable it returns is awaited.
     """
     hint_xy = hint_xy if hint_xy is not None else hint_for(text, store)
     poses = []
@@ -462,6 +539,13 @@ async def search_and_find(rig, text: str, store, hint_xy=None) -> dict:
         views += 1
         found.update(path=path, views=views)
         square = found.get("square") or square
+        if progress is not None:
+            try:
+                r = progress(views, 1 + len(poses), path, found.get("obj") is not None)
+                if inspect.isawaitable(r):
+                    await r
+            except Exception as e:
+                print(f"  search progress callback failed: {e}")
         if found.get("obj") is not None:
             if found.get("square") is None and square is not None:
                 found.update(square=square, square_from="search")
@@ -547,7 +631,7 @@ async def sweep_table(rig, progress=None) -> list:
     return frames
 
 
-async def execute(rig, text: str, store, mode: str = "demo", target=None, target_xy=None) -> dict:
+async def execute(rig, text: str, store, mode: str = "demo", target=None, target_xy=None, progress=None) -> dict:
     """
     One command: put the object described by `text` into the blue square. Returns the logged attempt doc.
 
@@ -555,8 +639,9 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
       observe pose (theta within +-1 deg): no observe move, pick at once. Ignored if its theta is off.
     target_xy: a hint, table x/y where it was last seen (live map): search_and_find looks there right after the
       current frame, then keeps searching if it is gone. None: the object memory's last sighting is the hint.
-    The square comes from the found frame, else any frame of this search, else LAST_SQUARE (< SQUARE_CACHE_S
-    old), else it is searched only while carrying. Always ends at the observe pose.
+    progress(k, n, path, found): passed to search_and_find (module status "searching... pose k/n").
+    The square comes from the found frame, else any frame of this search, else known_square() (the newer of
+    LAST_SQUARE and the live map's), else it is searched only while carrying. Always ends at the observe pose.
     Never raises for an ordinary failure: status is done / not_found / ambiguous / too_wide / failed.
     """
     doc = {"ts": time.time(), "mode": mode, "target_text": text, "success": False, "status": "failed",
@@ -578,7 +663,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
             if found.get("square") is None:
                 found["square"] = square_from_frame(found["rgb"], found.get("depth"), tp, intr(rig))
         else:
-            found = await search_and_find(rig, text, store, hint_xy=target_xy)
+            found = await search_and_find(rig, text, store, hint_xy=target_xy, progress=progress)
             doc["find_path"], doc["find_views"] = found.get("path"), found.get("views")
         obj = found.get("obj")
         if obj is None:
@@ -597,12 +682,16 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         square_xy, doc["square_path"] = None, "search"
         if found.get("square"):
             square_xy, doc["square_path"] = tuple(found["square"]["xy"]), found.get("square_from", "frame")
-        elif LAST_SQUARE["xy"] is not None and time.time() - LAST_SQUARE["ts"] < SQUARE_CACHE_S:
-            square_xy, doc["square_path"] = LAST_SQUARE["xy"], "cache"
+        else:
+            # Newest of the executor's own sighting and the live map's (place_in_square searches if it moved)
+            square_xy, src = known_square(rig)
+            if square_xy is not None:
+                doc["square_path"] = src
         tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store)
         # Found from a sweep pose (z 580): centre it at ALIGN_Z, where pick starts, without another look
         await approach(rig, found, tracker)
-        height, grip = await ppa.pick(rig, times, tracker, verify=lambda: verify_target(rig, text, store))
+        height, grip = await ppa.pick(rig, times, tracker, verify=lambda: verify_target(rig, text, store, tracker),
+                                      check=lambda: still_target(rig, text, store, tracker))
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy)
         # Released over the hole's centre (place_in_square servos onto it when visible): remember it
@@ -635,43 +724,119 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
 
 
 async def recover(rig, doc: dict) -> None:
-    """After a failure: lift; if still holding something, put it down right there so nothing stays mid-air."""
+    """
+    After a failure: lift; if still holding something, put it back where it was picked.
+
+    WHY (2026-10-29): a reset found no free spot and this put the yellow block down "right there", over the
+    last refused spot, half on the square's tape. The pick spot is the one place known to fit this object, so
+    the gripper opens only there (lowered to the measured table); with no pick spot known it keeps holding.
+    """
     try:
         await rig.lift()
         if await rig.holding():
-            await ppa.release_here(rig, doc.get("height_mm", 30.0), (doc.get("grasp") or {}).get("grip_depth", 15.0))
+            xy = await put_back(rig, doc.get("height_mm", 30.0), (doc.get("grasp") or {}).get("grip_depth", 15.0))
+            doc["put_back_at"] = [round(xy[0], 1), round(xy[1], 1)]
+            doc["fail_reason"] = f"{doc.get('fail_reason')} | put back where it was picked ({xy[0]:.0f},{xy[1]:.0f})"
     except Exception as e:
         doc["fail_reason"] = f"{doc.get('fail_reason')} | recovery failed: {e}"
 
 
-FREE_SPOTS_FILE = Path(__file__).resolve().parent.parent / "data" / "scan" / "free_spots.json"
+async def put_back(rig, height: float, grip: float) -> tuple:
+    """Carry the held object back to rig.picked_at and release it there at table height; raises if unknown."""
+    if rig.picked_at is None:
+        raise RuntimeError("still holding: pick spot unknown, not opening the gripper")
+    x, y, theta = rig.picked_at
+    await ppa.travel(rig, x, y, theta=theta)
+    await ppa.release_here(rig, height, grip)
+    return x, y
 
 
-def candidate_spots(n: int = 8) -> list:
+DROP_CLEAR_MM = (83.0, 60.0)  # clearance around a drop spot: SPOT_CLEAR_PX at the observe depth, then relaxed
+DROP_GRID_MM = 60.0  # candidate spacing over the reachable table
+DROP_REACH_MM = (170.0, 560.0)  # flange distance from the base for a release near the table
+# Table area known to be table: survey free spots spanned x 240..535, y -342..430; objects stood at x >= 166
+DROP_X, DROP_Y = (150.0, 560.0), (-440.0, 440.0)
+DROP_TRIES = 6  # live looks per clearance before relaxing
+SQUARE_AVOID_MM = 180.0  # never drop within this of the square's centre (hole ~140 x 190 mm, tape, paper)
+SQUARE_FAR_MM = 350.0  # beyond this from the square, nearer to the arm wins
+
+
+def known_square(rig) -> tuple:
     """
-    Drop candidates: free spots measured by the table survey (scripts/survey_scan.py), nearest-agnostic
-    shuffle; random points in RESET_X x RESET_Y only if no survey exists. Each is re-checked live anyway.
-    """
-    import json
+    (flange xy over the square's centre, "cache" / "map") from whichever was seen LATER: LAST_SQUARE (executor
+    frames) or the live map's square (every module frame); (None, None) if neither is < SQUARE_CACHE_S old.
 
+    WHY (2026-10-29): the user moved the paper next to the screwdrivers and a grasp still used square_path
+    "cache" at the old spot; the live map had already seen it elsewhere.
+    """
+    best = (LAST_SQUARE["ts"], LAST_SQUARE["xy"], "cache") if LAST_SQUARE["xy"] is not None else None
+    m = live_map(rig)
+    sq = (m or {}).get("square")
+    if sq and sq.get("xy") and (best is None or float(sq.get("seen_ts") or 0.0) > best[0]):
+        best = (float(sq.get("seen_ts") or 0.0), tuple(sq["xy"]), "map")
+    if best is None or time.time() - best[0] > SQUARE_CACHE_S:
+        return None, None
+    return tuple(best[1]), best[2]
+
+
+def live_map(rig):
+    """The module's live table map via rig.live_map(), or None; never fails."""
     try:
-        spots = [tuple(s) for s in json.loads(FREE_SPOTS_FILE.read_text())]
-    except (OSError, ValueError):
-        spots = []
-    random.shuffle(spots)
-    if spots:
-        return spots[: max(n, 12)]
-    return [(random.uniform(*RESET_X), random.uniform(*RESET_Y)) for _ in range(n)]
+        return rig.live_map() if getattr(rig, "live_map", None) else None
+    except Exception as e:
+        print(f"  live map unavailable: {e}")
+        return None
+
+
+def drop_candidates(rig, clear_mm: float, square_xy, avoid: list) -> list:
+    """
+    Flange xy drop spots over the whole reachable table, best first.
+
+    Skips keep-outs, the square (SQUARE_AVOID_MM) and anything within clear_mm of an `avoid` (x, y, radius)
+    (mapped objects, spots already refused). Score: distance from the square up to SQUARE_FAR_MM, minus 0.3 x
+    travel from the arm, so spots far from the square come first and nearby ones break ties.
+    """
+    p = rig.last_pose
+    here = (p.x, p.y) if p is not None else ppa.HOME_XY
+    out = []
+    for x in np.arange(DROP_X[0], DROP_X[1] + 1.0, DROP_GRID_MM):
+        for y in np.arange(DROP_Y[0], DROP_Y[1] + 1.0, DROP_GRID_MM):
+            x, y = float(x), float(y)
+            if not DROP_REACH_MM[0] <= math.hypot(x, y) <= DROP_REACH_MM[1] or not ppa.allowed(x, y):
+                continue
+            d_sq = math.hypot(x - square_xy[0], y - square_xy[1]) if square_xy is not None else SQUARE_FAR_MM
+            if d_sq < SQUARE_AVOID_MM:
+                continue
+            if any(math.hypot(x - ax, y - ay) < clear_mm + ar for ax, ay, ar in avoid):
+                continue
+            out.append((min(d_sq, SQUARE_FAR_MM) - 0.3 * math.hypot(x - here[0], y - here[1]), x, y))
+    return [(x, y) for _, x, y in sorted(out, reverse=True)]
 
 
 async def drop_somewhere(rig, height: float, grip: float) -> tuple:
-    """Put the held object at a free spot (not near the square, no object within ~90 mm); returns (x, y)."""
-    for x, y in candidate_spots():
-        if not 150.0 <= math.hypot(x, y) <= 600.0 or not ppa.allowed(x, y):
-            continue
-        print(f"reset: trying ({x:.0f},{y:.0f})")
-        if await ppa.place_at(rig, x, y, height, grip):
-            return x, y
+    """
+    Put the held object at a free spot; returns (x, y). Raises (still holding) if none passes.
+
+    WHY (2026-10-29): a reset on the cluttered table found nothing: candidates came from a stale survey list
+    and every spot needed ~83 mm clear. Now candidates cover the whole reachable table, skip what the live map
+    knows is there, and each is checked live (place_at -> spot_free on the current depth); after DROP_TRIES
+    refusals the clearance relaxes to 60 mm.
+    """
+    square_xy, _ = known_square(rig)
+    m = live_map(rig)
+    avoid = [(float(e["xy"][0]), float(e["xy"][1]), 0.5 * max(e.get("size_mm") or [0.0, 0.0]))
+             for e in (m or {}).get("objects", []) if e.get("xy")]
+    for clear_mm in DROP_CLEAR_MM:
+        refused = []
+        for _ in range(DROP_TRIES):
+            cands = drop_candidates(rig, clear_mm, square_xy, avoid + refused)
+            if not cands:
+                break
+            x, y = cands[0]
+            print(f"reset: trying ({x:.0f},{y:.0f}) with {clear_mm:.0f} mm clear")
+            if await ppa.place_at(rig, x, y, height, grip, clear_mm=clear_mm):
+                return x, y
+            refused.append((x, y, 0.0))
     raise RuntimeError("no free spot to drop the object; still holding it")
 
 
@@ -727,11 +892,11 @@ async def clear_square(rig, store) -> dict:
                 publish_frame(store, rgb, seg, "reset")
             if not seen:
                 raise RuntimeError("square not visible after servo")
+            # Centred over the hole after the servo: drop_somewhere keeps away from here, the next run places here
+            q = await rig.pose()
+            LAST_SQUARE.update(xy=(q.x, q.y), ts=time.time())
             if not inside:
-                q = await rig.pose()
-                # Arm is centred over the empty square with an empty gripper: the place target for the next run
                 doc.update(success=True, status="done", square_xy=[q.x, q.y])
-                LAST_SQUARE.update(xy=(q.x, q.y), ts=time.time())
                 break
             obj = inside[0]
             print(f"reset: {len(inside)} object(s) in the square; removing one ({obj.colour}, {obj.height_mm:.0f} mm)")
