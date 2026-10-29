@@ -404,7 +404,7 @@ def identity(under, objs: list, text: str, store) -> tuple:
 INSIDE_FRAC = 0.7  # an object is "in the square" when this much of its footprint lies on the white interior
 
 
-def hole_mask(rgb: np.ndarray):
+def hole_mask(rgb: np.ndarray, depth: np.ndarray = None):
     """
     Bool mask of the white interior inside the blue tape (incl. anything standing on it), or None if not in view.
 
@@ -412,6 +412,11 @@ def hole_mask(rgb: np.ndarray):
     the non-blue region enclosed by tape, and the block's own pixels joined it. Now the interior is the convex
     hull of the region's white paper pixels, which stops at the tape's inner edge; anything inside the paper
     (even a blue or white object) is still covered by the hull.
+    With `depth`, a hole cut by the image border (the moved paper at the observe pose, frames 080/082) falls back
+    to perception.find_drop_square's partial hole: its visible bbox, so a delivered object there is still "in the
+    square" and never a grasp candidate. Its centre is not the hole's: never a place target.
+    {AGENT3 2026-10-29 "THE FRAME PATH CANNOT EXCLUDE THE YELLOW BLOCK IN THE SQUARE"}
+    [CONFIDENCE: SINGLE-SRC 80% — AGENT3: partial detector 0 false positives on 89 frames]
     """
     blue = ndimage.binary_closing(ppa.blue_mask(rgb), iterations=3)
     lab, n = ndimage.label(~blue)
@@ -424,10 +429,13 @@ def hole_mask(rgb: np.ndarray):
         if size > 2000 and (best is None or size > best[1]):
             best = (i, size)
     if best is None:
-        return None
+        return partial_hole(rgb, depth)
     region = ndimage.binary_fill_holes(lab == best[0])
     hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
-    grey = region & (hsv[..., 1] < 60)
+    # Paper reads light blue to this camera (PIL S median 52-103 by exposure); tape is S > 120 by its own mask
+    # {PERCEPTION.PY "PAPER READS LIGHT BLUE TO THIS CAMERA: PIL SATURATION MEDIAN 52-60 (010-076), 66 (080), 103 (082)"}
+    # [CONFIDENCE: CONFIRMED 85% — AGENT3's measurement; the old S < 60 failed whole exposures]
+    grey = region & (hsv[..., 1] < perception.SQUARE_WHITE_S)
     if grey.sum() < 1000:
         return region
     # Paper relative to its own brightness (exposure changes); objects are a minority of the region
@@ -445,6 +453,23 @@ def hole_mask(rgb: np.ndarray):
     return np.asarray(img, dtype=bool)
 
 
+def partial_hole(rgb: np.ndarray, depth: np.ndarray):
+    """Visible part (bbox) of a border-cut drop square from perception.find_drop_square, or None; never fails."""
+    if depth is None:
+        return None
+    try:
+        sq = perception.find_drop_square(rgb, depth)
+    except Exception as e:
+        print(f"  partial square check failed: {e}")
+        return None
+    if not sq or not sq.get("partial"):
+        return None
+    u0, v0, u1, v1 = (int(round(c)) for c in sq["bbox"])
+    m = np.zeros(rgb.shape[:2], bool)
+    m[max(v0, 0):v1 + 1, max(u0, 0):u1 + 1] = True
+    return m
+
+
 def in_hole(o, hole: np.ndarray) -> bool:
     """Object footprint mostly on the square's white interior (INSIDE_FRAC); on the tape border does not count."""
     return (o.mask & hole).sum() >= INSIDE_FRAC * o.mask.sum()
@@ -458,7 +483,7 @@ def objects_in_hole(rgb: np.ndarray, depth: np.ndarray) -> tuple:
     the square is invisible. Edge-cut objects are counted too (a full square can push one to the border).
     """
     seg = perception.segment_full(rgb, depth) if depth is not None else None
-    hole = hole_mask(rgb)
+    hole = hole_mask(rgb, depth)
     if hole is None or seg is None:
         return False, [], seg
     objs = list(seg.objects) + [o for o, _ in seg.excluded]
@@ -490,7 +515,7 @@ async def look_here(rig, text: str, store, source: str = "demo") -> dict:
     publish_frame(store, rgb, seg, "observe")
     if abs(pose["theta"]) <= 1.0:
         record_sightings(store, rgb, depth, seg, pose, intr(rig), source)
-    hole = hole_mask(rgb)
+    hole = hole_mask(rgb, depth)
     objs = [o for o in seg.objects if not o.touches_edge and (hole is None or not in_hole(o, hole))]
     found = clip_embed.best(objs, text, store) if objs else {"obj": None, "reason": "nothing seen", "searchable": True}
     found.update(rgb=rgb, depth=depth, pose=pose, square=square_from_frame(rgb, depth, pose, intr(rig)))
@@ -583,6 +608,9 @@ async def approach(rig, found: dict, tracker) -> None:
     u, v = obj.top_centroid_px or obj.centroid_px
     xy = perception.world_xy(pose, k, u, v, obj.top_depth_mm)
     fx, fy = xy
+    # The jaws cannot reach down this close to the base: refuse before any servo time is spent
+    if math.hypot(fx, fy) < ppa.MIN_GRASP_R_MM:
+        raise ppa.TooClose(ppa.too_close_msg(fx, fy))
     if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
         fx, fy = perception.look_flange_xy(xy)
         if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
@@ -657,7 +685,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
     progress(k, n, path, found): passed to search_and_find (module status "searching... pose k/n").
     The square comes from the found frame, else any frame of this search, else known_square() (the newer of
     LAST_SQUARE and the live map's), else it is searched only while carrying. Always ends at the observe pose.
-    Never raises for an ordinary failure: status is done / not_found / ambiguous / too_wide / failed.
+    Never raises for an ordinary failure: status is done / not_found / ambiguous / too_wide / too_close / failed.
     """
     doc = {"ts": time.time(), "mode": mode, "target_text": text, "success": False, "status": "failed",
            "fail_phase": None, "fail_reason": None}
@@ -723,6 +751,10 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if not right:
             why = "hole not visible" if not seen else "nothing seen inside the hole" if not inside else "wrong object in the hole"
             doc.update(fail_phase="check", fail_reason=why)
+    except ppa.TooClose as e:
+        # A refusal, not a failure: nothing was grabbed; tell the person to move it out
+        doc.update(status="too_close", fail_phase=times.get("at", "find"), fail_reason=str(e))
+        await recover(rig, doc)
     except Exception as e:
         doc.update(status="failed", fail_phase=times.get("at", "start"), fail_reason=f"{type(e).__name__}: {e}")
         await recover(rig, doc)

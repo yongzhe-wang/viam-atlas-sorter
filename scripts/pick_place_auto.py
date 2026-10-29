@@ -26,6 +26,7 @@ import asyncio
 import io
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -423,8 +424,32 @@ def retryable(e: Exception) -> bool:
     if isinstance(e, (StreamTerminatedError, ConnectionError, OSError, asyncio.TimeoutError)):
         return True
     if isinstance(e, GRPCError):
-        return e.status.name in ("UNAVAILABLE", "UNKNOWN", "CANCELLED", "DEADLINE_EXCEEDED") or "SESSION_EXPIRED" in str(e.message)
+        msg = str(e.message or "")
+        # A planner/IK/collision refusal comes back as UNKNOWN too: "grasp green square" (cube 198 mm from the base)
+        # was retried as a dropped link 4 times inside the module, where there is no network link, and failed as
+        # "link still down". Refusals are never retried.
+        # {VIAM CENTERAL 2026-10-29 "A GRPCERROR WITH STATUS UNKNOWN / FAILED_PRECONDITION, OR A MESSAGE CONTAINING
+        #  'IK', 'CONSTRAINT', 'COLLISION' OR 'PLAN', IS A NON-RETRYABLE REFUSAL"}
+        # [CONFIDENCE: SINGLE-SRC 80% — module log; exact planner wording not captured]
+        if REFUSAL_WORDS.search(msg):
+            return False
+        if "SESSION_EXPIRED" in msg:
+            return True
+        if e.status.name in ("UNAVAILABLE", "CANCELLED", "DEADLINE_EXCEEDED"):
+            return True
+        # UNKNOWN only when the message says the transport broke
+        return e.status.name == "UNKNOWN" and bool(LINK_WORDS.search(msg))
     return False
+
+
+# Planner refusals vs transport breaks, by gRPC message (case-insensitive)
+REFUSAL_WORDS = re.compile(r"\bik\b|inverse kinematics|constraint|collision|\bplan|solution|unreachable|joint limit|"
+                           r"out of reach|obstacle", re.IGNORECASE)
+LINK_WORDS = re.compile(r"connection|stream|transport|closed|reset|broken pipe|eof|unavailable|goaway", re.IGNORECASE)
+
+
+class MoveRefused(RuntimeError):
+    """The arm refused a call (planner, IK, collision, limits): the arm did not move; retrying will not help."""
 
 
 class Rig:
@@ -534,6 +559,9 @@ class Rig:
                 return await asyncio.wait_for(fn(), CALL_TIMEOUT_S.get(what, 20.0))
             except Exception as e:
                 if not retryable(e):
+                    if isinstance(e, GRPCError):
+                        # Keep the arm's own words: "move refused: <planner message>"
+                        raise MoveRefused(f"{what} refused: {e.message or e.status.name}") from e
                     raise
                 last = e
         raise RuntimeError(f"{what}: link still down after {len(RETRY_BACKOFF_S)} reconnects") from last
@@ -806,6 +834,23 @@ class PickFailed(RuntimeError):
     """The grab closed on nothing; the gripper has been opened and the arm lifted."""
 
 
+class TooClose(PickFailed):
+    """The object is too close to the arm base to reach down to; the arm did not descend."""
+
+
+# Below this flange distance from the base axis a grasp is refused up front: the green cube at r=198 mm had its
+# descent refused by the planner (seen as "link still down" before MoveRefused). Refusals at larger r are caught at
+# the descent and reported the same way when r < NEAR_BASE_R_MM, so the real limit can be read off the logs.
+# {VIAM CENTERAL 2026-10-29 "THE CUBE IS ~198 MM FROM THE BASE AXIS, SO THE DESCENT WAS MOST LIKELY AN IK / COLLISION REFUSAL"}
+# [CONFIDENCE: INFERRED 60% — one refusal at 198 mm; the boundary itself is not measured]
+MIN_GRASP_R_MM = 205.0
+NEAR_BASE_R_MM = 260.0
+
+
+def too_close_msg(x: float, y: float) -> str:
+    return f"too close to the arm base (r={math.hypot(x, y):.0f} mm), please move it out"
+
+
 def mark(times: dict, phase: str, t0: float) -> float:
     """Record seconds spent in `phase`, set the current phase marker, return the new start time."""
     now = time.monotonic()
@@ -882,7 +927,15 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         # Fingertips (TIP_BELOW_CAM past the camera) end `grip` below the block top
         z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
         print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
-        await rig.descend(z_grasp)
+        try:
+            await rig.descend(z_grasp)
+        except MoveRefused as e:
+            # The planner refused the straight descent (the arm did not move): say why instead of retrying
+            q = await rig.pose()
+            await rig.lift()
+            if math.hypot(q.x, q.y) < NEAR_BASE_R_MM:
+                raise TooClose(f"{too_close_msg(q.x, q.y)} ({e})") from e
+            raise PickFailed(f"descent refused at ({q.x:.0f},{q.y:.0f}): {e}") from e
         t = mark(times, "descend", t)
 
         times["at"] = "grab"
