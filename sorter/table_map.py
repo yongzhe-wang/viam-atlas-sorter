@@ -186,7 +186,7 @@ def _expected_visible(e: dict, pose: dict, intr: dict, seg, depth: np.ndarray, x
 
 
 def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = None, store=None,
-               source: str = "frame", now: float = None) -> dict:
+               source: str = "frame", recognised: list = None, seg=None, now: float = None) -> dict:
     """
     Fold one camera frame into the dynamic table map (in place; returns it).
 
@@ -200,7 +200,13 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
          entry; a frame with a hand in view gives no negative evidence.
       4. the drop square is updated the same way.
     A frame < SKIP_S after the last one at the same pose is skipped. tmap["last_update"] records what happened.
+
+    tmap None starts an empty map. recognised / seg: the caller's recognise_all(..., include_partial=True) output and
+    the segment_full() it came from, so the same frame is not segmented or embedded twice (recognised without seg:
+    the frame is segmented again but CLIP is skipped; without include_partial there are just no partial sightings).
+    Per object, "seen_ts" is the time of the last frame that saw it; the map's "ts" the last update.
     """
+    tmap = tmap if tmap is not None else empty_map()
     now = time.time() if now is None else now
     last = tmap.get("last_update")
     if last and not last.get("skipped") and now - last["ts"] < SKIP_S and _same_pose(last["pose"], pose):
@@ -208,8 +214,9 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
         return tmap
     t0 = time.perf_counter()
     intr = {**perception.INTRINSICS, **(intr or {})}
-    seg = perception.segment_full(rgb, depth)
-    recs = clip_embed.recognise_all(rgb, depth, store, seg=seg, include_partial=True)
+    seg = seg if seg is not None else perception.segment_full(rgb, depth)
+    recs = recognised if recognised is not None else clip_embed.recognise_all(rgb, depth, store, seg=seg,
+                                                                               include_partial=True)
     objs = tmap["objects"]
     touched = set()
 
@@ -230,11 +237,11 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
 
     def seen(e, d):
         e["score"] = round(max(e["score"] * 0.95, d["score"]), 3)
-        e.update(last_seen=now, misses=0, source=source, n_seen=e["n_seen"] + 1)
+        e.update(seen_ts=now, misses=0, source=source, n_seen=e["n_seen"] + 1)
         e["frame_ids"] = (e["frame_ids"] + [source + "@" + str(round(now, 1))])[-20:]
         touched.add(e["id"])
 
-    for r in (r for r in recs if not r["partial"]):
+    for r in (r for r in recs if not r.get("partial")):
         d = det_of(r["obj"], r)
         e = next((e for e in objs if e["id"] not in touched and _same(d, {**e, "emb": np.asarray(e["emb"])})), None)
         if e is None and d["label"] and d["score"] >= MOVE_CONF:
@@ -264,7 +271,7 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
     # - an entry nearby: still there (reset misses, no xy update)
     # - recognised, and the label has no entry, or its entry should be visible here but is not: the object moved
     #   to this edge spot; keep it as a "partial" entry (approximate xy) so the executor knows where to look
-    for r in (r for r in recs if r["partial"]):
+    for r in (r for r in recs if r.get("partial")):
         d = det_of(r["obj"], r)
         e = next((e for e in objs if e["id"] not in touched and math.dist(e["xy"], d["xy"]) <= 1.5 * MERGE_XY_MM
                   and abs(e["height_mm"] - d["height_mm"]) <= MERGE_DH_MM
@@ -302,7 +309,7 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
         oxy = old["xy"] if old else xy
         tmap["square"] = {"xy": [round((1 - a) * oxy[0] + a * xy[0], 1), round((1 - a) * oxy[1] + a * xy[1], 1)],
                           "size_mm": [round((v1 - v0) * mm_px, 1), round((u1 - u0) * mm_px, 1)],
-                          "last_seen": now, "misses": 0}
+                          "seen_ts": now, "misses": 0}
     elif tmap.get("square") and not seg.intruders and _expected_visible(
             {"height_mm": 0.0, "size_mm": tmap["square"]["size_mm"]}, pose, intr, seg, depth, xy=tmap["square"]["xy"]):
         tmap["square"]["misses"] = tmap["square"].get("misses", 0) + 1
