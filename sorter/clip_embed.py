@@ -15,6 +15,7 @@ and picked cylinders.
 Contract: docs/EXEC_PLAN.md (embed_images, embed_text, rank). Model: open_clip ViT-B-32, CPU.
 """
 import re
+import time
 
 import numpy as np
 
@@ -176,13 +177,41 @@ def recognise_all(rgb: np.ndarray, depth: np.ndarray, store=None, seg=None) -> l
     return out
 
 
+SIGHTING_MIN_CONF = 0.2  # recognition confidence (vote/k) below this does not move an object's last-seen xy
+
+
+def record_sightings(store, recs: list, pose: dict, intr: dict = None, source: str = "idle") -> int:
+    """
+    Update the last-seen table xy of every confidently recognised object in a recognise_all() result.
+
+    WHY: where_is() must follow objects that people or trials move, not only the scan. Called by the idle loop,
+    the executor's re-looks and trials, with the arm pose the frame was taken at (arm still, frame not stale).
+    Needs Store.log_sighting (AGENT 2); returns the number written, 0 if the Store has no sightings yet.
+    """
+    from sorter import perception
+
+    if not hasattr(store, "log_sighting"):
+        return 0
+    n = 0
+    for r in recs:
+        if r["label"] is None or r["score"] < SIGHTING_MIN_CONF:
+            continue
+        o = r["obj"]
+        xy = perception.world_xy(pose, intr or perception.INTRINSICS, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+        store.log_sighting({"label": r["label"], "xy": [round(xy[0], 1), round(xy[1], 1)],
+                            "height_mm": round(o.height_mm, 1), "conf": round(r["score"], 3), "source": source,
+                            "pose": {k: pose[k] for k in ("x", "y", "z", "theta") if k in pose}, "ts": time.time()})
+        n += 1
+    return n
+
+
 def where_is(store, text: str) -> dict:
     """
-    Where the library last saw the object a query names: {"label", "xy", "frame", "look_flange_xy"} or None.
+    Where the object a query names was last seen: {"label", "xy", "source", "look_flange_xy", ...} or None.
 
     WHY: the observe pose sees only part of the table (frame 076: the green cube, yellow block and KIND bar were
-    all outside or cut by the edge, so best() correctly refused). The arm-scan views carry table xy and the
-    survey frame they came from; frames are numbered in time order, so the highest frame is the latest sighting.
+    all outside or cut by the edge, so best() correctly refused). Newest live sighting (record_sightings) first;
+    otherwise the arm-scan view from the highest survey frame (frames are numbered in time order).
     look_flange_xy centres that spot in the camera (theta 0, z 400); look there, recognise_all, best() again.
     """
     from sorter import perception
@@ -191,11 +220,15 @@ def where_is(store, text: str) -> dict:
     if entry is None:
         return None
     label = entry[0]
+    s = store.last_sighting(label) if hasattr(store, "last_sighting") else None
+    if s:
+        return {"label": label, "xy": tuple(s["xy"]), "source": s.get("source", "sighting"), "ts": s.get("ts"),
+                "look_flange_xy": perception.look_flange_xy(s["xy"])}
     views = [v for v in store.search_views(_name_emb(label), k=1000, label=label) if v.get("xy") and v.get("frame")]
     if not views:
         return None
     v = max(views, key=lambda v: v["frame"])
-    return {"label": label, "xy": tuple(v["xy"]), "frame": v["frame"],
+    return {"label": label, "xy": tuple(v["xy"]), "source": "scan", "frame": v["frame"],
             "look_flange_xy": perception.look_flange_xy(v["xy"])}
 
 
@@ -273,9 +306,12 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
     qcol = set(clean_query(text).split()) & COLOURS
     # The library knows this query ("candy" is an alias of the KIND bar): then only an object recognised as it
     # may be picked. Without this, "candy" with the bar out of view picked an unrecognised cup fragment.
-    if qcol and not colour_ok(qcol, o.colour):
+    named = o.recognised is not None and name_matches(text, o.recognised_names)
+    # Recognised as exactly what was named beats the dominant-colour heuristic: the blue screwdriver's handle is
+    # mostly black, and "blue screwdriver" was refused with "no blue object found" while recognised at 0.98
+    if qcol and not colour_ok(qcol, o.colour) and not named:
         out["reason"] = f"no {'/'.join(sorted(qcol))} object found"
-    elif o.recognised is not None and not name_matches(text, o.recognised_names):
+    elif o.recognised is not None and not named:
         out["reason"] = f"best candidate is recognised as {o.recognised!r}"
     elif known and o.recognised is None:
         out["reason"] = f"no {clean_query(text)!r} recognised on the table"
