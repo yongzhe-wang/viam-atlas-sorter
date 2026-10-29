@@ -317,6 +317,7 @@ class ObjectLost(RuntimeError):
 
 
 RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)  # waits before each reconnect attempt
+CONNECT_TIMEOUT_S = 30.0  # one connect attempt; a timeout counts as a dropped link and is retried
 
 
 def retryable(e: Exception) -> bool:
@@ -355,7 +356,8 @@ class Rig:
         opts = RobotClient.Options.with_api_key(
             api_key=os.environ["VIAM_API_KEY"], api_key_id=os.environ["VIAM_API_KEY_ID"]
         )
-        self.robot = await RobotClient.at_address(os.environ["VIAM_MACHINE_ADDRESS"], opts)
+        # Bounded: a reconnect once hung for minutes inside at_address with the arm holding the block
+        self.robot = await asyncio.wait_for(RobotClient.at_address(os.environ["VIAM_MACHINE_ADDRESS"], opts), CONNECT_TIMEOUT_S)
         # Resource handles belong to one connection, so rebind them on every (re)connect
         self.arm = Arm.from_robot(self.robot, "arm")
         self.cam = Camera.from_robot(self.robot, "cam")
@@ -768,7 +770,6 @@ async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> 
     rgb, depth = await rig.frame()
     if depth is None:
         return False
-    p = await rig.pose()
     table, _ = table_and_near(depth)
     hint = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
     # ~220 px is ~90 mm at ALIGN_Z: keeps the open jaws (84 mm stroke) clear of neighbours
