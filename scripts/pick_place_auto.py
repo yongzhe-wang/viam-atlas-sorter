@@ -973,8 +973,13 @@ async def search_square(rig: Rig) -> None:
     """
     Leave the arm at ALIGN_Z with the whole tape hole in view; raise if it is nowhere on the table.
 
-    Looks from the current pose first, then visits SEARCH_XY nearest-first.
+    Looks from the current pose first, then visits SEARCH_XY nearest-first. Starts by turning the wrist back
+    to 0: the square servo's fallback Jacobian is only valid at theta 0, and a reset that had just picked an
+    object at theta 4 lost the square in a probe and could not recover.
     """
+    p = await rig.pose()
+    if abs(rig.theta) > 0.5:
+        await rig.goto(p.x, p.y, ALIGN_Z, theta=0.0)
     if find_square((await rig.frame())[0]):
         return
     p = await rig.pose()
