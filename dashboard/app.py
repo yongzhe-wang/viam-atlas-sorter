@@ -186,8 +186,21 @@ def status():
 
 @app.get("/api/workers")
 def workers():
-    """Each arm worker's latest heartbeat, with `online` = heard from within WORKER_OFFLINE_S."""
-    return [{**w, "online": w["age_s"] <= WORKER_OFFLINE_S} for w in store.worker_status()]
+    """
+    Each arm worker's latest heartbeat, with `online` = heard from within WORKER_OFFLINE_S and `consumer` =
+    it takes dashboard commands.
+
+    WHY: EXEC_PLAN allows exactly one command consumer; two would race for the arm. A heartbeat may say
+    consumer=true/false; without the flag the command worker (sfhack4-worker) counts as a consumer and the
+    Viam module (module:<name>) does not, because the module heartbeats even with consume_dashboard_commands off.
+    """
+    out = []
+    for w in store.worker_status():
+        consumer = w.get("consumer")
+        if consumer is None:
+            consumer = not str(w.get("worker", "")).startswith("module:")
+        out.append({**w, "online": w["age_s"] <= WORKER_OFFLINE_S, "consumer": bool(consumer)})
+    return out
 
 
 @app.get("/api/snapshot.jpg")

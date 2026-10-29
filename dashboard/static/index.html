@@ -57,6 +57,9 @@
   .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
   .phase { font-weight: 600; }
   .werr { flex-basis: 100%; color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
+  .takes { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--ok); color: var(--ok); }
+  .twocons { background: var(--bad); color: #fff; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px;
+             font-size: 13px; font-weight: 600; }
   ul.cmds { list-style: none; margin: 10px 0 0; padding: 0; }
   ul.cmds li { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--chip); white-space: nowrap; }
@@ -196,10 +199,14 @@ const ago = (s) => s < 90 ? `${Math.round(s)} s ago` : s < 5400 ? `${Math.round(
 function renderWorkers(list) {
   const box = $("workers"); box.replaceChildren();
   if (!list.length) { box.appendChild(el("div", "Arm worker: no heartbeat yet", "worker muted")); return; }
+  // Exactly one live command consumer is allowed (EXEC_PLAN); two would both claim commands and drive the arm
+  const live = list.filter((w) => w.online && w.consumer).map((w) => w.worker);
+  if (live.length > 1) box.appendChild(el("div", `Two command consumers live (${live.join(", ")}): stop one`, "twocons"));
   for (const w of list) {
     const row = el("div", null, "worker");
     row.appendChild(el("span", null, "dot " + (!w.online ? "" : w.error ? "bad" : "ok")));
     row.appendChild(el("span", w.worker));
+    if (w.online && w.consumer) row.appendChild(el("span", "takes commands", "takes"));
     row.appendChild(el("span", w.online ? w.phase : "offline", "phase"));
     if (w.online && w.holding != null) row.appendChild(el("span", w.holding ? "holding object" : "gripper empty", "muted"));
     row.appendChild(el("span", w.online ? ago(w.age_s) : `last seen ${ago(w.age_s)}`, "muted"));
