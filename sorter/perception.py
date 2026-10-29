@@ -409,8 +409,22 @@ INTRINSICS = {"fx": 909.93, "fy": 909.36, "cx": 645.48, "cy": 365.37}
 # [CONFIDENCE: CONFIRMED 80% — independent check: AGENT1's own pixel->world conversion agrees within 1-15 mm]
 JAW_IN_CAM_MM = (32.9, 48.1)
 # Image +u is world -y and image +v is world -x at theta 0 (arm +y moved the scene +u, arm +x moved it +v).
-# Wrist rotation direction is not verified on hardware: use theta 0 for surveys and look poses.
+# Wrist rotation direction checked on the arm: with -1 the four objects of theta_test 079 (theta -90) land on their
+# 077 (theta 0) positions up to a constant offset; with +1 they scatter by 150-300 mm.
+# {079.JSON "THETA": -90.03} {THETA_CHECK SIGN -1 "GREEN (218, 8)" VS 077 "GREEN (198, 33)"; SIGN +1 "GREEN (220, -286)"}
+# [CONFIDENCE: CONFIRMED 90% — one theta pair, 4 objects; the +90 frame 078 had no fully visible shared object]
 THETA_SIGN = -1.0
+# The wrist turns about the pose point, not about the jaw axis that world_xy() maps to the flange xy: the jaw axis
+# sits TOOL_AXIS_MM from the rotation axis (world frame at theta 0). Fitted so 079 matches 077 (residuals <= 2.5 mm).
+# Zero effect at theta 0, so the map / look / travel convention (map xy = theta-0 flange xy over the point) is kept.
+# {THETA_FIT "J = [21.74 -3.25]" "RED RESID [-2.5 0.]" "YELLOW RESID [0.5 0.]"}
+# [CONFIDENCE: SINGLE-SRC 75% — one theta pair; re-fit if a theta +90 pair disagrees]
+TOOL_AXIS_MM = (21.7, -3.3)
+
+
+def _rot(t: float, x: float, y: float) -> tuple:
+    """Rotate (x, y) by t radians (counter-clockwise in the arm base frame)."""
+    return x * math.cos(t) - y * math.sin(t), x * math.sin(t) + y * math.cos(t)
 
 
 def world_xy(pose: dict, intr: dict, u: float, v: float, depth_mm: float) -> tuple:
@@ -418,20 +432,24 @@ def world_xy(pose: dict, intr: dict, u: float, v: float, depth_mm: float) -> tup
     Table xy (arm base frame, mm) of the point seen at pixel (u, v) at camera distance depth_mm.
 
     Pinhole back-projection to camera coordinates, then the offset from the jaw axis rotated into the
-    world; a point exactly on the jaw axis maps to the flange xy.
+    world; a point exactly on the jaw axis maps to the flange xy at theta 0. At other wrist angles the
+    offset is taken about the real rotation axis (TOOL_AXIS_MM), so every angle agrees with theta 0.
     """
     xc = (u - intr["cx"]) * depth_mm / intr["fx"]
     yc = (v - intr["cy"]) * depth_mm / intr["fy"]
     dx, dy = JAW_IN_CAM_MM[1] - yc, JAW_IN_CAM_MM[0] - xc  # world offset at theta 0
     t = math.radians(THETA_SIGN * float(pose.get("theta", 0.0)))
-    return (pose["x"] + dx * math.cos(t) - dy * math.sin(t), pose["y"] + dx * math.sin(t) + dy * math.cos(t))
+    # Offset from the rotation axis turns with the wrist; subtracting TOOL_AXIS_MM keeps theta 0 unchanged
+    rx, ry = _rot(t, dx + TOOL_AXIS_MM[0], dy + TOOL_AXIS_MM[1])
+    return pose["x"] + rx - TOOL_AXIS_MM[0], pose["y"] + ry - TOOL_AXIS_MM[1]
 
 
 def project_xy(pose: dict, intr: dict, table_xy, depth_mm: float) -> tuple:
     """Pixel (u, v) where a table point appears at camera distance depth_mm: the inverse of world_xy()."""
     t = math.radians(THETA_SIGN * float(pose.get("theta", 0.0)))
-    wx, wy = table_xy[0] - pose["x"], table_xy[1] - pose["y"]
-    dx, dy = wx * math.cos(t) + wy * math.sin(t), -wx * math.sin(t) + wy * math.cos(t)  # rotate by -t
+    # Undo world_xy(): offset from the rotation axis, rotated back by -t, then back to the jaw-axis offset
+    rx, ry = _rot(-t, table_xy[0] - pose["x"] + TOOL_AXIS_MM[0], table_xy[1] - pose["y"] + TOOL_AXIS_MM[1])
+    dx, dy = rx - TOOL_AXIS_MM[0], ry - TOOL_AXIS_MM[1]
     yc, xc = JAW_IN_CAM_MM[1] - dx, JAW_IN_CAM_MM[0] - dy
     return intr["cx"] + xc * intr["fx"] / depth_mm, intr["cy"] + yc * intr["fy"] / depth_mm
 
