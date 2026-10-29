@@ -5,8 +5,8 @@ Hackathon: Viam x MongoDB, Oct 29-30 2026. Demo Friday 3:30 PM. Hardware on `sfh
 ## Demo story
 
 1. **Overnight practice.** The robot practiced unattended on ~6 objects. The dashboard shows success rate over time, per object and per grasp type.
-2. **Language.** "Put the thing you drink from into the box" → it picks the cup (CLIP text→image match, not color), using the grasp it learned works for cups overnight.
-3. **Teach once.** An unseen object → zero-shot guess → wrong → one click to correct → next time it is right.
+2. **Language.** Type "the thing you drink from" → it picks the cup (CLIP text→image match, not color) with the grasp it learned for cups overnight, and drops it in the blue square. The destination is always the blue square.
+3. **Teach once.** The words pick the wrong object → one click on the right one → next time the same words find it.
 
 Atlas does three jobs: vector search (what is this / which object did the user mean), memory that drives control (which grasp to use), and the ledger behind the dashboard.
 
@@ -15,12 +15,12 @@ Atlas does three jobs: vector search (what is this / which object did the user m
 | Module | Job | Owner |
 |---|---|---|
 | Perception | Find every object on the table, measure its shape, embed it | B |
-| Memory (Atlas) | Object library, grasp stats, places, attempts, commands | B |
+| Memory (Atlas) | Object library, grasp stats, attempts, commands | B |
 | Grasp planner | Pick a grasp primitive + params per object | A |
 | Executor | Move safely, run the primitive, check success | A |
-| Language | Parse a command, ground object and place | C |
+| Language | Match a text description to an object on the table | C |
 | Autonomy | Self-reset loop + watchdog for overnight | A |
-| UI | Live view, command box, teach buttons, Charts | C |
+| UI | Live view, text box, click-to-correct, Charts | C |
 
 The control loop runs on the `sfhack4-main` Linux box (LAN, survives laptop sleep). The laptop only hosts the UI.
 
@@ -58,24 +58,23 @@ Parameters (all relative to the object, never absolute poses): `yaw_offset`, `z_
 ## 3. Atlas data model
 
 ```
-views     { object_id, label, embedding[512], cam_pose, img_path }            # vector index on embedding, filter: label, bin
-objects   { _id, label, bin, aliases[], text_emb[512], geometry{l,w,h,hollow},
+views     { object_id, label, embedding[512], cam_pose, img_path }            # vector index on embedding, filter: label
+objects   { _id, label, aliases[], geometry{l,w,h,hollow},
             grasps: [{ id, primitive, params{...}, n_try, n_ok }] }
-places    { name, aliases[], text_emb[512], drop_pose }                       # "box", "blue square", bins
 attempts  { ts, run_id, mode: overnight|demo|teach, object_id, sim, grasp_id, primitive, params,
             success, fail_reason, img_before, img_after, duration_s }
-commands  { ts, text, parsed{object, place}, chosen_object, score, margin, place, success }
+commands  { ts, text, chosen_object, score, margin, corrected_to, success }
 ```
 
 Several `views` per object (multi-angle), so a query takes the top-k views and votes by label.
 
 ## 4. Object library pre-collection (Day 1 afternoon)
 
-`scripts/scan_object.py`: put an object in the centre → the arm visits 8 poses (2 heights × 4 wrist angles) → 8 views embedded → asks for label, bin, aliases → writes `views` + `objects`. About 1 minute per object. Target 15–25 objects: everything the organizers provide plus our own.
+`scripts/scan_object.py`: put an object in the centre → the arm visits 8 poses (2 heights × 4 wrist angles) → 8 views embedded → asks for label and aliases → writes `views` + `objects`. About 1 minute per object. Target 15–25 objects: everything the organizers provide plus our own.
 
 ## 5. Overnight autonomy (organizers confirmed overnight running is allowed)
 
-Loop: observe → pick a random object in the workspace → choose grasp (Thompson) → execute → success check → **place it at a random free spot in the workspace** (self-reset, not into a bin) → log → repeat. 4–6 different objects on the table for variety.
+Loop: observe → pick a random object in the workspace → choose grasp (Thompson) → execute → success check → **place it at a random free spot in the workspace** (self-reset, not into the square) → log → repeat. 4–6 different objects on the table for variety.
 
 Watchdog:
 
@@ -88,25 +87,26 @@ Before leaving (by ~8:30 PM): 30 attended minutes with no table hits and no obje
 
 Expected volume: ~12 h × (3600 / ~50 s per attempt) ≈ 850 attempts (cycle time not measured yet).
 
-## 6. Language commands
+## 6. Language: describe the object, it goes in the blue square
 
-1. Input: text box, optional mic (browser Web Speech API).
-2. Parse to `{object, place}` with templates only (no LLM): `put/move/place X in/into/on Y`, plus a Chinese template `把 X 放到/放进 Y`. Unmatched sentences are rejected with a message showing the supported forms.
-3. Ground the object: CLIP text embedding of `"a photo of " + X` vs. each detected crop → argmax. `"this"` means the object nearest the pick-zone centre. A small fixed set of spatial words is handled by rules on the detection list: `left/right` (image x), `nearest/farthest` (distance to the arm), `biggest/smallest` (footprint area); the rest of the phrase is still matched with CLIP among the remaining candidates.
-4. Ground the place: match against `places.aliases` / `text_emb`.
-5. If the top two candidates are close, highlight both in the UI and ask the user to choose. Text-image scores are lower than image-image, so compare candidates against each other rather than using a fixed threshold.
-6. Execute with the normal grasp pipeline; log to `commands`.
+The destination is always the blue square, so there is nothing to parse. No LLM, no templates.
+
+1. Input: a text box (optional mic via the browser Web Speech API) where the user describes **only the object**: "the cup", "something to drink from", "黄色的方块".
+2. Ground: CLIP text embedding of `"a photo of " + text` vs. each detected crop on the table → argmax.
+3. If the top two are close, highlight both and let the user click the right one. Compare candidates against each other, not against a fixed threshold (text-image scores run lower than image-image).
+4. That click is the teach-once step: store the clicked crop's embedding with the typed text as a label/alias, so the same words find it next time.
+5. Run the normal grasp pipeline → drop in the blue square; log to `commands`.
 
 ## 7. UI (laptop browser)
 
-Live camera with detection boxes and the chosen grasp drawn on top · command box · teach panel (bin buttons + label field) · embedded Atlas Charts (success over time, per object, per primitive, language success).
+Live camera with detection boxes and the chosen grasp drawn on top · command box · click-to-correct on the live view · embedded Atlas Charts (success over time, per object, per primitive, language success).
 
 ## 8. Timeline
 
 | When | A: robot / executor | B: perception / Atlas | C: language / UI |
 |---|---|---|---|
 | Thu → 1 PM | fix frame lag; stable `TOP_PINCH` pick-and-place | `align_color_depth`; depth segmentation; CLIP; Atlas collections + indexes | UI skeleton; Charts wired to `attempts` |
-| 2–5 PM | `RIM`, `SOFT`, success check | `scan_object.py`; scan 15–25 objects | parse + grounding |
+| 2–5 PM | `RIM`, `SOFT`, success check | `scan_object.py`; scan 15–25 objects | text → object grounding |
 | 5–8 PM | self-reset loop + watchdog | Thompson selection + stats updates | command flow end-to-end |
 | 8–8:45 PM | attended 30-minute test, checklist, start overnight | | |
 | Fri 9–10 AM | analyze the night, fix the top failure mode | write best grasps back to `objects` | dashboard from overnight data |
@@ -117,7 +117,7 @@ Live camera with detection boxes and the chosen grasp drawn on top · command bo
 ## Cut lines
 
 - `SIDE` grasp is stretch only.
-- Spatial-word rules → plain CLIP match only. Mic → text box only.
+- Mic → text box only.
 - Depth segmentation not working by 1 PM → color-only objects.
 - Self-reset loop not stable by 8 PM → run the overnight loop on one known object at a fixed spot, just to get a reliable curve.
 
