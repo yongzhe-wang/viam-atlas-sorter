@@ -469,16 +469,31 @@ def find_drop_square(rgb: np.ndarray, depth: np.ndarray, plane: tuple = None) ->
     from PIL import Image
 
     hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
-    blue = (hsv[..., 0] >= 130) & (hsv[..., 0] <= 165) & (hsv[..., 1] > 120) & (hsv[..., 2] > 50)
-    blue = ndimage.binary_closing(blue, iterations=3)
-    lab, n = ndimage.label(~blue)
-    if not n:
-        return None
-    border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
     d = depth.astype(float)
     a, b, c = plane or fit_table(d)  # reuse segment_full's plane when the caller has it
     H, W = d.shape
     min_area = SQUARE_MIN_AREA_PX * area_scale(float(a * W / 2 + b * H / 2 + c))
+    # Strict tape mask first; one looser retry (lower saturation/brightness, wider hue) because the real z=500 sweep
+    # found no square although geometry and a simulated higher view both say it was fully in view: exposure at a
+    # different height is the remaining suspect. The hole checks (enclosed, large, mostly white) stay the same.
+    for hlo, hhi, smin, vmin in ((130, 165, 120, 50), (120, 172, 70, 40)):
+        blue = (hsv[..., 0] >= hlo) & (hsv[..., 0] <= hhi) & (hsv[..., 1] > smin) & (hsv[..., 2] > vmin)
+        hit = _enclosed_white_hole(hsv, ndimage.binary_closing(blue, iterations=3), min_area, (a, b, c))
+        if hit:
+            return hit
+    return None
+
+
+def _enclosed_white_hole(hsv: np.ndarray, blue: np.ndarray, min_area: float, plane: tuple):
+    """Largest non-blue region not touching the border, >= min_area and mostly white paper; or None."""
+    a, b, c = plane
+    lab, n = ndimage.label(~blue)
+    if not n:
+        return None
+    border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
+    # "White" relative to this frame's exposure: at 60 % brightness the paper fell below a fixed V>150 and the square
+    # was lost at every height in simulation; capped at 150 so normal exposures behave exactly as before
+    v_white = min(150.0, 0.8 * float(np.percentile(hsv[::4, ::4, 2], 95)))
     best = None
     for i, sl in enumerate(ndimage.find_objects(lab), start=1):
         if sl is None or i in border:
@@ -487,7 +502,7 @@ def find_drop_square(rgb: np.ndarray, depth: np.ndarray, plane: tuple = None) ->
         area = int(m.sum())
         if area < min_area or (best and area <= best["area"]):
             continue
-        white = (hsv[sl][..., 1][m] < 60).mean() > 0.6 and (hsv[sl][..., 2][m] > 150).mean() > 0.6
+        white = (hsv[sl][..., 1][m] < 60).mean() > 0.6 and (hsv[sl][..., 2][m] > v_white).mean() > 0.6
         if not white:
             continue
         vs, us = np.nonzero(m)
