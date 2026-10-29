@@ -582,12 +582,36 @@ def _enclosed_white_hole(hsv: np.ndarray, blue: np.ndarray, min_area: float, pla
                 continue
         u, v = sl[1].start + us.mean(), sl[0].start + vs.mean()
         best = {"centroid_px": (float(u), float(v)), "area": area, "bbox": bbox,
-                "depth_mm": float(a * u + b * v + c)}  # flat paper: the table plane at its centre
+                "depth_mm": float(a * u + b * v + c), "_i": i, "_sl": sl}  # flat paper: the table plane at its centre
         if cut:
             # Border-cut, or "enclosed" only by a few edge rows: on 060 the vignetted bottom rows of the paper read as
             # tape, so a hole running off the bottom looked whole and its centroid sat 20 mm off on the map
             best.update(partial=True, cut=cut)
+    if best is not None:
+        best["hull_px"], best["hull_cut"] = _hole_hull(lab, best.pop("_i"), best.pop("_sl"), plane)
     return best
+
+
+def _hole_hull(lab: np.ndarray, i: int, sl: tuple, plane: tuple) -> tuple:
+    """
+    Convex hull of the hole (objects on the paper filled in): ([[u, v, depth_mm], ...] counter-clockwise,
+    [cut per edge i -> i+1]). An edge is cut when both ends lie on the same image side (within SQUARE_EDGE_PX):
+    that side of the hull is the frame, not tape. table_map fits the full rectangle from the other edges.
+    """
+    from scipy.spatial import ConvexHull
+
+    a, b, c = plane
+    H, W = lab.shape
+    pad = (slice(max(sl[0].start - 2, 0), min(sl[0].stop + 2, H)), slice(max(sl[1].start - 2, 0), min(sl[1].stop + 2, W)))
+    m = ndimage.binary_fill_holes(lab[pad] == i)
+    vs, us = np.nonzero(m & ~ndimage.binary_erosion(m))  # the rim is enough for the hull
+    pts = np.column_stack([us + pad[1].start, vs + pad[0].start]).astype(float)
+    hp = pts[ConvexHull(pts).vertices]
+    e = SQUARE_EDGE_PX
+    side = [{s for s, hit in (("top", v <= e), ("bottom", v >= H - 1 - e), ("left", u <= e), ("right", u >= W - 1 - e))
+             if hit} for u, v in hp]
+    cut = [bool(side[k] & side[(k + 1) % len(hp)]) for k in range(len(hp))]
+    return [[float(u), float(v), float(a * u + b * v + c)] for u, v in hp], cut
 
 
 def segment(rgb: np.ndarray, depth: np.ndarray) -> tuple:

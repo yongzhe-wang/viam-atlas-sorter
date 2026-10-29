@@ -10,8 +10,9 @@ Flow: frames {id, rgb, depth, pose, intrinsics?} -> recognise_all per frame -> t
 
 Map doc (Store.save_map / latest_map, AGENT 2), latest wins:
   {ts, frames: [{id, pose}], objects: [{id, label, names, xy, height_mm, score, colour, colours, size_mm, frame_ids, emb}],
-   square?: {xy, size_mm: [along x, along y], partial, frame_ids}}   (drop zone: white interior of the blue tape;
-   partial=True: only border-cut views so far, xy/size are the seen part, not the hole centre: never place there)
+   square?: drop_square entry {xy, size_mm, yaw_deg, corners, partial, confidence, ...}}   (drop zone: white
+   interior of the blue tape, estimated whole even from border-cut views; partial=True: not all four tape edges seen
+   yet, so look at it fully before placing)
 label/names are None/[] for objects the library does not know; emb (512 floats) lets open-vocabulary queries run
 on the map without re-embedding crops.
 """
@@ -25,50 +26,11 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
-from sorter import clip_embed, perception
+from sorter import clip_embed, drop_square, perception
 
 MERGE_XY_MM = 40.0  # two sightings this close on the table can be the same object
 MERGE_DH_MM = 15.0  # ... if their heights agree
 MERGE_COS = 0.70  # ... and, when not both labelled, their crops look alike (same as label_scan grouping)
-
-
-SQUARE_MOVED_MM = 20.0  # a partial view sticking out of the known square by more than this: the paper was moved
-# A full view this far from the stored centre replaces it instead of averaging: full views agree within ~1.3 mm,
-# and averaging the ~28 mm push of the paper (076 -> 084) left the centre half-way, at 383 instead of 397
-# {REPLAY 2026-10-29 "SQUARE ([383.3, 85.5], FALSE)"; 084 FULL "X 339-456"} [CONFIDENCE: CONFIRMED 85% — one move seen]
-SQUARE_JUMP_MM = 10.0
-
-
-def _square_obs(sq: dict, pose: dict, intr: dict) -> dict:
-    """
-    One find_drop_square() hit on the table: {xy, size_mm: [along x, along y], partial}.
-
-    Size from the world xy of the bbox corners (any wrist angle); xy is the hole centroid when the whole hole was
-    seen, else the centre of the visible part (partial: a lower bound of the interior, never a place target).
-    """
-    u0, v0, u1, v1 = sq["bbox"]
-    cs = [perception.world_xy(pose, intr, u, v, sq["depth_mm"]) for u in (u0, u1) for v in (v0, v1)]
-    b = (min(c[0] for c in cs), max(c[0] for c in cs), min(c[1] for c in cs), max(c[1] for c in cs))
-    partial = bool(sq.get("partial"))
-    xy = ((b[0] + b[1]) / 2, (b[2] + b[3]) / 2) if partial else perception.world_xy(pose, intr, *sq["centroid_px"], sq["depth_mm"])
-    return {"xy": xy, "size_mm": (b[1] - b[0], b[3] - b[2]), "partial": partial}
-
-
-def _sq_bounds(sq: dict) -> tuple:
-    """(x0, x1, y0, y1) of a square entry / observation."""
-    (x, y), (sx, sy) = sq["xy"], sq["size_mm"]
-    return x - sx / 2, x + sx / 2, y - sy / 2, y + sy / 2
-
-
-def _sq_from_bounds(b: tuple) -> dict:
-    """Square entry fields back from (x0, x1, y0, y1)."""
-    return {"xy": [round((b[0] + b[1]) / 2, 1), round((b[2] + b[3]) / 2, 1)],
-            "size_mm": [round(b[1] - b[0], 1), round(b[3] - b[2], 1)]}
-
-
-def _sq_union(bs: list) -> tuple:
-    """Bounds covering all of `bs`: partial views from several poses add up to more of the interior."""
-    return min(b[0] for b in bs), max(b[1] for b in bs), min(b[2] for b in bs), max(b[3] for b in bs)
 
 
 def _detections(frames: list, store) -> tuple:
@@ -79,7 +41,7 @@ def _detections(frames: list, store) -> tuple:
         intr = {**perception.INTRINSICS, **(f.get("intrinsics") or {})}
         sq = perception.find_drop_square(f["rgb"], f["depth"])
         if sq:
-            squares.append({**_square_obs(sq, f["pose"], intr), "frame": f["id"]})
+            squares.append({**drop_square.observe(sq, f["pose"], intr), "frame": f["id"]})
         for r in clip_embed.recognise_all(f["rgb"], f["depth"], store):
             o = r["obj"]
             xy = perception.world_xy(f["pose"], intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
@@ -174,34 +136,27 @@ def map_from_frames(frames: list, store=None) -> dict:
                     "emb": [round(float(x), 4) for x in e / np.linalg.norm(e)]})  # 4 decimals: ~3x smaller doc
     doc = {"ts": time.time(), "frames": [{"id": f["id"], "pose": f["pose"]} for f in frames], "objects": out,
            "timing_ms": [round(x) for x in ms]}
-    full = [q for q in squares if not q["partial"]]
-    if full:
-        # Median over the frames that saw the whole square; frames agreed within ~1.3 mm on the z=400 survey
-        doc["square"] = {"xy": [round(float(np.median([q["xy"][k] for q in full])), 1) for k in (0, 1)],
-                         "size_mm": [round(float(np.median([q["size_mm"][k] for q in full])), 1) for k in (0, 1)],
-                         "partial": False, "frame_ids": [q["frame"] for q in full]}
-    elif squares:
-        # Only border-cut views: the union of their visible parts, flagged partial (its xy is not the hole centre)
-        doc["square"] = {**_sq_from_bounds(_sq_union([_sq_bounds(q) for q in squares])), "partial": True,
-                         "frame_ids": [q["frame"] for q in squares]}
+    sq = None
+    for q in squares:  # every view of the square, whole or border-cut, folded as the live map does
+        sq = drop_square.update(sq, q, doc["ts"])
+    if sq is not None:
+        doc["square"] = {**sq, "frame_ids": [q["frame"] for q in squares]}
     _mark_in_square(doc)
     return doc
 
 
-SQUARE_MARGIN_MM = 10.0  # an object this close to the square's interior counts as inside it
-
-
 def _mark_in_square(tmap: dict) -> None:
     """
-    Flag every object whose xy lies in the drop square's interior (in_square=True).
+    Flag every object whose xy lies in the drop square's estimated full interior (in_square=True), partial or not.
 
     WHY: the module filters objects already in the square out of a single frame, but a query against the map would
-    otherwise pick the yellow block out of the square again after it was delivered.
+    otherwise pick the yellow block out of the square again after it was delivered; with the square only partly in
+    view the visible part is too small, so the estimated rectangle (drop_square) is used.
+    {VIAM CENTERAL 2026-10-29 ""OBJECTS IN THE SQUARE" USES THE ESTIMATED FULL INTERIOR EVEN WHEN PARTIAL"}
     """
     sq = tmap.get("square")
     for e in tmap["objects"]:
-        e["in_square"] = bool(sq) and (abs(e["xy"][0] - sq["xy"][0]) <= sq["size_mm"][0] / 2 + SQUARE_MARGIN_MM
-                                       and abs(e["xy"][1] - sq["xy"][1]) <= sq["size_mm"][1] / 2 + SQUARE_MARGIN_MM)
+        e["in_square"] = drop_square.contains(sq, e["xy"])
 
 
 # ---- dynamic map: every frame the arm takes updates it ------------------------------------------------------
@@ -247,6 +202,12 @@ def _ensure_map(tmap: dict) -> dict:
         e["size_mm"] = list(e.get("size_mm") or [0.0, 0.0])
         e.setdefault("n_seen", len(e["frame_ids"]))
     tmap["objects"], tmap["next_id"] = objs, next_id
+    if tmap.get("square") is not None:
+        sq = drop_square.from_legacy(tmap["square"])  # a square saved before drop_square: rebuilt as a model entry
+        if sq is None:
+            tmap.pop("square")
+        else:
+            tmap["square"] = sq
     tmap.setdefault("last_update", None)
     tmap.setdefault("ts", 0.0)
     return tmap
@@ -314,8 +275,8 @@ def observe_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = N
     {VIAM CENTERAL 2026-10-29 "MAKE THE MAP A DETERMINISTIC FOLD OVER IT … USING THE STORED DETECTIONS (NO RE-RECOGNITION)"}
     [CONFIDENCE: CONFIRMED 90% — live vs replay compared on the 89-frame scan, see fold_observations]
     recognised / seg as for update_map(). Record: {ts, source, pose, intr, shape, table_depth_mm, detections:
-    [{label, names, score, xy, height_mm, bbox, colour, colours, size_mm, partial, emb16}], square: {xy, size_mm,
-    partial, cut} | None, intruders: [bbox], depth_valid}.
+    [{label, names, score, xy, height_mm, bbox, colour, colours, size_mm, partial, emb16}], square: drop_square.observe()
+    {hull_xy, real, cut, partial, xy, size_mm} | None, intruders: [bbox], depth_valid}.
     """
     intr = {**perception.INTRINSICS, **(intr or {})}
     seg = seg if seg is not None else perception.segment_full(rgb, depth)
@@ -334,11 +295,7 @@ def observe_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = N
                      "partial": bool(r.get("partial")),
                      "emb16": base64.b64encode(np.asarray(r["emb"], np.float16).tobytes()).decode()})
     sq = perception.find_drop_square(rgb, depth, plane=seg.plane)
-    square = None
-    if sq:
-        s = _square_obs(sq, pose, intr)
-        square = {"xy": [round(float(c), 2) for c in s["xy"]], "size_mm": [round(float(c), 2) for c in s["size_mm"]],
-                  "partial": s["partial"], "cut": list(sq.get("cut", []))}
+    square = drop_square.observe(sq, pose, intr) if sq else None
     return {"ts": float(time.time() if now is None else now), "source": source,
             "pose": {k: float(pose[k]) for k in ("x", "y", "z", "theta") if k in pose},
             "intr": {k: float(intr[k]) for k in ("fx", "fy", "cx", "cy")},
@@ -356,7 +313,7 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
       2. partly visible (edge) detections reset misses without moving the entry (see below)
       3. negative evidence: an entry that should be clearly visible here but was not detected gets a miss;
          MISSES_TO_DROP misses in a row remove it; an observation with a hand in view gives no negative evidence
-      4. the drop square is updated (whole view: centre; border-cut view: confirm, grow or replace)
+      4. the drop square is refined from the tape edges this view sees (drop_square.update), or gets a miss
     Per object, "seen_ts" is the ts of the last observation that saw it; the map's "ts" the last update.
     """
     t0 = time.perf_counter()
@@ -441,32 +398,17 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
         dropped = [e for e in objs if e.get("misses", 0) >= MISSES_TO_DROP]
         tmap["objects"] = [e for e in objs if e.get("misses", 0) < MISSES_TO_DROP]
 
-    obs = rec["square"]
-    if obs:
-        old = tmap.get("square")
-        if not obs["partial"]:
-            # Whole hole seen: smooth the centre, but jump when it moved or the old entry was only a partial view
-            xy = obs["xy"]
-            a = 1.0 if not old or old.get("partial") or math.dist(old["xy"], xy) > SQUARE_JUMP_MM else XY_ALPHA
-            oxy = old["xy"] if old else xy
-            tmap["square"] = {"xy": [round((1 - a) * oxy[0] + a * xy[0], 1), round((1 - a) * oxy[1] + a * xy[1], 1)],
-                              "size_mm": [round(obs["size_mm"][0], 1), round(obs["size_mm"][1], 1)],
-                              "partial": False, "seen_ts": now, "misses": 0}
-        else:
-            ob, b = (_sq_bounds(old) if old else None), _sq_bounds(obs)
-            m = SQUARE_MOVED_MM
-            if old and not old.get("partial") and ob[0] - m <= b[0] and b[1] <= ob[1] + m and ob[2] - m <= b[2] and b[3] <= ob[3] + m:
-                # Part of the full square we know: confirm it, keep the full view's centre and size
-                old.update(seen_ts=now, misses=0)
-            else:
-                # No full view yet (grow the known part while views overlap), or the paper moved (start over)
-                if old and old.get("partial") and b[0] <= ob[1] and ob[0] <= b[1] and b[2] <= ob[3] and ob[2] <= b[3]:
-                    b = _sq_union([ob, b])
-                tmap["square"] = {**_sq_from_bounds(b), "partial": True, "seen_ts": now, "misses": 0}
-    elif tmap.get("square") and not hand and _expected_visible(
-            {"height_mm": 0.0, "size_mm": tmap["square"]["size_mm"]}, rec, grid, xy=tmap["square"]["xy"]):
-        tmap["square"]["misses"] = tmap["square"].get("misses", 0) + 1
-        if tmap["square"]["misses"] >= MISSES_TO_DROP:
+    obs, sq = rec["square"], tmap.get("square")
+    if obs and "hull_xy" in obs:
+        # Every view of the square, whole or border-cut, refines one rectangle (drop_square: sides, yaw, size)
+        new = drop_square.update(sq, obs, now)
+        if new is not None:
+            tmap["square"] = new
+    elif not obs and sq and not hand and _expected_visible(
+            {"height_mm": 0.0, "size_mm": [2 * drop_square.radius(sq)] * 2}, rec, grid, xy=sq["xy"]):
+        # Its whole estimated interior should be in view and it was not found: gone (MISSES_TO_DROP in a row)
+        sq["misses"] = sq.get("misses", 0) + 1
+        if sq["misses"] >= MISSES_TO_DROP:
             tmap.pop("square")
 
     _mark_in_square(tmap)

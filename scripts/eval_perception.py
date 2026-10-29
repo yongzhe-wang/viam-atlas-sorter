@@ -12,6 +12,7 @@ Usage (data in data/eval/, gitignored):
   eval_perception.py report [--store] [--absent "green square" ...]
   eval_perception.py demo                    rehearsal queries (docs/demo_queries.md) on arm-scan frames
   eval_perception.py sweep                   AGENT1's high sweep frames (kind sweep_test): timing, map, queries
+  eval_perception.py square                  drop square per frame (whole or border-cut) vs full-view truth
 Env for capture: VIAM_MACHINE_ADDRESS, VIAM_API_KEY_ID, VIAM_API_KEY.
 """
 import asyncio
@@ -230,6 +231,57 @@ def report(use_store: bool, absent: list) -> None:
         print(f"top-1 ({m}): {hits[m]}/{n_q} = {hits[m] / max(n_q, 1):.0%}")
 
 
+def square() -> None:
+    """
+    The drop square on every arm-scan frame that sees it: each view alone, and all views folded in time order.
+
+    WHY: the user moves the paper freely, so a border-cut view must still place the whole square; this measures how
+    far each single view's estimate is from the truth. Truth per placement of the paper ("era": the fold restarted,
+    i.e. the paper moved or turned) = median of that era's views that saw all four tape edges.
+    """
+    import math
+
+    from sorter import drop_square
+
+    scan = EVAL.parent / "scan"
+    recs = []
+    for pj in sorted(scan.glob("[0-9][0-9][0-9].json")):
+        meta = json.loads(pj.read_text())
+        if not isinstance(meta, dict) or "pose" not in meta:
+            continue
+        rgb = np.asarray(Image.open(pj.with_suffix(".jpg")).convert("RGB"))
+        hit = perception.find_drop_square(rgb, np.load(scan / f"{pj.stem}_depth.npy"))
+        if hit:
+            intr = {**perception.INTRINSICS, **meta.get("intrinsics", {})}
+            recs.append((meta.get("ts", 0.0), pj.stem, drop_square.observe(hit, meta["pose"], intr), meta["pose"]))
+    recs.sort()
+    # Fold in time order; an era is one placement of the paper (drop_square restarts on a move/turn: since_ts)
+    sq, eras, folded = None, {}, {}
+    for ts, n, r, _ in recs:
+        sq = drop_square.update(sq, r, ts)
+        eras[n], folded[n] = sq["since_ts"], dict(sq)
+    single = {n: drop_square.update(None, r, ts) for ts, n, r, _ in recs}
+    truth = {}
+    for e in set(eras.values()):
+        full = [single[n]["xy"] for n in eras if eras[n] == e and not single[n]["partial"]]
+        truth[e] = tuple(np.median(full, axis=0)) if full else None
+    errs = []
+    print(f"{'frame':5} {'pose':>22} {'sides':8} {'conf':>4} {'yaw':>6} {'single-view xy':>16} {'err':>5}  {'folded xy':>16} {'err':>5}")
+    for ts, n, r, pose in recs:
+        s, f, t = single[n], folded[n], truth[eras[n]]
+        e1 = math.dist(s["xy"], t) if t else float("nan")
+        e2 = math.dist(f["xy"], t) if t else float("nan")
+        if s["partial"] and t:
+            errs.append(e1)
+        print(f"{n:5} ({pose['x']:4.0f},{pose['y']:5.0f},{pose['z']:3.0f},{pose['theta']:+4.0f}) {''.join(sorted(s['sides'])):8} "
+              f"{s['confidence']:4.2f} {s['yaw_deg']:+6.1f} {str(s['xy']):>16} {e1:5.1f}  {str(f['xy']):>16} {e2:5.1f}"
+              f"{'' if s['partial'] else '  (full view)'}")
+    for e, t in sorted(truth.items()):
+        print(f"era since ts {e:.0f}: truth {np.round(t, 1).tolist() if t else None} from the full views")
+    if errs:
+        print(f"partial single views: {len(errs)}, centre error median {np.median(errs):.1f} mm, max {max(errs):.1f} mm")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "capture":
@@ -242,6 +294,8 @@ if __name__ == "__main__":
         demo()
     elif cmd == "sweep":
         sweep()
+    elif cmd == "square":
+        square()
     elif cmd == "report":
         # report [--store] [--absent "green square" ...]
         rest = sys.argv[2:]
