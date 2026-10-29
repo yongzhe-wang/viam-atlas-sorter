@@ -255,20 +255,24 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
     laptop key, and with only the green cylinder in view it would grab the cylinder. Refuses when the colour
     is wrong, when the library recognises the best candidate as a different object, or when the match is weak.
     `recognised`: recognise_all() output; then objs may be None and no crop is embedded again.
-    Returns {"obj", "score", "margin", "ambiguous", "reason", "recognised"}; obj is None when refusing.
+    Returns {"obj", "score", "margin", "ambiguous", "reason", "recognised", "searchable"}; obj is None when
+    refusing. searchable = refused, but the library knows what was named: it is just not in this view, so the
+    caller should look where the library last saw it (where_is). Use the flag, not the reason text: "no green
+    object found" and "best candidate is recognised as 'yellow cylinder'" are both searchable refusals.
     """
     if objs is None:
         objs = [r["obj"] for r in recognised or []]
+    known = store is not None and any(name_matches(text, n) for n in library_names(store))
     r = rank(objs, text, store, recognised)
     if not r:
         return {"obj": None, "score": 0.0, "margin": 0.0, "ambiguous": False, "reason": "no objects on the table",
-                "recognised": None}
+                "recognised": None, "searchable": known}
     (o, s), margin = r[0], (r[0][1] - r[1][1]) if len(r) > 1 else 1.0
-    out = {"obj": None, "score": s, "margin": margin, "ambiguous": False, "reason": "", "recognised": o.recognised}
+    out = {"obj": None, "score": s, "margin": margin, "ambiguous": False, "reason": "", "recognised": o.recognised,
+           "searchable": False}
     qcol = set(clean_query(text).split()) & COLOURS
     # The library knows this query ("candy" is an alias of the KIND bar): then only an object recognised as it
     # may be picked. Without this, "candy" with the bar out of view picked an unrecognised cup fragment.
-    known = store is not None and any(name_matches(text, n) for n in library_names(store))
     if qcol and not colour_ok(qcol, o.colour):
         out["reason"] = f"no {'/'.join(sorted(qcol))} object found"
     elif o.recognised is not None and not name_matches(text, o.recognised_names):
@@ -279,4 +283,5 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
         out["reason"] = f"best match only {s:.2f}"
     else:
         out.update(obj=o, ambiguous=margin < AMBIGUOUS_MARGIN)
+    out["searchable"] = out["obj"] is None and known
     return out
