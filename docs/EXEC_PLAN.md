@@ -92,6 +92,14 @@ top object (re-detect + servo + depth heights, as in `pick_place_auto.py`) → p
 camera check → `Store.log_attempt` + `finish_command` → dashboard updates.
 Verbs ("grasp", "pick up") are stripped; the destination is always the blue square.
 
+## One command consumer at a time
+
+Both `sorter/worker.py` (heartbeat `sfhack4-worker`) and the Viam module with `consume_dashboard_commands: true`
+(heartbeat `module:<name>`) call `Store.next_command()` and drive the arm. Claiming is atomic, but two consumers
+would still take turns moving the arm. Rule: exactly one is live. Until the module is verified on sfhack4 the
+live consumer is AGENT1's worker; switching to the module is announced by the coordinator, and the worker is
+stopped first. The dashboard warns when both heartbeats are fresh.
+
 ## Person intervention (AGENT1)
 
 - Re-detect the target before every phase (servo, descend, grab, place). Moved → re-servo. Gone → go back
