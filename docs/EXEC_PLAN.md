@@ -88,6 +88,20 @@ Verbs ("grasp", "pick up") are stripped; the destination is always the blue squa
 - Connection drop → reconnect with backoff and resume from the last finished phase (moves are absolute,
   so repeating one is safe). Better: run the worker on the `sfhack4-main` Linux box over LAN.
 
+## Reset: clear the blue square (AGENT1; button by AGENT 2)
+
+Runs before every trial, after every successful place (so trials loop unattended), and on demand from
+the dashboard ("Clear square" button → `Store.add_command("__reset__")`).
+
+1. **Pick-out (preferred):** segment the square region; for each object inside the hole, pick it with the
+   normal executor and drop it at a random free spot in a safe rectangle away from the square
+   (free = no depth blob within 60 mm, not under the tape, inside reach).
+2. **Wipe (fallback when a pick fails twice or the object is too wide/flat to grasp):** gripper closed,
+   fingertips ~10 mm above the measured table, one straight slow pass across the hole toward a side that
+   depth shows is empty; never toward the arm base or the room side. Then re-check; at most 2 passes.
+3. **Verify:** hole is empty by depth (no blob > 8 mm inside the hole). Log `attempts` with `mode: reset`.
+   If it is still not empty → park and report on the dashboard; do not start the next trial.
+
 ## Order of work
 
 | When | AGENT1 (arm) | AGENT 2 (Atlas + dashboard) | AGENT3 (perception) |
