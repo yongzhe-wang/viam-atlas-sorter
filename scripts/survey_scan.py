@@ -212,8 +212,13 @@ async def main() -> None:
 
 
 async def around(points: list, offset: float = 40.0) -> None:
+    """4 library views per point; see around_offsets(). Kept as the --around entry point."""
+    await shoot(points, ((-offset, -offset), (-offset, offset), (offset, -offset), (offset, offset)), "library")
+
+
+async def shoot(points: list, offsets, kind: str) -> None:
     """
-    Extra library frames: 4 views per point, flange at (x +- offset, y +- offset), theta 0, z ALIGN_Z.
+    Extra frames: one per (point, offset), flange at (x + dx, y + dy), theta 0, z ALIGN_Z.
 
     WHY: an object that the grid only saw in corner views (the green cube near the base) needs centred
     views for the object library. Indices continue after the newest frame in data/scan.
@@ -226,13 +231,13 @@ async def around(points: list, offset: float = 40.0) -> None:
     try:
         await ppa.apply_workspace_limits(rig)
         for cx, cy in points:
-            for dx, dy in ((-offset, -offset), (-offset, offset), (offset, -offset), (offset, offset)):
+            for dx, dy in offsets:
                 x, y = cx + dx, cy + dy
                 if not ppa.allowed(x, y) or math.hypot(x, y) < 120.0:
                     print(f"  skip ({x:.0f},{y:.0f}): keep-out or too close to the base")
                     continue
                 await ppa.travel(rig, x, y, theta=0.0)
-                await capture(rig, n, "library", {"around": [cx, cy]})
+                await capture(rig, n, kind, {"around": [cx, cy]})
                 print(f"  frame {n:03d} at ({x:.0f},{y:.0f})")
                 n += 1
     finally:
@@ -246,6 +251,10 @@ if __name__ == "__main__":
     # --free-only: recompute free_spots.json from the saved frames without moving the arm
     if "--free-only" in sys.argv:
         recompute_free()
+    elif "--at" in sys.argv:
+        # --at X,Y [X,Y ...]: one frame exactly at each flange point (e.g. the observe pose for AGENT3's queries)
+        pts = [tuple(map(float, a.split(","))) for a in sys.argv[sys.argv.index("--at") + 1:]]
+        asyncio.run(shoot(pts, ((0.0, 0.0),), "observe"))
     elif "--around" in sys.argv:
         # --around X,Y [X,Y ...]: 4 library views around each flange point
         pts = [tuple(map(float, a.split(","))) for a in sys.argv[sys.argv.index("--around") + 1:]]
