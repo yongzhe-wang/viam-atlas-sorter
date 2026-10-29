@@ -275,7 +275,13 @@ class ObjTracker:
             self.close_uv = None
             if not o.touches_edge:
                 self._learn(rgb, o.mask)
-            return (o.centroid_px[0], o.centroid_px[1], o.yaw_deg, int(o.mask.sum()))
+            # Grasp point = top-face centroid: on a long object that is its thickest part (the screwdriver's
+            # handle), not the overall centroid out on the shaft; on a block it is the top centre. Matching
+            # between frames stays on the overall centroid (far_uv).
+            # {VIAM CENTERAL 2026-10-29 "FOR ELONGATED OBJECTS, CHOOSE THE GRASP POINT AT THE HANDLE/THICKEST SECTION"}
+            # [CONFIDENCE: INFERRED 75% — perception.Obj.top_centroid_px is the top band within TOP_BAND_MM]
+            gu, gv = o.top_centroid_px or o.centroid_px
+            return (gu, gv, o.yaw_deg, int(o.mask.sum()))
         ref = self.close_uv or self.far_uv
         lab, n = ndimage.label(self._close_mask(rgb))
         cands, self._labels = [], []
@@ -317,8 +323,11 @@ async def under_jaws(rig) -> tuple:
     objs = list(seg.objects) + [o for o, _ in seg.excluded]
 
     def off_axis(o):
+        # The servo centres the top face (ObjTracker), so measure from it: a long object's overall centroid
+        # sits out on its shaft, >80 px from the jaws
         au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, o.top_depth_mm)
-        return math.hypot(o.centroid_px[0] - au, o.centroid_px[1] - av)
+        gu, gv = o.top_centroid_px or o.centroid_px
+        return math.hypot(gu - au, gv - av)
 
     under = min(objs, key=off_axis) if objs else None
     return (under if under is not None and off_axis(under) <= 80.0 else None), objs, pose

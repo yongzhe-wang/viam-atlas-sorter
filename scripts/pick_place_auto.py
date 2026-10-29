@@ -59,6 +59,13 @@ TOL_PX = 7.0
 # hangs into the bottom-right (it hid the hole twice on 2026-10-29); then one J^-1 step to the real target
 CARRY_OFFSET_PX = (-276.0, -232.0)
 GRAB_TRIES = 3  # first grab + 2 retries
+# Final approach is open loop: pose, yaw and identity are fixed at standoff (ALIGN_Z, ~350 mm depth: whole object
+# and valid depth in view), then one straight descent. The close-range servo (depth blind < ~280 mm, colour-only
+# tracking) followed parts of objects: the screwdriver's blue end cap, then the blue block (clips_sd2/sd3).
+# {VIAM CENTERAL 2026-10-29 "MAKE THE FINAL APPROACH OPEN-LOOP FOR ALL OBJECTS, FIXING POSE AND IDENTITY AT STANDOFF"}
+# {ARXIV 2001.05650 (HAVILAND ET AL.) RGB-D MIN RANGE ~30 CM; DEPTH-BASED GRASPING FAILS IN THE FINAL PHASE}
+# [CONFIDENCE: SINGLE-SRC 70% — literature + our clips; open-loop accuracy on the arm not measured yet]
+CLOSE_SERVO = False  # True restores the close-range re-alignment at APPROACH_GAP, for A/B on the arm
 # Wait after every move before trusting a camera frame: the lag test measured ~0.5 s of stale frames
 SETTLE_S = 0.6
 # Jaw-axis model fitted from released blocks (data/jaw_calib.json); None until `jaw_calib.py fit` has run
@@ -791,6 +798,7 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     is in view; `check` before every descent, after the wrist turn, where a long object is cut off by the
     fingertips and only continuity can be judged. Before (2026-10-29) one full check ran before each descent
     and refused the blue screwdriver it was centred on: at theta -50 only its handle was in view.
+    Descent: one straight move from ALIGN_Z to the grasp height measured there (CLOSE_SERVO False).
     """
     times = {} if times is None else times
     finder = finder or find_block
@@ -830,17 +838,20 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
                 raise PickFailed(f"lost the target, refusing to grab something else: {why}")
         # Never descend into a hand: check the area the jaws are about to enter
         await rig.wait_clear(axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top))
-        # Close range re-alignment: fingertips APPROACH_GAP above the block top, where pixel offsets are larger
-        # and any error in the depth scaling of JAW_TIP_PX shrinks
-        z_mid = z0 - (top - TIP_BELOW_CAM - APPROACH_GAP)
-        print(f"  table={table:.0f}mm top={top:.0f}mm height={height:.0f}mm -> approach z={z_mid:.0f}")
-        await rig.descend(z_mid)
-        # Too close for the RealSense depth range (~280 mm min), so the block-top depth is carried over
-        # from the measurement above; straight vertical moves keep that relation exact
-        if hasattr(finder, "close_target"):
-            # Where the jaws point at this height: the tracker returns it when the close view cuts the object off
-            finder.close_target = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top - (z0 - z_mid))
-        await rig.servo(finder, True, "block-close", plane_at=lambda z: top - (z0 - z))
+        print(f"  table={table:.0f}mm top={top:.0f}mm height={height:.0f}mm")
+        if CLOSE_SERVO:
+            # Close range re-alignment: fingertips APPROACH_GAP above the block top, where pixel offsets are
+            # larger and any error in the depth scaling of JAW_TIP_PX shrinks
+            z_mid = z0 - (top - TIP_BELOW_CAM - APPROACH_GAP)
+            print(f"  -> approach z={z_mid:.0f}")
+            await rig.descend(z_mid)
+            # Too close for the RealSense depth range (~280 mm min), so the block-top depth is carried over
+            # from the measurement above; straight vertical moves keep that relation exact
+            if hasattr(finder, "close_target"):
+                # Where the jaws point at this height: the tracker returns it when the close view cuts the object off
+                finder.close_target = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top - (z0 - z_mid))
+            await rig.servo(finder, True, "block-close", plane_at=lambda z: top - (z0 - z))
+        # Open loop from here: straight down the tool axis to the height measured at standoff.
         # Fingertips (TIP_BELOW_CAM past the camera) end `grip` below the block top
         z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
         print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
