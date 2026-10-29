@@ -34,6 +34,16 @@ GRIPPER_U = (400, 1280)  # ... and these columns
 DEPTH_LEFT_INVALID_U = 60  # RealSense depth is invalid in a band at its left edge (stereo baseline)
 INTRUDER_MIN_AREA_PX = 6000  # blind-range hole this large could be a hand
 SKIN_FRAC = 0.30  # fraction of skin-coloured pixels that turns a hole or blob into an intruder
+# An intruder must reach this far into the image: a hand reaching for an object does, while static tall
+# scenery cut by the border does not (a laptop hinge at the top edge read 102 mm and paused everything).
+INTRUDER_INNER_MARGIN_PX = 150
+
+
+def _reaches_inside(bbox: tuple, shape: tuple) -> bool:
+    """True if the bbox overlaps the image shrunk by INTRUDER_INNER_MARGIN_PX on every side."""
+    u0, v0, u1, v1 = bbox
+    m, (h, w) = INTRUDER_INNER_MARGIN_PX, shape
+    return u1 > m and u0 < w - m and v1 > m and v0 < h - m
 
 
 @dataclass
@@ -175,11 +185,11 @@ def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple) -> list:
         area = int(m.sum())
         if area < INTRUDER_MIN_AREA_PX:
             continue
+        vs, us = np.nonzero(m)
+        bbox = (int(us.min()), int(vs.min()), int(us.max()), int(vs.max()))
         sk = skin_fraction(rgb, m)
-        if sk >= SKIN_FRAC:
-            vs, us = np.nonzero(m)
-            out.append({"bbox": (int(us.min()), int(vs.min()), int(us.max()), int(vs.max())), "area": area,
-                        "reason": f"blind-range hole, skin {sk:.0%}"})
+        if sk >= SKIN_FRAC and _reaches_inside(bbox, m.shape):
+            out.append({"bbox": bbox, "area": area, "reason": f"blind-range hole, skin {sk:.0%}"})
     return out
 
 
@@ -217,8 +227,10 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         # A tall blob, or a skin-coloured one (a hand resting on the table), is never a target
         sk = skin_fraction(rgb, m)
         if top_h > MAX_OBJ_HEIGHT_MM or sk >= 0.5:
-            intruders.append({"bbox": bbox, "area": int(m.sum()),
-                              "reason": f"blob {top_h:.0f} mm tall, skin {sk:.0%}"})
+            # Never a target; an intruder only if it reaches into the workspace (else static scenery)
+            if _reaches_inside(bbox, m.shape):
+                intruders.append({"bbox": bbox, "area": int(m.sum()),
+                                  "reason": f"blob {top_h:.0f} mm tall, skin {sk:.0%}"})
             continue
         u0, v0, u1, v1 = bbox
         mu, mv = int((u1 - u0) * CROP_MARGIN) + 4, int((v1 - v0) * CROP_MARGIN) + 4
@@ -255,9 +267,10 @@ def colour_name(rgb: np.ndarray, mask: np.ndarray) -> tuple:
     r, g, b = px[:, 0], px[:, 1], px[:, 2]
     hue = np.where(mx == r, ((g - b) / d) % 6, np.where(mx == g, (b - r) / d + 2, (r - g) / d + 4)) * 60.0
     names = np.full(len(px), "grey", dtype=object)
-    sat = s > 0.35
+    # Dark pixels carry a faint hue from white balance; a black charger read "blue" before this
+    sat = (s > 0.35) & (mx > 0.3)
     names[~sat & (mx > 0.8)] = "white"
-    names[~sat & (mx < 0.25)] = "black"
+    names[mx <= 0.3] = "black"
     for lo, hi, nm in [(0, 15, "red"), (15, 40, "orange"), (40, 70, "yellow"), (70, 165, "green"),
                        (165, 200, "cyan"), (200, 260, "blue"), (260, 330, "purple"), (330, 361, "red")]:
         names[sat & (hue >= lo) & (hue < hi)] = nm

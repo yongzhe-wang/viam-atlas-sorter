@@ -22,6 +22,11 @@ COLOUR_BONUS = 0.04  # colour word matches the object's dominant colour (CLIP si
 COLOUR_PENALTY = 0.04  # colour word names a different, saturated colour
 SHAPE_BONUS = 0.02
 STORE_WEIGHT = 0.10  # weight of labelled-view votes from the object library
+# Below this the best crop is not really what was asked for. On frame t01 the correct objects scored
+# 0.27-0.35 while "green square" (no green object present) topped out at 0.203 on a laptop key.
+# [CONFIDENCE: SINGLE-SRC 60% — one frame, 6 objects; re-tune on the scanned set]
+MIN_SCORE = 0.22
+AMBIGUOUS_MARGIN = 0.02  # top-1 minus top-2 below this: let the user confirm in the dashboard
 
 _model = _preprocess = _tokenizer = None
 
@@ -114,3 +119,23 @@ def rank(objs: list, text: str, store=None) -> list:
                 score += STORE_WEIGHT * max(votes)
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
+
+
+def best(objs: list, text: str, store=None) -> dict:
+    """
+    The object to pick for `text`, or a reason not to pick anything.
+
+    WHY: rank() always returns something, so "green square" with no green object on the table would grab a
+    laptop key. Returns {"obj", "score", "margin", "ambiguous", "reason"}; obj is None when there is no match.
+    """
+    r = rank(objs, text, store)
+    if not r:
+        return {"obj": None, "score": 0.0, "margin": 0.0, "ambiguous": False, "reason": "no objects on the table"}
+    (o, s), margin = r[0], (r[0][1] - r[1][1]) if len(r) > 1 else 1.0
+    qcol = set(clean_query(text).split()) & COLOURS
+    if qcol and o.colour not in qcol:
+        return {"obj": None, "score": s, "margin": margin, "ambiguous": False,
+                "reason": f"no {'/'.join(sorted(qcol))} object found"}
+    if s < MIN_SCORE:
+        return {"obj": None, "score": s, "margin": margin, "ambiguous": False, "reason": f"best match only {s:.2f}"}
+    return {"obj": o, "score": s, "margin": margin, "ambiguous": margin < AMBIGUOUS_MARGIN, "reason": ""}
