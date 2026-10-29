@@ -15,6 +15,7 @@ Map doc (Store.save_map / latest_map, AGENT 2), latest wins:
 label/names are None/[] for objects the library does not know; emb (512 floats) lets open-vocabulary queries run
 on the map without re-embedding crops.
 """
+import base64
 import json
 import math
 import time
@@ -219,16 +220,37 @@ def _same_pose(a: dict, b: dict) -> bool:
             and abs(float(a.get("theta", 0)) - float(b.get("theta", 0))) <= SAME_POSE_DEG)
 
 
-def _expected_visible(e: dict, pose: dict, intr: dict, seg, depth: np.ndarray, xy=None) -> bool:
+DEPTH_CELL_PX = 16  # negative evidence reads depth validity per 16x16 px cell, kept in every observation
+# Fields apply_observation() reads from a record (observe_frame() writes all of them)
+REC_KEYS = ("ts", "source", "pose", "intr", "shape", "table_depth_mm", "detections", "square", "intruders", "depth_valid")
+
+
+def _valid_grid(depth: np.ndarray) -> dict:
+    """Depth validity per DEPTH_CELL_PX cell (at least half the pixels have depth), bit-packed for the record."""
+    c = DEPTH_CELL_PX
+    rows, cols = depth.shape[0] // c, depth.shape[1] // c
+    g = (depth[:rows * c, :cols * c] > 0).reshape(rows, c, cols, c).mean(axis=(1, 3)) >= 0.5
+    return {"cell": c, "rows": rows, "cols": cols, "bits": base64.b64encode(np.packbits(g).tobytes()).decode()}
+
+
+def _grid(rec: dict) -> np.ndarray:
+    """The observation's depth-validity grid back as a bool array (rows x cols)."""
+    g = rec["depth_valid"]
+    bits = np.unpackbits(np.frombuffer(base64.b64decode(g["bits"]), np.uint8))
+    return bits[:g["rows"] * g["cols"]].reshape(g["rows"], g["cols"]).astype(bool)
+
+
+def _expected_visible(e: dict, rec: dict, grid: np.ndarray, xy=None) -> bool:
     """
-    Should this map entry be clearly detected in this frame? Its whole extent projects inside the view (minus a
-    margin), with valid depth at its centre (not the blind range, not the held object), not under the fingertips.
+    Should this map entry be clearly detected in this observation? Its whole extent projects inside the view (minus
+    a margin), with valid depth at its centre (not the blind range, not the held object), not under the fingertips.
 
     The whole extent, not just the centre: the 17 cm KIND bar and the 19x14 cm square had their centres inside the
     view while their bodies were cut by the edge, were not detected as whole, and got wrongly dropped.
     """
-    H, W = depth.shape
-    z = max(seg.table_depth_mm - e.get("height_mm", 0.0), 50.0)
+    H, W = rec["shape"]
+    pose, intr = rec["pose"], rec["intr"]
+    z = max(rec["table_depth_mm"] - e.get("height_mm", 0.0), 50.0)
     cx, cy = xy or e["xy"]
     r = 0.5 * max(e.get("size_mm") or [0.0, 0.0])
     m = FOOT_MARGIN_PX
@@ -239,51 +261,76 @@ def _expected_visible(e: dict, pose: dict, intr: dict, seg, depth: np.ndarray, x
     u, v = perception.project_xy(pose, intr, (cx, cy), z)
     if any(u0 <= u < u1 and v0 <= v < v1 for u0, v0, u1, v1 in perception.FINGER_BOXES):
         return False
-    win = depth[int(v) - 7:int(v) + 8, int(u) - 7:int(u) + 8]
-    return bool(win.size and (win > 0).mean() >= 0.5)
+    row, col = int(v) // DEPTH_CELL_PX, int(u) // DEPTH_CELL_PX
+    return bool(0 <= row < grid.shape[0] and 0 <= col < grid.shape[1] and grid[row, col])
 
 
-def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = None, store=None,
-               source: str = "frame", recognised: list = None, seg=None, now: float = None) -> dict:
+def observe_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = None, store=None, recognised: list = None,
+                  seg=None, source: str = "frame", now: float = None) -> dict:
     """
-    Fold one camera frame into the dynamic table map (in place; returns it).
+    One camera frame -> observation record: everything the map takes from it, JSON-safe (AGENT 2 logs these).
 
-    WHY: the user wants every picture the arm takes to keep the map current, so a pick request can be answered
-    without a fresh sweep and moved or removed objects disappear. Per frame:
-      1. detections (recognise_all) -> table xy with the full pose (theta included)
-      2. each detection updates the entry it matches (same label nearby, or same look for unknowns), or moves the
-         one entry of that label if seen confidently elsewhere (one of each object on the table), or adds one
-      3. negative evidence: an entry that should be clearly visible here but was not detected gets a miss;
-         MISSES_TO_DROP misses in a row remove it. Partly visible (edge) objects reset misses without moving the
-         entry; a frame with a hand in view gives no negative evidence.
-      4. the drop square is updated the same way.
-    A frame < SKIP_S after the last one at the same pose is skipped. tmap["last_update"] records what happened.
-
-    tmap None starts an empty map. recognised / seg: the caller's recognise_all(..., include_partial=True) output and
-    the segment_full() it came from, so the same frame is not segmented or embedded twice (recognised without seg:
-    the frame is segmented again but CLIP is skipped; without include_partial there are just no partial sightings).
-    Per object, "seen_ts" is the time of the last frame that saw it; the map's "ts" the last update.
+    WHY: every frame is kept and the map is a fold over the log; the live update_map() and a replay
+    (fold_observations) run the same apply_observation() on the same record, so they build the same map, and a
+    replay needs no images and no CLIP. Detections carry their CLIP embedding as float16 (base64, ~1.4 kB) because
+    unknown objects merge by appearance; depth survives only as the per-cell validity grid negative evidence reads.
+    {VIAM CENTERAL 2026-10-29 "MAKE THE MAP A DETERMINISTIC FOLD OVER IT … USING THE STORED DETECTIONS (NO RE-RECOGNITION)"}
+    [CONFIDENCE: CONFIRMED 90% — live vs replay compared on the 89-frame scan, see fold_observations]
+    recognised / seg as for update_map(). Record: {ts, source, pose, intr, shape, table_depth_mm, detections:
+    [{label, names, score, xy, height_mm, bbox, colour, colours, size_mm, partial, emb16}], square: {xy, size_mm,
+    partial, cut} | None, intruders: [bbox], depth_valid}.
     """
-    tmap = tmap if tmap is not None else empty_map()
-    now = time.time() if now is None else now
-    last = tmap.get("last_update")
-    if last and not last.get("skipped") and now - last["ts"] < SKIP_S and _same_pose(last["pose"], pose):
-        tmap["last_update"] = {**last, "skipped": True, "skip_ts": now}
-        return tmap
-    t0 = time.perf_counter()
     intr = {**perception.INTRINSICS, **(intr or {})}
     seg = seg if seg is not None else perception.segment_full(rgb, depth)
     recs = recognised if recognised is not None else clip_embed.recognise_all(rgb, depth, store, seg=seg,
                                                                                include_partial=True)
+    dets = []
+    for r in recs:
+        o = r["obj"]
+        xy = perception.world_xy(pose, intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+        mm_px = o.top_depth_mm / intr["fx"]
+        dets.append({"label": r["label"], "names": list(r["names"]), "score": round(float(r["score"]), 4),
+                     "xy": [round(float(xy[0]), 2), round(float(xy[1]), 2)], "height_mm": round(float(o.height_mm), 2),
+                     "bbox": [int(c) for c in o.bbox], "colour": o.colour,
+                     "colours": {c: round(float(f), 4) for c, f in (o.colours or {}).items()},
+                     "size_mm": [round(float(o.length_px * mm_px), 2), round(float(o.width_px * mm_px), 2)],
+                     "partial": bool(r.get("partial")),
+                     "emb16": base64.b64encode(np.asarray(r["emb"], np.float16).tobytes()).decode()})
+    sq = perception.find_drop_square(rgb, depth, plane=seg.plane)
+    square = None
+    if sq:
+        s = _square_obs(sq, pose, intr)
+        square = {"xy": [round(float(c), 2) for c in s["xy"]], "size_mm": [round(float(c), 2) for c in s["size_mm"]],
+                  "partial": s["partial"], "cut": list(sq.get("cut", []))}
+    return {"ts": float(time.time() if now is None else now), "source": source,
+            "pose": {k: float(pose[k]) for k in ("x", "y", "z", "theta") if k in pose},
+            "intr": {k: float(intr[k]) for k in ("fx", "fy", "cx", "cy")},
+            "shape": [int(depth.shape[0]), int(depth.shape[1])], "table_depth_mm": round(float(seg.table_depth_mm), 2),
+            "detections": dets, "square": square, "intruders": [[int(c) for c in i["bbox"]] for i in seg.intruders],
+            "depth_valid": _valid_grid(depth)}
+
+
+def apply_observation(tmap: dict, rec: dict) -> dict:
+    """
+    Fold one observation record into the map (in place; returns it). Pure: reads only the record and the map.
+
+      1. each whole detection updates the entry it matches (same label nearby, or same look for unknowns), or moves
+         the one entry of that label if seen confidently elsewhere (one of each object on the table), or adds one
+      2. partly visible (edge) detections reset misses without moving the entry (see below)
+      3. negative evidence: an entry that should be clearly visible here but was not detected gets a miss;
+         MISSES_TO_DROP misses in a row remove it; an observation with a hand in view gives no negative evidence
+      4. the drop square is updated (whole view: centre; border-cut view: confirm, grow or replace)
+    Per object, "seen_ts" is the ts of the last observation that saw it; the map's "ts" the last update.
+    """
+    t0 = time.perf_counter()
+    now, source, pose = rec["ts"], rec["source"], rec["pose"]
+    grid = _grid(rec)
+    hand = bool(rec["intruders"])
     objs = tmap["objects"]
     touched = set()
 
-    def det_of(o, r):
-        xy = perception.world_xy(pose, intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
-        mm_px = o.top_depth_mm / intr["fx"]
-        return {"label": r["label"], "names": r["names"], "xy": xy, "height_mm": o.height_mm, "score": r["score"],
-                "colour": o.colour, "colours": dict(o.colours or {}), "emb": r["emb"],
-                "size_mm": (o.length_px * mm_px, o.width_px * mm_px)}
+    def det(d):
+        return {**d, "emb": np.frombuffer(base64.b64decode(d["emb16"]), np.float16).astype(np.float32)}
 
     def new_entry(d, partial):
         e = {"id": tmap["next_id"], "label": d["label"], "names": list(d["names"]), "xy": list(d["xy"]), "n_seen": 0,
@@ -299,8 +346,7 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
         e["frame_ids"] = (e["frame_ids"] + [source + "@" + str(round(now, 1))])[-20:]
         touched.add(e["id"])
 
-    for r in (r for r in recs if not r.get("partial")):
-        d = det_of(r["obj"], r)
+    for d in (det(d) for d in rec["detections"] if not d["partial"]):
         e = next((e for e in objs if e["id"] not in touched and _same(d, {**e, "emb": np.asarray(e["emb"])})), None)
         if e is None and d["label"] and d["score"] >= MOVE_CONF:
             e = next((e for e in objs if e["label"] == d["label"] and e["id"] not in touched), None)  # it moved
@@ -329,8 +375,7 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
     # - an entry nearby: still there (reset misses, no xy update)
     # - recognised, and the label has no entry, or its entry should be visible here but is not: the object moved
     #   to this edge spot; keep it as a "partial" entry (approximate xy) so the executor knows where to look
-    for r in (r for r in recs if r.get("partial")):
-        d = det_of(r["obj"], r)
+    for d in (det(d) for d in rec["detections"] if d["partial"]):
         e = next((e for e in objs if e["id"] not in touched and math.dist(e["xy"], d["xy"]) <= 1.5 * MERGE_XY_MM
                   and abs(e["height_mm"] - d["height_mm"]) <= MERGE_DH_MM
                   and (not d["label"] or not e["label"] or e["label"] == d["label"])), None)
@@ -343,23 +388,22 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
         e = next((e for e in objs if e["label"] == d["label"] and e["id"] not in touched), None)
         if e is None:
             e = new_entry(d, partial=True)
-        elif e.get("partial") or _expected_visible(e, pose, intr, seg, depth):
+        elif e.get("partial") or _expected_visible(e, rec, grid):
             e.update(xy=[round(float(d["xy"][0]), 1), round(float(d["xy"][1]), 1)], partial=True)
         else:
             continue  # its whole entry is out of view here and may well be right: do not move it on a partial view
         seen(e, d)
 
     dropped = []
-    if not seg.intruders:
+    if not hand:
         for e in objs:
-            if e["id"] not in touched and _expected_visible(e, pose, intr, seg, depth):
+            if e["id"] not in touched and _expected_visible(e, rec, grid):
                 e["misses"] = e.get("misses", 0) + 1
         dropped = [e for e in objs if e.get("misses", 0) >= MISSES_TO_DROP]
         tmap["objects"] = [e for e in objs if e.get("misses", 0) < MISSES_TO_DROP]
 
-    sq = perception.find_drop_square(rgb, depth, plane=seg.plane)
-    if sq:
-        obs = _square_obs(sq, pose, intr)
+    obs = rec["square"]
+    if obs:
         old = tmap.get("square")
         if not obs["partial"]:
             # Whole hole seen: smooth the centre, but jump when it moved or the old entry was only a partial view
@@ -380,19 +424,75 @@ def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr:
                 if old and old.get("partial") and b[0] <= ob[1] and ob[0] <= b[1] and b[2] <= ob[3] and ob[2] <= b[3]:
                     b = _sq_union([ob, b])
                 tmap["square"] = {**_sq_from_bounds(b), "partial": True, "seen_ts": now, "misses": 0}
-    elif tmap.get("square") and not seg.intruders and _expected_visible(
-            {"height_mm": 0.0, "size_mm": tmap["square"]["size_mm"]}, pose, intr, seg, depth, xy=tmap["square"]["xy"]):
+    elif tmap.get("square") and not hand and _expected_visible(
+            {"height_mm": 0.0, "size_mm": tmap["square"]["size_mm"]}, rec, grid, xy=tmap["square"]["xy"]):
         tmap["square"]["misses"] = tmap["square"].get("misses", 0) + 1
         if tmap["square"]["misses"] >= MISSES_TO_DROP:
             tmap.pop("square")
 
     _mark_in_square(tmap)
     tmap["ts"] = now
+    # detections without their embeddings, for the dashboard (AGENT 2); the full record is the observation itself
+    light = [{k: v for k, v in d.items() if k != "emb16"} for d in rec["detections"]]
     tmap["last_update"] = {"ts": now, "pose": dict(pose), "source": source, "skipped": False,
-                           "ms": round((time.perf_counter() - t0) * 1000), "detected": len(recs),
+                           "ms": round((time.perf_counter() - t0) * 1000), "detected": len(rec["detections"]),
                            "dropped": [e["label"] or f"unknown#{e['id']}" for e in dropped],
-                           "hand_in_view": bool(seg.intruders)}
+                           "hand_in_view": hand, "detections": light, "square": rec["square"],
+                           "intruders": rec["intruders"]}
     return tmap
+
+
+def update_map(tmap: dict, rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = None, store=None,
+               source: str = "frame", recognised: list = None, seg=None, now: float = None) -> dict:
+    """
+    Fold one camera frame into the dynamic table map (in place; returns it): observe_frame() + apply_observation().
+
+    WHY: the user wants every picture the arm takes to keep the map current, so a pick request can be answered
+    without a fresh sweep and moved or removed objects disappear. A frame < SKIP_S after the last one at the same
+    pose is skipped (last_update["skipped"]; nothing to log). Otherwise last_update["observation"] is the record to
+    log: fold_observations() over the logged records rebuilds this same map.
+
+    tmap None starts an empty map. recognised / seg: the caller's recognise_all(..., include_partial=True) output and
+    the segment_full() it came from, so the same frame is not segmented or embedded twice (recognised without seg:
+    the frame is segmented again but CLIP is skipped; without include_partial there are just no partial sightings).
+    """
+    tmap = tmap if tmap is not None else empty_map()
+    now = time.time() if now is None else now
+    last = tmap.get("last_update")
+    if last and not last.get("skipped") and now - last["ts"] < SKIP_S and _same_pose(last["pose"], pose):
+        tmap["last_update"] = {**last, "skipped": True, "skip_ts": now}
+        return tmap
+    t0 = time.perf_counter()
+    rec = observe_frame(rgb, depth, pose, intr, store, recognised, seg, source, now)
+    apply_observation(tmap, rec)
+    tmap["last_update"].update(ms=round((time.perf_counter() - t0) * 1000), observation=rec)
+    return tmap
+
+
+def fold_observations(observations, tmap: dict = None) -> dict:
+    """
+    Replay logged observation records (update_map's last_update["observation"]) into a map, in ts order.
+
+    Deterministic and image-free: the same records give the same map as the live updates that produced them
+    (only last_update.ms differs). The skip rule is not applied: a logged record was never a skipped frame.
+    tmap: continue an existing map (None: start empty). Extra fields in a record (_id, paths, epoch) are ignored.
+    """
+    tmap = tmap if tmap is not None else empty_map()
+    for rec in sorted(observations, key=lambda r: r["ts"]):
+        # A record rebuilt from last_update's light fields lacks the embeddings and the depth grid: refuse it
+        # rather than fold a different map (no appearance merging, no negative evidence) without saying so
+        missing = [k for k in REC_KEYS if k not in rec] + (["detections[].emb16"] if any(
+            "emb16" not in d for d in rec.get("detections") or []) else [])
+        if missing:
+            raise ValueError(f"observation at ts {rec.get('ts')} lacks {missing}: log update_map's "
+                             "last_update['observation'] record as is (AGENT3)")
+        apply_observation(tmap, rec)
+    return tmap
+
+
+def rebuild_map(observations, since_ts: float = None) -> dict:
+    """fold_observations() over the records at or after since_ts (None: all), from an empty map."""
+    return fold_observations([r for r in observations if since_ts is None or r["ts"] >= since_ts])
 
 
 def best_on_map(table_map: dict, text: str, store=None) -> dict:
