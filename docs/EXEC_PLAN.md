@@ -10,6 +10,16 @@ table between (or during) runs. Never assume its location: find it fresh for eve
 re-detecting during the servo, search the reachable table (grid/spiral from the observe height) when it
 is not in view, and keep self-reset spots away from the ring and the paper.
 
+## Judging (email from Shannon Bradshaw, Viam, Oct 29 11:16) — 5-minute demo per team
+
+| Criterion | Weight | What we do about it |
+|---|---|---|
+| Functionality (does it work well) | 40% | reliability first: ≥8/10 runs, reset loop, person-intervention handling; rehearse the exact demo script |
+| Ambition | 20% | any object by description, moving target square, self-reset, data-driven grasp memory |
+| Creativity | 20% | language → object → square, live Atlas dashboard of attempts |
+| Modularity (reusable by other robot builders) | 15% | ship it as a Viam module: a generic service `sorter` with DoCommand `{"grasp": "<description>"}`, `{"reset": true}`, `{"status": true}`; config-only setup (arm, gripper, cam names, target colour); README for other teams |
+| Halloween style (spooky, cute, funny) | 5% | Halloween objects (mini pumpkin, candy) in the demo, a "trick or treat" prompt, spooky dashboard theme toggle |
+
 ## Done criteria (from the user)
 
 | # | Workstream | Done when |
@@ -24,7 +34,7 @@ is not in view, and keep self-reset spots away from the ring and the paper.
 | Agent | Session | Owns | Files |
 |---|---|---|---|
 | AGENT1 | robot-hackathon-planning | **the arm — the only session allowed to move it**; hardening, 10-run test, calibration, person intervention, executor, command worker | `scripts/pick_place_auto.py`, `scripts/jaw_calib.py`, `scripts/run_trials.py`, `sorter/arm.py`, `sorter/executor.py`, `sorter/worker.py` |
-| AGENT 2 | plan-fork | Atlas data layer + dashboard | `sorter/store.py`, `scripts/atlas_setup.py`, `dashboard/**` |
+| AGENT 2 | plan-fork | Atlas data layer + dashboard + Viam module packaging | `sorter/store.py`, `scripts/atlas_setup.py`, `dashboard/**`, `module/**`, `meta.json` |
 | AGENT3 | plan-fork-2 | perception: height segmentation, CLIP, text ranking, view capture | `sorter/perception.py`, `sorter/clip_embed.py`, `scripts/capture_views.py`, `scripts/eval_perception.py` |
 | main | coordinator | plan, interfaces, review, integration test | `docs/EXEC_PLAN.md`, `docs/PLAN.md`, `README.md` |
 
