@@ -11,12 +11,14 @@ Usage (data in data/eval/, gitignored):
   eval_perception.py label NAME 0="green square" 2=cup missed=1
   eval_perception.py report [--store] [--absent "green square" ...]
   eval_perception.py demo                    rehearsal queries (docs/demo_queries.md) on arm-scan frames
+  eval_perception.py sweep                   AGENT1's high sweep frames (kind sweep_test): timing, map, queries
 Env for capture: VIAM_MACHINE_ADDRESS, VIAM_API_KEY_ID, VIAM_API_KEY.
 """
 import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -140,6 +142,43 @@ def demo() -> None:
     print(f"demo queries: {passed}/{total} passed")
 
 
+def sweep() -> None:
+    """
+    Evaluate AGENT1's high sweep frames (json "kind": "sweep_test"): per-frame timing and recognition per height,
+    then one table map from the z=500 frames and the demo queries on it.
+
+    WHY: the library views were all taken ~378 mm from the table; at z 480-550 objects are smaller, so recognition
+    confidence can drop. The sweep frames are not in the library, so this is a fair test.
+    """
+    from sorter import table_map
+    from sorter.store import Store
+
+    scan = EVAL.parent / "scan"
+    ids = sorted(p.stem for p in scan.glob("*.json")
+                 if isinstance(m := json.loads(p.read_text()), dict) and m.get("kind") == "sweep_test" and not m.get("skipped"))
+    if not ids:
+        sys.exit("no sweep_test frames in data/scan yet")
+    store = Store()
+    frames = table_map.load_scan_frames(ids)
+    clip_embed.embed_images([np.zeros((50, 50, 3), np.uint8)])  # warm the model so timings are steady-state
+    for f in frames:
+        t = time.perf_counter()
+        recs = clip_embed.recognise_all(f["rgb"], f["depth"], store)
+        ms = (time.perf_counter() - t) * 1000
+        print(f"{f['id']} z={f['pose']['z']:.0f}: {ms:.0f} ms, " + ", ".join(
+            f"{r['label'] or '?'}({r['obj'].height_mm:.0f}mm {r['score']:.2f})" for r in recs))
+    z500 = [f for f in frames if abs(f["pose"]["z"] - 500) < 15] or frames
+    m = table_map.map_from_frames(z500, store)
+    print(f"map from {len(z500)} frames: {len(m['objects'])} objects, {sum(1 for o in m['objects'] if o['label'])} "
+          f"recognised, per frame {m['timing_ms']} ms")
+    for o in sorted((o for o in m["objects"] if o["label"]), key=lambda o: o["label"]):
+        print(f"   {o['label']:18} xy=({o['xy'][0]:.0f},{o['xy'][1]:.0f}) conf={o['score']:.2f} frames={o['frame_ids']}")
+    for q, want, _ in DEMO + [("blue screwdriver", "blue screwdriver", []), ("red screwdriver", "red screwdriver", [])]:
+        b = table_map.best_on_map(m, q, store)
+        got = b["map_obj"]["label"] if b["map_obj"] else None
+        print(f"  {q!r:28} -> {got} {'OK' if got == want else 'MISS'} {b['reason']}")
+
+
 def report(use_store: bool, absent: list) -> None:
     """
     Segmentation recall, and top-1 for each labelled object queried by its own label.
@@ -196,6 +235,8 @@ if __name__ == "__main__":
         label(sys.argv[2], sys.argv[3:])
     elif cmd == "demo":
         demo()
+    elif cmd == "sweep":
+        sweep()
     elif cmd == "report":
         # report [--store] [--absent "green square" ...]
         rest = sys.argv[2:]
