@@ -267,6 +267,7 @@ class ModuleBridge:
 
     STATUS_EVERY_S = 1.5
     SEEN_EVERY_S = 1.0  # the module's idle look runs about once a second
+    MAP_EVERY_S = 3.0  # the whole-table map changes only after a sweep; sightings every idle look
     CMD_TIMEOUT_S = 15.0
     MAX_FAILURES = 5  # consecutive failed calls -> raise, so the connection is rebuilt
 
@@ -275,7 +276,17 @@ class ModuleBridge:
         (out / "module_req").mkdir(parents=True, exist_ok=True)
         (out / "module_res").mkdir(parents=True, exist_ok=True)
         self.seen_supported = True  # an older module answers "unknown command"; then stop asking
+        self.map_supported = True
         self.seen_ts = None
+
+    async def _poll_map(self, svc) -> None:
+        """The module's whole-table map + sightings ({"table_map": true}) -> module_table_map.json."""
+        res = await self._call(svc, {"table_map": True}, 10.0)
+        if "unknown command" in str(res.get("error", "")):
+            self.map_supported = False
+            return
+        res["fetched_at"] = time.time()
+        _write_atomic(self.out / "module_table_map.json", json.dumps(res, default=str).encode())
 
     async def _poll_seen(self, svc) -> None:
         """
@@ -302,12 +313,18 @@ class ModuleBridge:
         from viam.services.generic import Generic
 
         svc = Generic.from_robot(robot, self.name)
-        failures, last_poll, last_seen = 0, 0.0, 0.0
+        failures, last_poll, last_seen, last_map = 0, 0.0, 0.0, 0.0
         while True:
             if self.seen_supported and time.time() - last_seen >= self.SEEN_EVERY_S:
                 last_seen = time.time()
                 try:
                     await self._poll_seen(svc)
+                except Exception:
+                    failures += 1
+            if self.map_supported and time.time() - last_map >= self.MAP_EVERY_S:
+                last_map = time.time()
+                try:
+                    await self._poll_map(svc)
                 except Exception:
                     failures += 1
             for req_path in sorted((self.out / "module_req").glob("*.json")):

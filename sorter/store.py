@@ -410,6 +410,92 @@ class Store:
                 best = (data, doc)
         return best
 
+    # ---- sightings: where each known object was last seen (AGENT3's where_is / record_sightings) ----
+
+    def _json_dict(self, name: str) -> dict:
+        try:
+            return json.loads((self.data / name).read_text())
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def log_sighting(self, doc: dict) -> None:
+        """
+        Latest sighting of one labelled object (upsert by label): {label, xy, height_mm, conf, source, pose, ts}.
+
+        WHY: the idle loop records several objects a second; one doc per label (not an append log) keeps reads O(1).
+        Offline: data/sightings.json {label: doc}, rewritten atomically under a lock.
+        """
+        label = doc.get("label")
+        if not label:
+            raise ValueError("a sighting needs a label")
+        doc = {**doc, "_id": label, "ts": doc.get("ts") or time.time()}
+        if self.online:
+            self.db.sightings.replace_one({"_id": label}, _with_date(doc), upsert=True)
+            return
+        with self._lock("sightings"):
+            d = self._json_dict("sightings.json")
+            d[label] = doc
+            _write_atomic(self.data / "sightings.json", json.dumps(d, default=str).encode())
+
+    def last_sighting(self, label: str):
+        """The newest sighting of `label`, or None."""
+        if self.online:
+            doc = self.db.sightings.find_one({"_id": label}, {"at": 0})
+        else:
+            doc = self._json_dict("sightings.json").get(label)
+        return doc or None
+
+    def list_sightings(self) -> list:
+        """Every object's latest sighting, newest first (dashboard map)."""
+        docs = list(self.db.sightings.find({}, {"at": 0})) if self.online else list(self._json_dict("sightings.json").values())
+        return sorted(docs, key=lambda d: -(d.get("ts") or 0))
+
+    # ---- whole-table map (AGENT3's table_map.map_from_frames), latest wins -------------------------
+
+    TABLE_MAP_HISTORY = 10
+
+    def put_table_map(self, table_map: dict) -> None:
+        """
+        Save a whole-table map {ts, frames, objects, square?} as the latest, keeping the previous ones as a short
+        history. Online: table_map collection ({_id: "latest"} + history docs); offline: data/table_map.json and
+        data/table_maps/<ts_ms>.json.
+        """
+        doc = {**table_map, "ts": table_map.get("ts") or time.time()}
+        doc.pop("_id", None)
+        if self.online:
+            self.db.table_map.replace_one({"_id": "latest"}, _with_date({**doc, "_id": "latest"}), upsert=True)
+            self.db.table_map.insert_one(_with_date({**doc, "_id": f"h-{int(doc['ts'] * 1000)}-{_new_id()[:6]}"}))
+            old = list(self.db.table_map.find({"_id": {"$ne": "latest"}}, {"_id": 1}).sort("ts", -1)
+                       .skip(self.TABLE_MAP_HISTORY))
+            if old:
+                self.db.table_map.delete_many({"_id": {"$in": [d["_id"] for d in old]}})
+            return
+        data = json.dumps(doc, default=str).encode()
+        _write_atomic(self.data / "table_map.json", data)
+        hist = self.data / "table_maps"
+        hist.mkdir(exist_ok=True)
+        _write_atomic(hist / f"{int(doc['ts'] * 1000)}.json", data)
+        for p in sorted(hist.glob("*.json"))[:-self.TABLE_MAP_HISTORY]:
+            p.unlink(missing_ok=True)
+
+    def get_table_map(self, with_emb: bool = True):
+        """The latest whole-table map with "age_s", or None. with_emb=False drops per-object embeddings (small)."""
+        if self.online:
+            doc = self.db.table_map.find_one({"_id": "latest"}, {"at": 0})
+        else:
+            doc = self._json_dict("table_map.json") or None
+        if not doc:
+            return None
+        doc.pop("_id", None)
+        if not with_emb:
+            doc["objects"] = [{k: v for k, v in o.items() if k != "emb"} for o in doc.get("objects") or []]
+        doc["age_s"] = round(time.time() - (doc.get("ts") or 0), 1)
+        return doc
+
+    # Names used in AGENT3's sorter/table_map.py docstring
+    save_map = put_table_map
+    latest_map = get_table_map
+
     # ---- clips: every frame of an attempt, for replay ----------------------------------------------
 
     @staticmethod
@@ -560,6 +646,15 @@ class Store:
                 self._file(coll).rename(self.data / f"{coll}.jsonl.flushed-{int(time.time())}")
             counts[coll] = len(docs)
         counts["clips"] = self._flush_clips()
+        # Latest-value records kept as JSON files offline: upsert their current content
+        sightings = self._json_dict("sightings.json")
+        for label, d in sightings.items():
+            self.db.sightings.replace_one({"_id": label}, _with_date({**d, "_id": label}), upsert=True)
+        counts["sightings"] = len(sightings)
+        tm = self._json_dict("table_map.json")
+        if tm:
+            self.db.table_map.replace_one({"_id": "latest"}, _with_date({**tm, "_id": "latest"}), upsert=True)
+        counts["table_map"] = 1 if tm else 0
         return counts
 
     def _flush_clips(self) -> int:

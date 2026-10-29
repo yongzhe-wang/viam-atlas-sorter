@@ -22,6 +22,7 @@ DoCommand:
   {"reset": true}                    clear the square (pick-out, wipe fallback, verify empty)
   {"status": true}                   busy / running / last / warm / seen / library / store mode
   {"seen_image": true}               last idle frame as base64 JPEG (<= 640 px) with the seen boxes scaled to it
+  {"table_map": true}                latest whole-table map (no embeddings), object sightings, sweep progress
 One job at a time; a second request while busy returns {"accepted": false, "error": "busy"}.
 
 Config attributes (all optional except where the defaults don't match your machine):
@@ -78,6 +79,7 @@ SEEN_IMAGE_WIDTH = 640
 WARM_RETRY_S = 30.0
 TIMELAPSE_EVERY_S = 5.0  # rolling timelapse for a backup demo video: one frame every 5 s ...
 TIMELAPSE_KEEP_S = 2 * 3600.0  # ... kept for the last 2 hours
+MAP_FRESH_S = 60.0  # a whole-table map younger than this is trusted for "where is it" (VIAM CENTERAL)
 
 
 def seed_library(bundle: Path, data: Path) -> str:
@@ -111,10 +113,10 @@ def _runtime():
     The arm/perception stack, imported on first use so viam-server can start the module and validate config
     quickly (warm-up then loads everything in the background). One place, so tests can swap it for stubs.
     """
-    from sorter import clip_embed, executor, perception, worker
+    from sorter import clip_embed, executor, perception, table_map, worker
 
     return SimpleNamespace(ppa=executor.ppa, executor=executor, clean=worker.clean, perception=perception,
-                           clip_embed=clip_embed)
+                           clip_embed=clip_embed, table_map=table_map)
 
 
 def _check_xy(attrs: dict, key: str) -> None:
@@ -351,6 +353,9 @@ class GraspByDescription(Generic, EasyResource):
                           "pose": pose}
         self.seen = {"ts": t_cap, "at_observe": True, "pose": pose, "objects": objects, "intruders": intruders,
                      "seen_ms": ms, "watch_period_s": self.watch_period}
+        # Arm confirmed still: keep each recognised object's last-seen table xy current (AGENT3's where_is)
+        if hasattr(rt.clip_embed, "record_sightings"):
+            await asyncio.to_thread(rt.clip_embed.record_sightings, self.store, recs, pose, None, "idle")
 
     async def _watch_loop(self) -> None:
         """Idle perception, every watch_period, once warm and while no job runs."""
@@ -478,38 +483,104 @@ class GraspByDescription(Generic, EasyResource):
         return {"id": int(o.id), "label": pick.get("recognised"), "score": round(float(pick.get("score", 0.0)), 3),
                 "bbox": _box(o.bbox)}
 
+    async def _from_map(self, text: str) -> Optional[dict]:
+        """
+        best_on_map() on the whole-table map when it is at most MAP_FRESH_S old:
+        {"found", "xy", "label", "status", "reason", "decide_ms", "map_age_s"}, or None when there is no fresh map.
+        """
+        m = self.store.get_table_map()
+        if not m or m["age_s"] > MAP_FRESH_S:
+            return None
+        t0 = time.monotonic()
+        b = await asyncio.to_thread(_runtime().table_map.best_on_map, m, text, self.store)
+        out = {"decide_ms": _ms(t0), "map_age_s": m["age_s"]}
+        if b.get("map_obj") is not None and not b.get("ambiguous"):
+            return {**out, "found": True, "xy": [round(float(v), 1) for v in b["xy"]], "label": b["map_obj"].get("label"),
+                    "score": round(float(b.get("score") or 0.0), 3)}
+        if b.get("ambiguous"):
+            return {**out, "found": False, "status": "ambiguous",
+                    "reason": f"two objects on the table match {text!r} about equally; be more specific"}
+        return {**out, "found": False, "status": "not_found",
+                "reason": f"no {text!r} on the table (whole-table map {m['age_s']:.0f} s old)"}
+
     async def _preview(self, text: str) -> Dict[str, ValueTypes]:
-        """What a grasp for `text` would pick from the cached frame, without moving (dashboard Preview)."""
+        """
+        What a grasp for `text` would do, without moving (dashboard Preview): pick from the cached frame, else go
+        to where a fresh table map saw it, else it would scan the table.
+        """
         busy_or_cold = self._not_ready()
         if busy_or_cold:
             return busy_or_cold
         pick, decide_ms, raw = await self._decide(text)
-        if pick is None:
-            why = "no fresh frame from the observe pose" if raw is None else "the cached frame is too old"
-            return {"ok": False, "reason": why, "decided_from_cache": False}
-        refusal = self._refusal(pick, text)
-        if refusal:
-            return {"ok": False, "status": refusal[0], "reason": refusal[1], "decide_ms": decide_ms,
+        refusal = self._refusal(pick, text) if pick is not None else None
+        if pick is not None and not refusal:
+            return {"ok": True, "via": "frame", "target": self._target_summary(pick), "decide_ms": decide_ms,
+                    "decided_from_cache": True, "frame_ts": raw["ts"]}
+        if refusal and refusal[0] == "ambiguous":
+            return {"ok": False, "status": "ambiguous", "reason": refusal[1], "decide_ms": decide_ms,
                     "decided_from_cache": True}
-        return {"ok": True, "target": self._target_summary(pick), "decide_ms": decide_ms, "decided_from_cache": True,
-                "frame_ts": raw["ts"]}
+        found = await self._from_map(text)
+        if found is None:
+            return {"ok": False, "via": "sweep", "status": "would_scan",
+                    "reason": f"{text!r} is not in view and there is no fresh table map: a grasp would scan the table"}
+        if found["found"]:
+            x, y = found["xy"]
+            return {"ok": True, "via": "map", "target_xy": found["xy"], "label": found["label"],
+                    "decide_ms": found["decide_ms"], "map_age_s": found["map_age_s"],
+                    "message": f"remembered at ({x:.0f}, {y:.0f}) on the table map"}
+        return {"ok": False, "status": found["status"], "reason": found["reason"], "decide_ms": found["decide_ms"]}
+
+    def _sweep_progress(self, k: int, n: int):
+        """
+        Executor callback during a table sweep: shows "pose k/N" in status. Returns a finished future, so it
+        works whether the executor calls it plainly or awaits it.
+        """
+        self.job_info["sweep"] = {"k": int(k), "n": int(n)}
+        fut = asyncio.get_event_loop().create_future()
+        fut.set_result(None)
+        return fut
 
     # ---- jobs --------------------------------------------------------------------------------------
 
     async def _run(self, kind: str, text: Optional[str], target: Optional[dict] = None,
-                   decide_ms: Optional[int] = None) -> dict:
-        """Run one grasp or reset to completion and return its summary; never raises."""
-        fast = False
+                   decide_ms: Optional[int] = None, target_xy: Optional[list] = None, sweep: bool = False) -> dict:
+        """
+        Run one grasp or reset to completion and return its summary; never raises.
+
+        Grasp, in order of what is known: target (from the cached frame) -> executor skips its own first look;
+        target_xy (from a fresh table map) -> executor looks there and picks; sweep -> executor scans the whole
+        table, we build and save the map (AGENT3's map_from_frames) and pick from it. Each step needs the matching
+        executor entry point (AGENT1); without it the executor's own search (find_target) is used instead.
+        """
+        via = "search"
         try:
             rt = _runtime()
             rig = await self._get_rig()
             if kind == "grasp":
-                # Fast path needs AGENT1's execute(..., target=...): skip its first observe and use ours
-                fast = target is not None and "target" in inspect.signature(rt.executor.execute).parameters
-                if target is not None and not fast and not self._no_target_warned:
-                    LOGGER.warning("executor.execute has no target= parameter yet: full observe instead of the fast path")
+                params = inspect.signature(rt.executor.execute).parameters
+                if sweep and hasattr(rt.executor, "sweep_table"):
+                    frames = await rt.executor.sweep_table(rig, progress=self._sweep_progress)
+                    m = await asyncio.to_thread(rt.table_map.map_from_frames, frames, self.store)
+                    self.store.put_table_map(m)
+                    b = await asyncio.to_thread(rt.table_map.best_on_map, m, text, self.store)
+                    if b.get("map_obj") is None or b.get("ambiguous"):
+                        status = "ambiguous" if b.get("ambiguous") else "not_found"
+                        summary = {"status": status, "fail_phase": "find", "via": "sweep",
+                                   "fail_reason": f"no {text!r} on the table after scanning it" if status == "not_found"
+                                   else f"two objects match {text!r} about equally after scanning the table"}
+                        self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"),
+                                     "finished": time.time(), **summary}
+                        return summary
+                    target_xy, via = [float(v) for v in b["xy"]], "sweep"
+                kwargs = {}
+                if target is not None and "target" in params:
+                    kwargs, via = {"target": target}, "frame"
+                elif target_xy is not None and "target_xy" in params:
+                    kwargs = {"target_xy": tuple(target_xy)}
+                    via = via if via == "sweep" else "map"
+                elif (target is not None or target_xy is not None) and not self._no_target_warned:
+                    LOGGER.warning("executor.execute lacks target=/target_xy=: using its own search instead")
                     self._no_target_warned = True
-                kwargs = {"target": target} if fast else {}
                 doc = await rt.executor.execute(rig, text, self.store, mode="demo", **kwargs)
             else:
                 doc = await rt.executor.clear_square(rig, self.store)
@@ -523,55 +594,73 @@ class GraspByDescription(Generic, EasyResource):
             except Exception:
                 pass
         if kind == "grasp":
-            summary.update(fast_path=fast, decide_ms=decide_ms)
+            summary.update(fast_path=via == "frame", via=via, decide_ms=decide_ms)
         # job id lets a DoCommand caller (the dashboard in module mode) match this result to its request
         self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
         return summary
 
     async def _start(self, kind: str, text: Optional[str], wait: bool, target: Optional[dict] = None,
-                     decide_ms: Optional[int] = None) -> Dict[str, ValueTypes]:
+                     decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
+                     sweep: bool = False) -> Dict[str, ValueTypes]:
         if self._busy():
             return {"accepted": False, "error": "busy", "running": dict(self.job_info)}
         job_id = uuid.uuid4().hex[:12]
-        self.job_info = {"job": job_id, "kind": kind, "text": text or "", "started": time.time(),
-                         "fast_path": target is not None}
-        self.job = asyncio.get_event_loop().create_task(self._run(kind, text, target, decide_ms))
+        via = "frame" if target is not None else "map" if target_xy is not None else "sweep" if sweep else "search"
+        self.job_info = {"job": job_id, "kind": kind, "text": text or "", "started": time.time(), "via": via,
+                         "fast_path": target is not None, "target_xy": target_xy}
+        self.job = asyncio.get_event_loop().create_task(self._run(kind, text, target, decide_ms, target_xy, sweep))
         if wait:
             return {"accepted": True, "job": job_id, **(await self.job)}
         return {"accepted": True, "job": job_id}
 
     async def _grasp(self, text: str, wait: bool) -> Dict[str, ValueTypes]:
         """
-        Decide from the cached idle frame when it is fresh: start at once, or say at once that it is not there.
-        Otherwise (no fresh frame, arm away from the observe pose) fall back to the executor's own observe.
+        Find the object fast, in this order (VIAM CENTERAL): the cached idle frame -> go at once; a fresh
+        whole-table map (<= MAP_FRESH_S) -> go to where it saw it; otherwise scan the table, then pick. Answers at
+        once when the object is ambiguous, or when a fresh map says it is not on the table.
         """
         if self._busy():
             return {"ok": False, "accepted": False, "error": "busy", "running": dict(self.job_info)}
         cold = self._not_ready()
         if cold:
             return cold
+        rt = _runtime()
         pick, decide_ms, raw = await self._decide(text)
-        if pick is None:
-            why = ("no fresh frame from the observe pose" if raw is None
-                   else f"cached frame is {time.time() - raw['ts']:.1f} s old")
-            res = await self._start("grasp", text, wait)
-            return {**res, "ok": bool(res.get("accepted")), "decided_from_cache": False, "fast_path": False,
-                    "decide_ms": None, "why_slow": why}
-        refusal = self._refusal(pick, text)
-        if refusal:
-            status, reason = refusal
-            self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": status,
-                         "fail_phase": "find", "fail_reason": reason, "decide_ms": decide_ms, "decided_from_cache": True}
-            return {"ok": False, "accepted": False, "status": status, "reason": reason, "decide_ms": decide_ms,
+        refusal = self._refusal(pick, text) if pick is not None else None
+        if pick is not None and not refusal:
+            target = {**pick, "rgb": raw["rgb"], "depth": raw["depth"], "pose": raw["pose"], "ts": raw["ts"]}
+            # fast_path: the executor will skip its own first observe (needs AGENT1's execute(..., target=...))
+            fast = "target" in inspect.signature(rt.executor.execute).parameters
+            res = await self._start("grasp", text, wait, target=target, decide_ms=decide_ms)
+            if not res.get("accepted"):
+                return {**res, "ok": False}  # became busy while deciding
+            return {**res, "ok": True, "via": "frame", "decided_from_cache": True, "fast_path": fast,
+                    "decide_ms": decide_ms, "target": self._target_summary(pick)}
+        if refusal and refusal[0] == "ambiguous":
+            self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": "ambiguous",
+                         "fail_phase": "find", "fail_reason": refusal[1], "decide_ms": decide_ms, "decided_from_cache": True}
+            return {"ok": False, "accepted": False, "status": "ambiguous", "reason": refusal[1], "decide_ms": decide_ms,
                     "decided_from_cache": True}
-        target = {**pick, "rgb": raw["rgb"], "depth": raw["depth"], "pose": raw["pose"], "ts": raw["ts"]}
-        # fast_path: the executor will skip its own first observe (needs AGENT1's execute(..., target=...))
-        fast = "target" in inspect.signature(_runtime().executor.execute).parameters
-        res = await self._start("grasp", text, wait, target=target, decide_ms=decide_ms)
-        if not res.get("accepted"):
-            return {**res, "ok": False}  # became busy while deciding
-        return {**res, "ok": True, "decided_from_cache": True, "fast_path": fast, "decide_ms": decide_ms,
-                "target": self._target_summary(pick)}
+        # Not in the cached frame (or no fresh frame): the whole-table map, else a sweep
+        found = await self._from_map(text)
+        if found is not None and not found["found"]:
+            self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": found["status"],
+                         "fail_phase": "find", "fail_reason": found["reason"], "decide_ms": found["decide_ms"]}
+            return {"ok": False, "accepted": False, "status": found["status"], "reason": found["reason"],
+                    "decide_ms": found["decide_ms"], "via": "map"}
+        if found is not None:
+            x, y = found["xy"]
+            res = await self._start("grasp", text, wait, target_xy=found["xy"], decide_ms=found["decide_ms"])
+            return {**res, "ok": bool(res.get("accepted")), "via": "map", "status_text": "going_to_map",
+                    "message": f"remembered at ({x:.0f}, {y:.0f}) on the table map · going there",
+                    "target_xy": found["xy"], "label": found["label"], "map_age_s": found["map_age_s"],
+                    "decide_ms": found["decide_ms"]}
+        has_sweep = hasattr(rt.executor, "sweep_table")
+        res = await self._start("grasp", text, wait, sweep=True)
+        return {**res, "ok": bool(res.get("accepted")), "via": "sweep" if has_sweep else "search",
+                "status_text": "scanning" if has_sweep else "searching",
+                "message": "scanning the table…" if has_sweep else "searching the observe positions…",
+                "why": "not in the cached frame" if pick is not None else "no fresh frame from the observe pose"}
 
     def _status(self) -> Dict[str, ValueTypes]:
         seen = dict(self.seen)
@@ -588,6 +677,12 @@ class GraspByDescription(Generic, EasyResource):
             return self._status()
         if command.get("seen_image"):
             return self._seen_image()
+        if command.get("table_map"):
+            # Dashboard top-down view: latest whole-table map (no embeddings) + each object's latest sighting
+            m = self.store.get_table_map(with_emb=False)
+            return {"ok": m is not None, "map": m or {}, "sightings": self.store.list_sightings()[:40],
+                    "sweep": dict(self.job_info.get("sweep") or {}) if self._busy() else {},
+                    "now": time.time()}  # robot clock, so the dashboard can age sightings without clock skew
         for key in ("grasp", "preview"):
             if key in command:
                 text = _runtime().clean(str(command.get(key) or ""))
@@ -597,7 +692,7 @@ class GraspByDescription(Generic, EasyResource):
         if command.get("reset"):
             return await self._start("reset", None, bool(command.get("wait")))
         return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"preview\": \"<description>\"}, "
-                         "{\"reset\": true}, {\"status\": true} or {\"seen_image\": true}"}
+                         "{\"reset\": true}, {\"status\": true}, {\"seen_image\": true} or {\"table_map\": true}"}
 
     # ---- background loops --------------------------------------------------------------------------
 

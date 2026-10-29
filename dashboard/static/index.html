@@ -153,6 +153,14 @@
     <div class="bars" id="bars"><span class="muted">no attempts yet</span></div>
   </section>
 
+  <section class="card full">
+    <h2>Table map</h2>
+    <div id="map-head" class="muted" style="font-size:13px;margin-bottom:6px">no table scan yet</div>
+    <svg id="tmap" viewBox="0 0 560 300" width="100%" role="img" aria-label="top-down table map"></svg>
+    <div class="legend"><span><i class="sw" style="background:var(--ok);height:8px;width:8px;border-radius:50%"></i>on the table scan</span>
+      <span>○ last sighting</span><span>colour = age: green &lt; 1 min, amber &lt; 5 min, grey older</span><span>click an object to grasp it</span></div>
+  </section>
+
   <section class="card full" id="charts-card" hidden>
     <h2>Atlas Charts</h2>
     <div id="charts"></div>
@@ -439,6 +447,55 @@ $("pl-seek").addEventListener("input", (e) => { stopPlay(); showFrame(Number(e.t
 $("pl-close").addEventListener("click", () => { stopPlay(); $("player").close(); });
 $("player").addEventListener("close", stopPlay);
 
+// Top-down table map: arm base at the bottom centre, +x (forward) up, +y (left) to the left; units mm
+const MAP = {W: 560, H: 300, s: 0.4, base: [280, 290]};
+const mapXY = (x, y) => [MAP.base[0] - y * MAP.s, MAP.base[1] - x * MAP.s];
+const ageColour = (age) => age < 60 ? "var(--ok)" : age < 300 ? "var(--warn)" : "var(--muted)";
+const agoText = (s) => s < 90 ? `${Math.round(s)} s ago` : `${Math.round(s / 60)} min ago`;
+async function refreshMap() {
+  const d = await api("/api/table_map");
+  const svg = $("tmap"), ns = "http://www.w3.org/2000/svg";
+  const mk = (tag, attrs, text) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
+  svg.replaceChildren();
+  // Reachable area: half ring between the inner and outer reach limits the arm code enforces
+  const [rin, rout] = d.reach_mm.map((r) => r * MAP.s), [bx, by] = MAP.base;
+  svg.appendChild(mk("path", {d: `M ${bx - rout} ${by} A ${rout} ${rout} 0 0 1 ${bx + rout} ${by} L ${bx + rin} ${by} A ${rin} ${rin} 0 0 0 ${bx - rin} ${by} Z`,
+    fill: "var(--chip)", stroke: "var(--line)"}));
+  svg.appendChild(mk("rect", {x: bx - 10, y: by - 6, width: 20, height: 10, rx: 2, fill: "var(--muted)"}));
+  svg.appendChild(mk("text", {x: bx + 14, y: by - 1}, "arm"));
+  const m = d.map;
+  if (m && m.square && m.square.xy) {
+    const [sx, sy] = mapXY(...m.square.xy), half = (m.square.size_mm || 200) * MAP.s / 2;
+    svg.appendChild(mk("rect", {x: sx - half, y: sy - half, width: 2 * half, height: 2 * half, fill: "none", stroke: "#2457d6", "stroke-width": 4}));
+  }
+  const pick = (label) => { if (label) { $("t").value = label; $("t").focus(); } };
+  const onMap = new Set();
+  for (const o of (m && m.objects) || []) {
+    const [px, py] = mapXY(...o.xy), label = o.label || "unknown";
+    onMap.add(o.label);
+    const g = mk("g", {style: o.label ? "cursor:pointer" : ""});
+    g.appendChild(mk("circle", {cx: px, cy: py, r: 7, fill: ageColour(m.age_s), stroke: "var(--panel)", "stroke-width": 2}));
+    g.appendChild(mk("text", {x: px + 10, y: py + 4, fill: "var(--ink)", style: "fill:var(--ink)"}, label));
+    g.appendChild(mk("title", {}, `${label} · (${o.xy[0].toFixed(0)}, ${o.xy[1].toFixed(0)}) mm · score ${o.score}`));
+    g.addEventListener("click", () => pick(o.label));
+    svg.appendChild(g);
+  }
+  // Last sightings (idle loop, looks): rings, so they read as "seen here" rather than "scanned here"
+  for (const s of d.sightings || []) {
+    if (!s.xy) continue;
+    const [px, py] = mapXY(...s.xy);
+    const g = mk("g", {style: "cursor:pointer"});
+    g.appendChild(mk("circle", {cx: px, cy: py, r: 6, fill: "none", stroke: ageColour(s.age_s), "stroke-width": 2.5}));
+    if (!onMap.has(s.label)) g.appendChild(mk("text", {x: px + 9, y: py - 6}, s.label));
+    g.appendChild(mk("title", {}, `${s.label} · seen ${agoText(s.age_s)} (${s.source})`));
+    g.addEventListener("click", () => pick(s.label));
+    svg.appendChild(g);
+  }
+  const head = d.sweep && d.sweep.n ? `scanning table… pose ${d.sweep.k}/${d.sweep.n}`
+    : m ? `scanned ${agoText(m.age_s)} · ${(m.objects || []).length} objects` : "no table scan yet";
+  $("map-head").textContent = head + ((d.sightings || []).length ? ` · ${(d.sightings || []).length} sightings` : "");
+}
+
 // Known objects from the view library: shows the audience what it can ask for; a click fills the box
 async function refreshLabels() {
   const list = await api("/api/labels");
@@ -461,6 +518,8 @@ setInterval(safe(refreshCommands), 1500);
 setInterval(safe(refreshStats), 3000);
 setInterval(safe(refreshAttempts), 3000);
 safe(refreshLabels)();
+safe(refreshMap)();
+setInterval(safe(refreshMap), 2000);
 setInterval(safe(refreshLabels), 30000);  // the library changes only when objects are scanned
 </script>
 </body>

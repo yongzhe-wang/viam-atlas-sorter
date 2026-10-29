@@ -420,6 +420,33 @@ async def preview(body: TextIn):
     return [{"id": o.id, "score": float(s)} for o, s in ranked]
 
 
+@app.get("/api/table_map")
+def table_map():
+    """
+    Top-down table view: latest whole-table map (objects with table xy, no embeddings), each object's last
+    sighting, and sweep progress. Module mode: from the module (via the robot link), ages on the robot's clock.
+    """
+    if MODULE_MODE:
+        try:
+            d = json.loads((CAM_DIR / "module_table_map.json").read_text())
+        except (FileNotFoundError, ValueError):
+            d = {}
+        since = time.time() - d.get("fetched_at", time.time())  # keep ages counting between fetches
+        robot_now = (d.get("now") or time.time()) + since
+        m = d.get("map") or None
+        sightings = d.get("sightings") or []
+        running = ((_module_state().get("status") or {}).get("running") or {})
+        sweep = running.get("sweep") or None
+    else:
+        m, sightings, robot_now = store.get_table_map(with_emb=False), store.list_sightings(), time.time()
+        sweep = next((w.get("sweep") for w in workers() if w.get("online") and w.get("sweep")), None)
+    if m:
+        m["age_s"] = round(robot_now - (m.get("ts") or robot_now), 1)
+    for s in sightings:
+        s["age_s"] = round(robot_now - (s.get("ts") or robot_now), 1)
+    return {"map": m, "sightings": sightings, "sweep": sweep, "reach_mm": [120, 650]}
+
+
 @app.get("/api/labels")
 def labels():
     """Known objects for the "you can ask for" list: [[label, *aliases], ...] from the view library."""

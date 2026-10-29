@@ -37,6 +37,8 @@ PLAIN_INDEXES = {
     "status": [[("ts", DESCENDING)]],
     "frames": [[("ts", DESCENDING)]],
     "clips": [[("attempt_id", ASCENDING), ("seq", ASCENDING)]],
+    "table_map": [[("ts", DESCENDING)]],
+    "sightings": [[("ts", DESCENDING)]],
 }
 
 
@@ -47,7 +49,7 @@ def main() -> None:
     db = MongoClient(uri, serverSelectionTimeoutMS=8000)[os.environ.get("MONGODB_DB", "sorter")]
 
     existing = set(db.list_collection_names())
-    for coll in COLLECTIONS + LIVE_COLLECTIONS + ("clips",):
+    for coll in COLLECTIONS + LIVE_COLLECTIONS + ("clips", "table_map", "sightings"):
         if coll not in existing:
             db.create_collection(coll)
             print("created collection", coll)
