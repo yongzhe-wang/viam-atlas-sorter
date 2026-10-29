@@ -373,6 +373,7 @@ RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)  # waits before each reconnect attempt
 CONNECT_TIMEOUT_S = 30.0  # one connect attempt; a timeout counts as a dropped link and is retried
 # Per-call limits (s). A trial hung > 10 min inside one SDK call after a release; a timeout now counts as a
 # dropped link (retryable), so call() reconnects and repeats it. Moves are absolute, so repeating is safe.
+MAP_ONLY_THETA0 = True  # flip once the theta_test frames confirm perception.THETA_SIGN on the arm
 CALL_TIMEOUT_S = {"move": 45.0, "get images": 10.0, "get pose": 10.0, "open": 15.0, "grab": 15.0,
                   "holding": 10.0, "frame system": 15.0, "geometries": 15.0}
 
@@ -411,6 +412,11 @@ class Rig:
         self.last_pose = None  # latest pose read, for status reports
         self.status = None  # "reconnecting" / "paused_person" while that is happening, else None
         self.on_frame = None  # optional recorder(phase, rgb, meta), set per attempt by sorter.executor
+        # Live table map: on_map_frame(rgb, depth, pose) gets EVERY frame with the pose it was taken at; set by the
+        # map's single owner (the Viam module, which adds the source from executor.phase_now). self.at is that
+        # pose: the last read pose, or the last commanded one (probe frames are taken right after goto()).
+        self.on_map_frame = None
+        self.at = None
 
     async def connect(self) -> None:
         # The SDK's own reconnect loop is off: it fought call()'s backoff, and its native layer can abort the
@@ -495,6 +501,8 @@ class Rig:
 
     async def pose(self):
         self.last_pose = await self.call("get pose", lambda: self.arm.get_end_position())
+        p = self.last_pose
+        self.at = {"x": p.x, "y": p.y, "z": p.z, "theta": p.theta}
         return self.last_pose
 
     def record(self, phase: str, rgb: np.ndarray, **meta) -> None:
@@ -533,6 +541,7 @@ class Rig:
             self.theta = theta
         target = Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=-1, theta=self.theta)
         await self.call("move", lambda: self.arm.move_to_position(target))
+        self.at = {"x": x, "y": y, "z": z, "theta": self.theta}
         # get_images() right after a move returns a stale frame; servo on stale frames diverged (68->142->297 px)
         # {LAGTEST 2026-10-29 "T+0S: BLOCK=(107, 475, 34)" "T+0.5S: BLOCK=(107, 496, 34)"}
         # [CONFIDENCE: CONFIRMED 90% — measured on sfhack4; 1 s gives margin over the observed ~0.5 s]
@@ -542,6 +551,14 @@ class Rig:
         res = await self.call("get images", lambda: self.cam.get_images())
         rgb, depth = decode(res[0] if isinstance(res, tuple) else res)
         self.last_depth = depth
+        if self.on_map_frame is not None and depth is not None and self.at is not None:
+            # Until the wrist-angle sign of the pixel->table map is verified on the arm, only theta-0 frames
+            # update the map: a wrong sign would mirror objects seen during the wrist-turned servo
+            if not MAP_ONLY_THETA0 or abs(self.at["theta"]) <= 1.0:
+                try:
+                    self.on_map_frame(rgb, depth, dict(self.at))
+                except Exception as e:
+                    print(f"  map update failed: {e}")
         return rgb, depth
 
     async def detect_depth_shift(self) -> None:
