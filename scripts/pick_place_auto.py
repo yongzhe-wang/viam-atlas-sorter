@@ -565,11 +565,22 @@ class Rig:
             for dx, dy in ((probe, 0.0), (0.0, probe)):
                 await self.goto(p.x + dx, p.y + dy, p.z)
                 h2 = finder((await self.frame())[0])
-                if h2 is None:
-                    raise RuntimeError(f"{label}: lost during probe")
-                cols.append([(h2[0] - hit[0]) / probe, (h2[1] - hit[1]) / probe])
                 await self.goto(p.x, p.y, p.z)
-            J = np.array(cols).T  # px per mm, columns = arm x, arm y
+                if h2 is None:
+                    break
+                cols.append([(h2[0] - hit[0]) / probe, (h2[1] - hit[1]) / probe])
+            if len(cols) == 2:
+                J = np.array(cols).T  # px per mm, columns = arm x, arm y
+            elif J is None:
+                # A probe lost the target (the held object covered it): fall back to the nominal Jacobian,
+                # valid at wrist theta 0: arm +x moves the image +v, arm +y moves it +u, at f/depth px/mm
+                # {SHIFT TEST 2026-10-29 "+40 X: DU=0 DV=60" "+40 Y: DU=87 DV=-3"}
+                # [CONFIDENCE: CONFIRMED 80% — measured at another height; only the signs and rough scale matter]
+                if abs(self.theta) > 1.0:
+                    raise RuntimeError(f"{label}: lost during probe (no Jacobian at theta {self.theta:.0f})")
+                k = self.fx / plane
+                J = np.array([[0.0, k], [k, 0.0]])
+                print(f"  {label}: probe lost the target; using the nominal Jacobian")
             # Arm move that cancels the pixel error (damped); the image moves by J @ move
             move = np.linalg.solve(J, -e) * 0.85
             n = np.linalg.norm(move)
@@ -759,7 +770,8 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     print("3/5 carry to the blue square")
     times["at"] = "carry"
     if square_xy is not None:
-        await travel(rig, *square_xy)
+        # Wrist back to 0 so the nominal Jacobian holds if a probe loses the square behind the held object
+        await travel(rig, *square_xy, theta=0.0)
         if find_square((await rig.frame())[0]):
             try:
                 await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX)
@@ -768,6 +780,8 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
                 await travel(rig, *square_xy)
     else:
         # The square is on paper that people move around: never assume where it is
+        q = await rig.pose()
+        await rig.goto(q.x, q.y, ALIGN_Z, theta=0.0)
         await search_square(rig)
         await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX)
     t = mark(times, "carry", t)
