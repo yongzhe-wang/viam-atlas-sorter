@@ -167,8 +167,34 @@ def _render_worker_frame(data: bytes, doc: dict) -> bytes:
     return out.getvalue()
 
 
+MODULE_FRAME_FRESH_S = 3.0  # module mode: show the module's own labelled frame while it is this fresh
+
+
+def _module_frame():
+    """(jpeg with the module's recognised labels drawn, age_s) from module_frame.*, or None."""
+    img, meta_path = CAM_DIR / "module_frame.jpg", CAM_DIR / "module_frame.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+        data = img.read_bytes()
+    except (FileNotFoundError, ValueError):
+        return None
+    age = time.time() - meta_path.stat().st_mtime  # laptop clock: the module's own ts may be skewed
+    key = ("module", meta.get("ts"))
+    if _worker_render["key"] != key:
+        objs = [{"bbox": o["bbox"], "label": o.get("label") or "unknown",
+                 "score": o.get("confidence")} for o in meta.get("objects") or []]
+        _worker_render.update(key=key, jpeg=_render_worker_frame(data, {"meta": {"objects": objs,
+                                                                                 "intruders": meta.get("intruders")}}))
+    return _worker_render["jpeg"], age
+
+
 def _pick_frame():
     """(jpeg, source description, age_s) by the policy in the module docstring, or None."""
+    if MODULE_MODE:
+        # What the module itself sees and recognises, labelled: the audience sees "green square" before typing
+        mf = _module_frame()
+        if mf and mf[1] <= MODULE_FRAME_FRESH_S:
+            return mf[0], f"module {MODULE_NAME} (robot)", mf[1]
     worker = store.get_frame()
     worker_age = time.time() - worker[1].get("ts", 0) if worker else None
     direct = CAM_DIR / "frame.jpg"
@@ -196,8 +222,14 @@ def status():
     cam["objects"] = len(cam.get("objects", []))
     picked = _pick_frame()
     frame = {"source": picked[1], "age_s": round(picked[2], 1)} if picked else None
-    return {"atlas": store.online, "queued": store.queued_counts(), "camera": cam, "frame": frame,
-            "workers": workers(), "command_path": COMMAND_PATH, "charts": urls, "now": time.time()}
+    out = {"atlas": store.online, "queued": store.queued_counts(), "camera": cam, "frame": frame,
+           "workers": workers(), "command_path": COMMAND_PATH, "charts": urls, "now": time.time()}
+    if MODULE_MODE:
+        # Perception runs on the robot inside the module: report what it sees there, not our (off) camera
+        seen = ((_module_state().get("status") or {}).get("seen") or {})
+        out["module_seen"] = {"objects": len(seen.get("objects") or []), "intruders": len(seen.get("intruders") or []),
+                              "at_observe": seen.get("at_observe")}
+    return out
 
 
 def _module_state() -> dict:
@@ -217,7 +249,14 @@ def _module_worker() -> dict:
     s = st.get("status") or {}
     running, last = s.get("running") or {}, s.get("last") or {}
     online = bool(st.get("ok")) and st["age_s"] is not None and st["age_s"] <= MODULE_STALE_S
-    phase = f"{running.get('kind')}: {running.get('text') or 'square'}" if s.get("busy") else "idle"
+    if s.get("busy"):
+        phase = f"{running.get('kind')}: {running.get('text') or 'square'}"
+    elif s.get("warm") is False:
+        phase = "warming up"
+    else:
+        # Always-ready module: say what it currently recognises on the table
+        seen = [o.get("label") for o in (s.get("seen") or {}).get("objects") or [] if o.get("label")]
+        phase = "idle · sees " + ", ".join(seen) if seen else "idle"
     error = None if st.get("ok") else st.get("error")
     if not error and not s.get("busy") and last.get("status") in ("error", "failed"):
         error = last.get("error") or last.get("fail_reason")
@@ -312,8 +351,14 @@ async def add_command(body: TextIn):
     except HTTPException as e:
         entry.update(status="error", fail_reason=e.detail)
         raise
+    entry["decide_ms"] = res.get("decide_ms")
     if res.get("accepted"):
-        entry.update(status="running", job=res.get("job"))
+        target = res.get("target") or {}
+        entry.update(status="running", job=res.get("job"),
+                     chosen={"label": target.get("label"), "score": target.get("score")} if target else None)
+    elif res.get("status") in ("not_found", "ambiguous"):
+        # Always-ready module answers at once from its cached frame: nothing started, here is why
+        entry.update(status=res["status"], fail_reason=res.get("reason"))
     else:
         busy = res.get("error") == "busy"
         # the "busy" badge says it all; a refusal for any other reason shows its message

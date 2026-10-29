@@ -266,6 +266,7 @@ class ModuleBridge:
     """
 
     STATUS_EVERY_S = 1.5
+    SEEN_EVERY_S = 1.0  # the module's idle look runs about once a second
     CMD_TIMEOUT_S = 15.0
     MAX_FAILURES = 5  # consecutive failed calls -> raise, so the connection is rebuilt
 
@@ -273,6 +274,26 @@ class ModuleBridge:
         self.out, self.name = out, name
         (out / "module_req").mkdir(parents=True, exist_ok=True)
         (out / "module_res").mkdir(parents=True, exist_ok=True)
+        self.seen_supported = True  # an older module answers "unknown command"; then stop asking
+        self.seen_ts = None
+
+    async def _poll_seen(self, svc) -> None:
+        """
+        The module's own labelled idle frame ({"seen_image": true}) -> module_frame.jpg + module_frame.json.
+        Written only when the module's frame changes, so the file time is when this laptop first got it.
+        """
+        res = await self._call(svc, {"seen_image": True}, 10.0)
+        if "unknown command" in str(res.get("error", "")):
+            self.seen_supported = False
+            return
+        if not res.get("ok") or res.get("ts") == self.seen_ts:
+            return
+        self.seen_ts = res["ts"]
+        import base64
+
+        _write_atomic(self.out / "module_frame.jpg", base64.b64decode(res["jpeg_b64"]))
+        meta = {k: res.get(k) for k in ("ts", "scale", "objects", "intruders")}
+        _write_atomic(self.out / "module_frame.json", json.dumps(meta, default=str).encode())
 
     async def _call(self, svc, command: dict, timeout: float) -> dict:
         return _jsonable(await asyncio.wait_for(svc.do_command(command), timeout=timeout))
@@ -281,8 +302,14 @@ class ModuleBridge:
         from viam.services.generic import Generic
 
         svc = Generic.from_robot(robot, self.name)
-        failures, last_poll = 0, 0.0
+        failures, last_poll, last_seen = 0, 0.0, 0.0
         while True:
+            if self.seen_supported and time.time() - last_seen >= self.SEEN_EVERY_S:
+                last_seen = time.time()
+                try:
+                    await self._poll_seen(svc)
+                except Exception:
+                    failures += 1
             for req_path in sorted((self.out / "module_req").glob("*.json")):
                 try:
                     req = json.loads(req_path.read_text())

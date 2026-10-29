@@ -96,6 +96,7 @@ class Store:
         (self.data / "img").mkdir(parents=True, exist_ok=True)
         uri = uri if uri is not None else os.environ.get("MONGODB_URI")
         self.db = None
+        self._views_cache = None  # ((mtime_ns, size), views, matrix) for offline search_views
         if uri:
             from pymongo import MongoClient
 
@@ -189,6 +190,25 @@ class Store:
             raise ValueError(f"embedding has {len(vec)} dims, expected {EMBED_DIM}")
         return self._insert("views", {**(meta or {}), "label": label, "embedding": vec, "jpeg": jpeg})
 
+    def _views_offline(self) -> tuple:
+        """
+        (views, embedding matrix) from data/views.jsonl, re-read only when the file changes.
+
+        WHY: the module's idle perception searches the library for every object about once a second; parsing
+        the ~1 MB file each time was most of that cost. Keyed on (mtime, size), so appends invalidate it.
+        """
+        path = self._file("views")
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            return [], None
+        key = (st.st_mtime_ns, st.st_size)
+        if self._views_cache is None or self._views_cache[0] != key:
+            views = self._read_offline("views")
+            matrix = np.array([v["embedding"] for v in views], dtype=float) if views else None
+            self._views_cache = (key, views, matrix)
+        return self._views_cache[1], self._views_cache[2]
+
     def search_views(self, embedding, k: int = 5, label: str = None) -> list:
         """
         Nearest labelled views, best first, each with "score" in [0, 1] (cosine, Atlas scale).
@@ -207,10 +227,13 @@ class Store:
                         {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
                         {"$project": {"embedding": 0, "jpeg": 0}}]
             return list(self.db.views.aggregate(pipeline))
-        views = [v for v in self._read_offline("views") if not label or v.get("label") == label]
+        views, matrix = self._views_offline()
+        if label:
+            keep = [i for i, v in enumerate(views) if v.get("label") == label]
+            views, matrix = [views[i] for i in keep], (matrix[keep] if keep else None)
         if not views:
             return []
-        scores = _cosine01(np.array([v["embedding"] for v in views], dtype=float), q)
+        scores = _cosine01(matrix, q)
         out = []
         for i in np.argsort(-scores)[:k]:
             v = {key: val for key, val in views[i].items() if key not in ("embedding", "jpeg")}

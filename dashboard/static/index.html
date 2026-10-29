@@ -190,14 +190,22 @@ async function refreshStatus() {
     if (s.frame) setPill("p-cam", `Picture: ${s.frame.source} · ${s.frame.age_s} s`, s.frame.age_s < 10 ? "ok" : "warn");
     else setPill("p-cam", "No picture yet", "bad");
     // Targets are what the arm may pick; ignored = cut by the image edge / outside the workspace
-    if (!c.perception) setPill("p-perc", "Perception off", "warn");
+    const ms = s.module_seen;
+    if (ms) {
+      // Module mode: perception runs on the robot; show what the module sees from its observe pose
+      if (ms.intruders) setPill("p-perc", "Hand in workspace · arm pauses", "bad");
+      else if (ms.at_observe === false) setPill("p-perc", "Robot: arm away from observe pose", "warn");
+      else setPill("p-perc", `Robot sees ${ms.objects} object${ms.objects === 1 ? "" : "s"}`, ms.objects ? "ok" : "warn");
+    }
+    else if (!c.perception) setPill("p-perc", "Perception off", "warn");
     else if (c.intruders) setPill("p-perc", "Hand in workspace · arm pauses", "bad");
     else setPill("p-perc", `Perception · ${c.objects} target${c.objects === 1 ? "" : "s"}${c.excluded ? ` · ${c.excluded} ignored` : ""}`, "ok");
     // Where "Grasp" goes: the Store queue (a worker claims it) or straight to the Viam module's DoCommand
     commandPath = s.command_path;
     setPill("p-mode", s.command_path === "module" ? "Commands → Viam module" : "Commands → queue", "");
-    const fromWorker = s.frame && s.frame.source.startsWith("worker");
-    $("camnote").textContent = fromWorker ? "" : (c.error || c.perception_error || "");
+    // Our own camera's errors only matter when the picture comes from our own camera
+    const ownCamera = s.frame ? s.frame.source === "direct camera" : true;
+    $("camnote").textContent = ownCamera ? (c.error || c.perception_error || "") : "";
     renderWorkers(s.workers);
     const box = $("charts");
     if (s.charts.length && !box.childElementCount) {
@@ -236,7 +244,8 @@ async function refreshCommands() {
     left.appendChild(el("div", c.text === "__reset__" ? "Clear square" : c.text));
     const chosen = c.chosen ? `picked ${c.chosen.label ?? "#" + c.chosen.id}${c.chosen.score != null ? " · " + Number(c.chosen.score).toFixed(2) : ""}` : "";
     const took = c.duration_s != null ? `${Number(c.duration_s).toFixed(0)} s` : "";
-    left.appendChild(el("div", [hhmm(c.ts), chosen, took].filter(Boolean).join(" · "), "muted"));
+    const decided = c.decide_ms != null ? `decided in ${c.decide_ms} ms` : "";
+    left.appendChild(el("div", [hhmm(c.ts), chosen, decided, took].filter(Boolean).join(" · "), "muted"));
     // Last result straight from the module (or the worker): why it failed, so the demo needs no Atlas
     if (c.fail_reason) left.appendChild(el("div", c.fail_reason, "cmdfail"));
     li.appendChild(left);
@@ -320,7 +329,9 @@ $("b-reset").addEventListener("click", async () => {
 let commandPath = "queue";
 function sentMsg(r, what) {
   if (!r.module) return `queued: ${what}`;
-  if (r.module.accepted) return `module started: ${what}`;
+  const ms = r.module.decide_ms != null ? ` (decided in ${r.module.decide_ms} ms)` : "";
+  if (r.module.accepted) return `module started: ${what}${ms}`;
+  if (r.module.reason) return `${r.module.reason}${ms}`;
   return r.module.error === "busy" ? `module is busy with "${r.module.running?.text || "a job"}", try again when it is idle` : `module refused: ${r.module.error}`;
 }
 $("b-prev").addEventListener("click", async () => {

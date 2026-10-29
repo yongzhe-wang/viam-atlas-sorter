@@ -67,6 +67,13 @@ await sorter.do_command({"reset": True})                    # empty the square (
 ```
 
 - Leading verbs are ignored ("grasp", "pick up", "get", ...); the destination is always the square.
+- **Always ready:** CLIP and the object library load in the background at startup (`"warm": true` in status).
+  While idle with the arm at the observe pose (`home_xy`, z 400), the service looks at the table about once a
+  second and caches what it recognises (`"seen"` in status: labels, confidence, boxes, intruders). If that
+  frame is at most 1.5 s old, a grasp decides from it at once (`"decide_ms"`). It either starts moving with
+  that target or answers immediately `{"ok": false, "status": "not_found", "reason": "no 'pumpkin' on the table"}`.
+  Otherwise, for example right after a move, it falls back to the executor's own observe (`"why_slow"`).
+  `{"seen_image": true}` returns that frame as a small base64 JPEG with the boxes scaled to it.
 - One job at a time. A request while busy returns `{"accepted": false, "error": "busy", "running": {...}}`.
 - Summaries contain `status` (`done`, `failed`, `not_found`, `ambiguous` = two objects match about equally,
   `too_wide`, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
