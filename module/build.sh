@@ -8,7 +8,8 @@ rm -rf module/dist && mkdir -p module/dist/stage/module module/dist/stage/script
 cp module/run.sh module/dist/stage/run.sh
 # viam-server reads the entrypoint from meta.json inside local tarballs (reload-local fails without it)
 cp meta.json module/dist/stage/meta.json
-cp module/main.py module/sorter_service.py module/dist/stage/module/
+# Every module/*.py: listing files by name shipped a tarball without live_map.py and the module died on import
+cp module/*.py module/dist/stage/module/
 cp requirements.txt module/dist/stage/requirements.txt
 cp -R sorter module/dist/stage/sorter
 cp scripts/pick_place_auto.py scripts/jaw_calib.py module/dist/stage/scripts/
