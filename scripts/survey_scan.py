@@ -203,9 +203,44 @@ async def main() -> None:
         print(f"survey: {n} frames in {OUT} ({time.monotonic() - t_start:.0f} s); parked at {ppa.HOME_XY}")
 
 
+async def around(points: list, offset: float = 40.0) -> None:
+    """
+    Extra library frames: 4 views per point, flange at (x +- offset, y +- offset), theta 0, z ALIGN_Z.
+
+    WHY: an object that the grid only saw in corner views (the green cube near the base) needs centred
+    views for the object library. Indices continue after the newest frame in data/scan.
+    """
+    OUT.mkdir(parents=True, exist_ok=True)
+    existing = [int(f.stem) for f in OUT.glob("[0-9][0-9][0-9].json")]
+    n = max(existing) + 1 if existing else 0
+    rig = ppa.Rig()
+    await rig.start()
+    try:
+        await ppa.apply_workspace_limits(rig)
+        for cx, cy in points:
+            for dx, dy in ((-offset, -offset), (-offset, offset), (offset, -offset), (offset, offset)):
+                x, y = cx + dx, cy + dy
+                if not ppa.allowed(x, y) or math.hypot(x, y) < 120.0:
+                    print(f"  skip ({x:.0f},{y:.0f}): keep-out or too close to the base")
+                    continue
+                await ppa.travel(rig, x, y, theta=0.0)
+                await capture(rig, n, "library", {"around": [cx, cy]})
+                print(f"  frame {n:03d} at ({x:.0f},{y:.0f})")
+                n += 1
+    finally:
+        try:
+            await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
+        finally:
+            await rig.close()
+
+
 if __name__ == "__main__":
     # --free-only: recompute free_spots.json from the saved frames without moving the arm
     if "--free-only" in sys.argv:
         recompute_free()
+    elif "--around" in sys.argv:
+        # --around X,Y [X,Y ...]: 4 library views around each flange point
+        pts = [tuple(map(float, a.split(","))) for a in sys.argv[sys.argv.index("--around") + 1:]]
+        asyncio.run(around(pts))
     else:
         asyncio.run(main())
