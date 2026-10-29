@@ -97,6 +97,7 @@
       <div class="kpi"><b id="k-rate">–</b><span>success</span></div>
       <div class="kpi"><b id="k-time">–</b><span>mean time (success)</span></div>
     </div>
+    <div id="k-reset" class="muted" style="font-size:12px;margin:-4px 0 8px"></div>
     <svg id="chart" viewBox="0 0 520 180" width="100%" role="img" aria-label="success rate over attempts"></svg>
     <div class="legend"><span><i class="sw" style="background:var(--accent)"></i>cumulative</span>
       <span><i class="sw" style="background:var(--ok)"></i>last 10</span></div>
@@ -202,6 +203,8 @@ async function refreshStats() {
   const s = await api("/api/stats");
   $("k-n").textContent = s.n; $("k-rate").textContent = pct(s.rate);
   $("k-time").textContent = s.mean_success_s ? s.mean_success_s.toFixed(0) + " s" : "–";
+  // Square clearing is not a requested grasp: counted here, kept out of the rate and the chart
+  $("k-reset").textContent = s.resets.n ? `Clear-square passes (not in the rate): ${s.resets.n}, ${s.resets.ok} cleared` : "";
   drawChart(s.series);
   const bars = $("bars"); bars.replaceChildren();
   for (const p of s.per_label) {

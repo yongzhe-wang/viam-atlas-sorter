@@ -171,8 +171,13 @@ def attempts(limit: int = 30):
 
 @app.get("/api/stats")
 def stats():
-    """Success over attempts (cumulative and rolling 10) and per label; reset passes are excluded."""
-    picks = [a for a in store.list_attempts(limit=0, newest_first=False) if a.get("mode") != "reset"]
+    """
+    Success over attempts (cumulative and rolling 10) and per label. Reset passes (clearing the square,
+    EXEC_PLAN "Reset") are not grasps on request, so they are excluded here and counted separately.
+    """
+    every = store.list_attempts(limit=0, newest_first=False)
+    picks = [a for a in every if a.get("mode") != "reset"]
+    resets = [a for a in every if a.get("mode") == "reset"]
     series, ok = [], 0
     for i, a in enumerate(picks):
         ok += bool(a.get("success"))
@@ -187,6 +192,7 @@ def stats():
     times = [a["duration_s"] for a in picks if a.get("success") and a.get("duration_s")]
     return {"n": len(picks), "ok": ok, "rate": ok / len(picks) if picks else None,
             "mean_success_s": sum(times) / len(times) if times else None, "series": series,
+            "resets": {"n": len(resets), "ok": sum(bool(a.get("success")) for a in resets)},
             "per_label": [{"label": k, **v, "rate": v["ok"] / v["n"]} for k, v in sorted(per_label.items())]}
 
 
