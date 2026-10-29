@@ -810,10 +810,14 @@ def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = 220.0) -> 
     disk = (uu - uv[0]) ** 2 + (vv - uv[1]) ** 2 < radius ** 2
     disk[FINGER_ROW:] = False
     table, _ = table_and_near(depth)
-    raised = int(((depth > 0) & (depth < table - 10) & disk).sum())
-    blind_all, _ = ndimage.label(depth == 0)
-    held = np.isin(blind_all, np.unique(blind_all[-1][blind_all[-1] > 0]))
-    blind = int(((depth == 0) & ~held & disk).sum())
+    up = (depth > 0) & (depth < table - 10)
+    # The held object hangs in from the bottom edge: unreadable core plus close valid edges. Everything
+    # close/unreadable and connected to the bottom row is the gripper's own load, not the table's.
+    close, _ = ndimage.label((depth == 0) | up)
+    held = ndimage.binary_dilation(np.isin(close, np.unique(close[-1][close[-1] > 0])), iterations=10)
+    disk &= ~held
+    raised = int((up & disk).sum())
+    blind = int(((depth == 0) & disk).sum())
     odd = int((non_table_colour(rgb, (depth > 0) & (np.abs(depth - table) < 3)) & disk).sum())
     if raised > 300:
         return False, f"something raised ({raised} px)"
