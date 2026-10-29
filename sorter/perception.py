@@ -12,6 +12,7 @@ Intruders (hands, arms) are reported separately so the executor can pause; see f
 Contract: docs/EXEC_PLAN.md (Obj, segment). segment_full() also returns intruders and the alignment used.
 """
 import math
+import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -120,23 +121,36 @@ def non_table_colour(rgb: np.ndarray, table_px: np.ndarray) -> np.ndarray:
     return (m2 > 16.0).reshape(rgb.shape[:2])
 
 
-def pick_alignment(rgb: np.ndarray, above: np.ndarray, table: np.ndarray) -> tuple:
-    """
-    IDENTITY or UNALIGNED, whichever puts the depth object mask on non-table-coloured pixels.
-
-    WHY: AGENT1 turns align_color_depth on at some point; checking per frame means nobody has to flip a
-    flag in this code at the same moment. Score = IoU with the colour "not table" mask.
-    """
-    if above.sum() < MIN_AREA_PX:
-        return UNALIGNED
+def alignment_ious(rgb: np.ndarray, above: np.ndarray, table: np.ndarray) -> dict:
+    """IoU of the depth object mask with the colour "not table" mask, under each depth -> colour model."""
     cue = non_table_colour(rgb, to_colour(table, UNALIGNED) & to_colour(table, IDENTITY))
-    best, best_iou = UNALIGNED, -1.0
-    for model in (UNALIGNED, IDENTITY):
+    out = {}
+    for name, model in (("identity", IDENTITY), ("unaligned", UNALIGNED)):
         m = to_colour(above, model)
-        iou = (m & cue).sum() / max((m | cue).sum(), 1)
-        if iou > best_iou:
-            best, best_iou = model, iou
-    return best
+        out[name] = float((m & cue).sum() / max((m | cue).sum(), 1))
+    return out
+
+
+# Decided once per process on the first frame with objects; see segment_full()
+_ALIGN = {"model": None}
+
+
+def _startup_alignment(rgb: np.ndarray, above: np.ndarray, table: np.ndarray) -> tuple:
+    """
+    align_color_depth is on (verified 2026-10-29: IoU 0.31 at identity vs 0.06 at the old shift), so
+    identity is the model. Checked once on the first frame with objects: if the unaligned model fits
+    clearly better, someone turned the switch off -> warn and fall back instead of mis-masking everything.
+    {VIAM CENTERAL 2026-10-29 "ALIGN_COLOR_DEPTH IS NOW ON — DEPTH PIXELS MAP 1:1 TO COLOUR PIXELS"}
+    [CONFIDENCE: CONFIRMED 90% — also seen on frame f02: per-frame check picked identity]
+    """
+    if _ALIGN["model"] is None and above.sum() >= MIN_AREA_PX:
+        ious = alignment_ious(rgb, above, table)
+        if ious["unaligned"] > ious["identity"] * 1.5:
+            warnings.warn(f"depth looks UNALIGNED to colour {ious}; is align_color_depth off? using UNALIGNED")
+            _ALIGN["model"] = UNALIGNED
+        else:
+            _ALIGN["model"] = IDENTITY
+    return _ALIGN["model"] or IDENTITY
 
 
 def _geometry(mask: np.ndarray) -> tuple:
@@ -197,7 +211,7 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
     """
     Objects, intruders and table depth from one colour + depth frame (both 1280x720).
 
-    `align`: depth -> colour model; None picks IDENTITY or UNALIGNED from the frame itself.
+    `align`: depth -> colour model; None = IDENTITY (align_color_depth on), checked once per process.
     """
     d = depth.astype(float)
     valid = (d > 0) & (d < 2000)
@@ -207,7 +221,7 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
 
     above = ndimage.binary_opening(valid & (height > MIN_HEIGHT_MM) & (height < 300), iterations=2)
     table = valid & (np.abs(height) < 3)
-    model = align if align is not None else pick_alignment(rgb, above, table)
+    model = align if align is not None else _startup_alignment(rgb, above, table)
 
     lab_d, n = ndimage.label(above)
     lab_c = to_colour(lab_d, model)
