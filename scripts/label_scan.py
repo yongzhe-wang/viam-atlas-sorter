@@ -56,7 +56,12 @@ def load_frames():
         if pj.name in ("groups.json", "applied.json"):
             continue
         meta = json.loads(pj.read_text())
+        # AGENT1 also writes objects.json / free_spots.json (lists) next to the frames
+        if not isinstance(meta, dict):
+            continue
         pose = meta.get("pose", meta)
+        if not isinstance(pose, dict) or "x" not in pose:
+            continue
         stem = pj.with_suffix("")
         img = next((p for p in (stem.with_suffix(".jpg"), stem.with_suffix(".png")) if p.exists()), None)
         dnp, dpng = Path(f"{stem}_depth.npy"), Path(f"{stem}_depth.png")

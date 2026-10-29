@@ -33,10 +33,13 @@ FILLER = {"the", "a", "an", "one", "object", "thing"}
 COLOUR_BONUS = 0.04  # colour word matches the object's dominant colour (CLIP sims sit around 0.2-0.3)
 COLOUR_PENALTY = 0.04  # colour word names a different, saturated colour
 SHAPE_BONUS = 0.02  # "long"/"stick" vs footprint aspect; the only shape cue that held up
-# Library recognition. View scores are on the Store's 0-1 scale ((1 + cos) / 2): a crop matched its own
-# view at 1.0 and a different object's view at 0.83-0.87 in the offline test.
-# [CONFIDENCE: SINGLE-SRC 55% — offline test only; calibrate on the arm scan]
-KNN_MIN = 0.90  # a view at least this close counts as "same object"
+# Library recognition. View scores are on the Store's 0-1 scale ((1 + cos) / 2). Measured on the 32-frame arm
+# scan: same object across frames median 0.93 (p5 0.86); different objects up to 0.95, but only same-shape
+# objects of another colour (blue vs green cylinder) or another height (yellow cylinder 60 mm vs yellow block
+# 31 mm). So a view must also agree on colour and height to vote.
+# [CONFIDENCE: CONFIRMED 75% — 10 clean groups, 100 sightings; see label_scan held-out test]
+KNN_MIN = 0.88  # a view at least this close counts as "same object"
+VIEW_DH_MM = 15.0  # ... and its height within this of the object's
 # Vote weight by view source: phone close-ups are oblique, the wrist camera looks straight down
 SOURCE_WEIGHT = {"phone": 0.5}
 LABEL_BONUS = 0.15  # object recognised as something the query names
@@ -116,15 +119,21 @@ def name_matches(query: str, names: list) -> bool:
     return bool(q) and any(q <= _words(n) or (_words(n) and _words(n) <= q) for n in names)
 
 
-def recognise(emb: np.ndarray, store, k: int = 5) -> tuple:
+def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm: float = None) -> tuple:
     """
     (label, names, confidence) from the nearest labelled views, or (None, [], 0.0).
 
-    Views closer than KNN_MIN vote with their score; names = the winning label plus every alias seen.
+    Views closer than KNN_MIN vote with their score (phone views at reduced weight), but only if their stored
+    colour and height (when present) agree with the object's: CLIP alone confuses same-shape objects of a
+    different colour or height. names = the winning label plus every alias seen.
     """
     votes, names = {}, {}
     for v in store.search_views(emb, k=k):
         if v["score"] < KNN_MIN:
+            continue
+        if colour and v.get("colour") and not (colour_ok({colour}, v["colour"]) or colour_ok({v["colour"]}, colour)):
+            continue
+        if height_mm is not None and v.get("height_mm") is not None and abs(v["height_mm"] - height_mm) > VIEW_DH_MM:
             continue
         votes[v["label"]] = votes.get(v["label"], 0.0) + v["score"] * SOURCE_WEIGHT.get(v.get("source"), 1.0)
         names.setdefault(v["label"], {v["label"]}).update(v.get("aliases") or [])
@@ -161,7 +170,7 @@ def rank(objs: list, text: str, store=None) -> list:
             score += SHAPE_BONUS if o.length_px / max(o.width_px, 1.0) > 2.0 else -SHAPE_BONUS
         o.recognised, o.recognised_names = None, []
         if store is not None:
-            lab, names, _ = recognise(emb, store)
+            lab, names, _ = recognise(emb, store, colour=o.colour, height_mm=o.height_mm)
             o.recognised, o.recognised_names = lab, names
             if lab is not None:
                 score += LABEL_BONUS if name_matches(q, names) else -LABEL_PENALTY
