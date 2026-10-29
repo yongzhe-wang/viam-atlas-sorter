@@ -73,3 +73,23 @@ scripts/    Atlas setup, seed data, homography calibration
 teach_ui/   minimal web page for teaching new objects
 docs/       notes
 ```
+
+## Running the autonomous pick-and-place (works on sfhack4, 2026-10-29)
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+export VIAM_MACHINE_ADDRESS=... VIAM_API_KEY_ID=... VIAM_API_KEY=...   # from the machine's CONNECT tab
+.venv/bin/python scripts/pick_place_auto.py          # full run: yellow block -> blue tape square
+.venv/bin/python scripts/pick_place_auto.py place    # resume when the block is already in the gripper
+```
+
+No human or LLM in the loop: the colour camera closes the loop on x/y (Jacobian probed on the fly), the
+RealSense depth map gives every height. Result: `docs/first_success.jpg`.
+
+Lessons that cost a run each:
+- `get_images()` right after a move returns a stale frame; wait ~1 s or the servo diverges.
+- The `table` obstacle `z=-123` is the centre of a 200 mm box; the real table top is ~0. Use depth, not config.
+- The configured camera offset was ~3-4 cm off; the jaw axis is calibrated from the fingertips visible in the image.
+- Depth is not aligned to colour and is invalid closer than ~280 mm; match depth blobs by position, carry depth over on vertical moves.
+- The held block occludes the tape square; treat it as a wall when finding the hole.
+- The WebRTC link from a laptop dropped once mid-run; run the script on the Linux box next to the arm.
