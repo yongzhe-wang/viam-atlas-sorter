@@ -164,13 +164,66 @@ def square_from_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intrinsics
     return {"px": [int(round(hit[0])), int(round(hit[1]))], "xy": [round(x, 1), round(y, 1)]}
 
 
-def record_sightings(store, rgb, depth, seg, pose: dict, intrinsics: dict, source: str) -> None:
-    """Tell the object memory what this frame saw (AGENT3's where_is follows moved objects); never fails."""
+def record_sightings(store, rgb, depth, seg, pose: dict, intrinsics: dict, source: str) -> list:
+    """
+    Tell the object memory what this frame saw (AGENT3's where_is follows moved objects); never fails.
+    Returns the recognise_all() records (one CLIP batch) so best() can reuse them; [] on failure.
+    """
     try:
         recs = clip_embed.recognise_all(rgb, depth, store, seg=seg)
+    except Exception as e:
+        print(f"  recognition failed: {e}")
+        return []
+    try:
         clip_embed.record_sightings(store, recs, pose, intrinsics, source=source)
     except Exception as e:
         print(f"  sightings not recorded: {e}")
+    return recs
+
+
+RING_HOLE_FRAC = 0.2  # share of an object's hole-filled mask that is hole: a ring (tape roll), grasped by its wall
+
+
+def ring_geometry(o):
+    """((cu, cv) ring centre px, radius px of the middle of the wall) if `o` is ring-like, else None."""
+    u0, v0, u1, v1 = o.bbox
+    sub = o.mask[v0:v1 + 1, u0:u1 + 1]
+    filled = ndimage.binary_fill_holes(sub)
+    hole = filled & ~sub
+    if not filled.any() or hole.sum() < RING_HOLE_FRAC * filled.sum():
+        return None
+    vs, us = np.nonzero(filled)
+    r_out, r_in = math.sqrt(filled.sum() / math.pi), math.sqrt(hole.sum() / math.pi)
+    return (u0 + float(us.mean()), v0 + float(vs.mean())), 0.5 * (r_out + r_in)
+
+
+def grasp_px(o, pose: dict = None, k: dict = None) -> tuple:
+    """
+    (u, v, yaw_deg): where the jaws close on `o` in this frame; yaw is the image angle align_wrist turns vertical
+    (the jaws close across it, along image u).
+
+    Default: the top-face centroid (a long object's handle / thickest part) and the object's long axis.
+    {VIAM CENTERAL 2026-10-29 "FOR ELONGATED OBJECTS, CHOOSE THE GRASP POINT AT THE HANDLE/THICKEST SECTION"}
+    [CONFIDENCE: INFERRED 75% — perception.Obj.top_centroid_px is the top band within TOP_BAND_MM]
+    Ring (ring_geometry: the black tape roll, whose top centroid is in its hole and whose outside is wider than
+    the jaws): the middle of its wall on the side nearest the arm base, yaw = the wall's tangent there, so the
+    jaws close across the wall. Needs the frame's pose and intrinsics for the base direction.
+    {VIAM CENTERAL 2026-10-29 "FOR RING-LIKE OBJECTS ... GRASP THE WALL: GRASP POINT ON THE RING AT THE SIDE NEAREST THE ARM"}
+    [CONFIDENCE: INFERRED 60% — the ring mask (table visible in the hole) is not yet seen on the arm]
+    """
+    ring = ring_geometry(o) if pose is not None and k is not None else None
+    if ring is None:
+        u, v = o.top_centroid_px or o.centroid_px
+        return float(u), float(v), float(o.yaw_deg)
+    (cu, cv), r_px = ring
+    # Image direction toward the base: the ring centre and a point 10 mm nearer the base, both projected
+    cx, cy = perception.world_xy(pose, k, cu, cv, o.top_depth_mm)
+    n = math.hypot(cx, cy) or 1.0
+    pu, pv = perception.project_xy(pose, k, (cx - 10.0 * cx / n, cy - 10.0 * cy / n), o.top_depth_mm)
+    du, dv = pu - cu, pv - cv
+    L = math.hypot(du, dv) or 1.0
+    # Tangent = radial turned 90 deg; same angle convention as perception (atan2(-dv, du), [0, 180))
+    return cu + du / L * r_px, cv + dv / L * r_px, math.degrees(math.atan2(-du / L, -dv / L)) % 180.0
 
 
 class ObjTracker:
@@ -187,7 +240,8 @@ class ObjTracker:
       candidate in reach it re-acquires by recognition over the whole frame;
     - close frames (depth blind < ~280 mm): pixels of ANY of the object's dominant colours (a blue+black handle
       is matched as a whole, not just its blue cap), nearest blob to the last position;
-    - executor.verify_target() re-checks identity by recognition before every descent (ppa.pick verify=).
+    - identity is fixed in the found frame (approach() -> self.ref); executor.still_target() checks continuity
+      before every descent and falls back to recognition (ppa.pick check=).
     """
 
     MAX_JUMP_PX = 260.0
@@ -197,7 +251,7 @@ class ObjTracker:
         self.far_uv = obj.centroid_px  # last position in a far frame
         self.close_uv = None  # last position in a close frame; cleared when the arm goes back up
         self.close_target = None  # jaw pixel for the close servo, set by ppa.pick before it starts
-        self.ref = None  # {"xy", "area"} of the object verify_target() accepted; still_target() compares with it
+        self.ref = None  # {"xy", "area"} of the object best() accepted (set by approach); still_target() compares
         self.uv = self.far_uv
         self._learn(rgb, obj.mask)
 
@@ -275,13 +329,10 @@ class ObjTracker:
             self.close_uv = None
             if not o.touches_edge:
                 self._learn(rgb, o.mask)
-            # Grasp point = top-face centroid: on a long object that is its thickest part (the screwdriver's
-            # handle), not the overall centroid out on the shaft; on a block it is the top centre. Matching
-            # between frames stays on the overall centroid (far_uv).
-            # {VIAM CENTERAL 2026-10-29 "FOR ELONGATED OBJECTS, CHOOSE THE GRASP POINT AT THE HANDLE/THICKEST SECTION"}
-            # [CONFIDENCE: INFERRED 75% — perception.Obj.top_centroid_px is the top band within TOP_BAND_MM]
-            gu, gv = o.top_centroid_px or o.centroid_px
-            return (gu, gv, o.yaw_deg, int(o.mask.sum()))
+            # Servo onto the grasp point (handle / ring wall, grasp_px); matching between frames stays on the
+            # overall centroid (far_uv)
+            gu, gv, yaw = grasp_px(o, self.rig.at, intr(self.rig))
+            return (gu, gv, yaw, int(o.mask.sum()))
         ref = self.close_uv or self.far_uv
         lab, n = ndimage.label(self._close_mask(rgb))
         cands, self._labels = [], []
@@ -323,10 +374,10 @@ async def under_jaws(rig) -> tuple:
     objs = list(seg.objects) + [o for o, _ in seg.excluded]
 
     def off_axis(o):
-        # The servo centres the top face (ObjTracker), so measure from it: a long object's overall centroid
-        # sits out on its shaft, >80 px from the jaws
+        # The servo centres the grasp point (ObjTracker), so measure from it: a long object's overall centroid
+        # sits out on its shaft, a ring's in its hole, both > 80 px from the jaws
         au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, o.top_depth_mm)
-        gu, gv = o.top_centroid_px or o.centroid_px
+        gu, gv, _ = grasp_px(o, pose, intr(rig))
         return math.hypot(gu - au, gv - av)
 
     under = min(objs, key=off_axis) if objs else None
@@ -334,39 +385,23 @@ async def under_jaws(rig) -> tuple:
 
 
 def footprint(rig, o, pose: dict) -> dict:
-    """Table xy of the object's top and its area scaled to REF_TABLE_DEPTH_MM, for continuity checks."""
-    xy = perception.world_xy(pose, intr(rig), *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+    """Table xy of the object's grasp point and its area scaled to REF_TABLE_DEPTH_MM, for continuity checks."""
+    gu, gv, _ = grasp_px(o, pose, intr(rig))
+    xy = perception.world_xy(pose, intr(rig), gu, gv, o.top_depth_mm)
     return {"xy": (float(xy[0]), float(xy[1])),
             "area": float(o.mask.sum()) * (o.top_depth_mm / perception.REF_TABLE_DEPTH_MM) ** 2}
 
 
-async def verify_target(rig, text: str, store, tracker=None) -> tuple:
-    """
-    (ok, why) centred over the object at theta 0, where the whole object is in view: is it the one `text` asks for?
-
-    The object under the jaws is the one nearest the jaw-axis pixel at its own top depth. It passes if best()
-    over everything in view picks it, or (if best() picks nothing) best() over it alone accepts it. Any other
-    winner means the tracker followed the wrong thing: refuse rather than grab it. On a pass the object's
-    footprint is kept on `tracker` (tracker.ref) for still_target() before each descent.
-    """
-    under, objs, pose = await under_jaws(rig)
-    if under is None:
-        return False, "nothing under the jaws"
-    ok, why = identity(under, objs, text, store)
-    if ok and tracker is not None:
-        tracker.ref = footprint(rig, under, pose)
-    return ok, why
-
-
 async def still_target(rig, text: str, store, tracker) -> tuple:
     """
-    (ok, why) just before a descent, after the wrist turn: still the object verify_target() accepted?
+    (ok, why) just before a descent, after the wrist turn: still the object best() accepted in the found frame?
 
     WHY (2026-10-29, "blue screwdriver" refused at theta -50 with its handle centred under the jaws): with the
     wrist turned, the fingertip band cut the shaft off and recognition of the handle alone failed. So here only
     continuity: the object nearest the jaw pixel stands where the verified one stood (CONT_XY_MM, full pose incl.
-    theta) with a similar footprint (CONT_AREA). If not provable (a missed grab moved it, or nothing was verified),
-    full recognition on this frame decides, so a different object (the blue block, clips_sd2) is still refused.
+    theta) with a similar footprint (CONT_AREA) as approach() recorded from the found frame (tracker.ref). If not
+    provable (a missed grab moved it, or no reference), full recognition on this frame decides, so a different
+    object (the blue block, clips_sd2) is still refused.
     """
     under, objs, pose = await under_jaws(rig)
     if under is None:
@@ -401,7 +436,13 @@ def identity(under, objs: list, text: str, store) -> tuple:
     return False, f"the object under the jaws does not look like '{text}'"
 
 
-INSIDE_FRAC = 0.7  # an object is "in the square" when this much of its footprint lies on the white interior
+# An object is "in the square" when this many of its raised pixels lie on the white interior (at the 380 mm
+# reference depth; scaled with depth like perception's areas). Was 70% of the footprint: the blue screwdriver lying
+# across the yellow block segments as one blob mostly outside the interior, and a reset said "done" in 3.7 s.
+# {VIAM CENTERAL 2026-10-29 "IN THE SQUARE IF ANY OF ITS RAISED PIXELS ... COVER THE WHITE INTERIOR BY ... >= 1500 PX"}
+# [CONFIDENCE: SINGLE-SRC 80% — coordinator's report of the stacked case; threshold from them]
+IN_SQUARE_PX = 1500
+SQUARE_CLEAR_RAISED_PX = 600  # reset is done only when the interior has fewer raised pixels than this (noise)
 
 
 def hole_mask(rgb: np.ndarray, depth: np.ndarray = None):
@@ -471,8 +512,17 @@ def partial_hole(rgb: np.ndarray, depth: np.ndarray):
 
 
 def in_hole(o, hole: np.ndarray) -> bool:
-    """Object footprint mostly on the square's white interior (INSIDE_FRAC); on the tape border does not count."""
-    return (o.mask & hole).sum() >= INSIDE_FRAC * o.mask.sum()
+    """Object's raised pixels cover >= IN_SQUARE_PX of the square's white interior (any shape, stacked or overhanging)."""
+    table = o.top_depth_mm + o.height_mm
+    return (o.mask & hole).sum() >= IN_SQUARE_PX * perception.area_scale(table)
+
+
+def raised_in_hole(depth: np.ndarray, hole: np.ndarray) -> int:
+    """Pixels of the white interior standing > perception.MIN_HEIGHT_MM above the fitted table plane."""
+    a, b, c = perception.fit_table(depth.astype(float))
+    h, w = depth.shape
+    plane = a * np.arange(w)[None, :] + b * np.arange(h)[:, None] + c
+    return int((hole & (depth > 0) & (plane - depth > perception.MIN_HEIGHT_MM)).sum())
 
 
 def objects_in_hole(rgb: np.ndarray, depth: np.ndarray) -> tuple:
@@ -488,6 +538,109 @@ def objects_in_hole(rgb: np.ndarray, depth: np.ndarray) -> tuple:
         return False, [], seg
     objs = list(seg.objects) + [o for o, _ in seg.excluded]
     return True, [o for o in objs if in_hole(o, hole)], seg
+
+
+# Clear room a release needs, around the drop point at theta 0 (the jaws close along image u): the fingers open to
+# ~84 mm, so a strip +-SPOT_JAW_MM along u and +-SPOT_FINGER_MM across it, plus the object's own grasped section
+SPOT_JAW_MM = 45.0
+SPOT_FINGER_MM = 12.0
+SPOT_BODY_MAX_MM = 40.0  # half-length of the object counted at most: a long object's rest hangs over the border
+RELEASE_MATCH_MM = 60.0  # the check looks for the placed object's grasp point this close to the release point
+
+
+def table_plane(depth: np.ndarray) -> np.ndarray:
+    """Fitted table depth per pixel (perception.fit_table)."""
+    a, b, c = perception.fit_table(depth.astype(float))
+    h, w = depth.shape
+    return a * np.arange(w)[None, :] + b * np.arange(h)[:, None] + c
+
+
+def square_spot(rig, size_mm: tuple = (40.0, 40.0)):
+    """
+    ppa.place_in_square's choose_spot: (flange xy over the free point of the white interior nearest its centre,
+    why), or (None, why) if no point of the interior has the room a release needs: the finger strip (+-SPOT_JAW_MM
+    along image u, +-SPOT_FINGER_MM along v) and the held object's grasped section (size_mm = (across the jaws,
+    along them), half-length capped at SPOT_BODY_MAX_MM).
+
+    WHY (2026-10-29): the blue screwdriver was put down on top of the yellow block already in the square. Seen
+    from the carry-offset view (hole up-left, held object at the bottom edge): occupied = raised above the fitted
+    table or unreadable; the held object (blind / raised and connected to the bottom row) counts as unknown, not
+    free. The free point keeps the jaws' clearance from every occupied pixel and from the tape.
+    {VIAM CENTERAL 2026-10-29 "DEPTH-FREE CELL NEAREST THE CENTRE WITH CLEARANCE FOR THE FOOTPRINT, OR FAIL WITH 'SQUARE IS FULL'"}
+    [CONFIDENCE: INFERRED 70% — offline on synthetic depth only]
+    """
+    def choose(rgb: np.ndarray, depth: np.ndarray, pose: dict) -> tuple:
+        if depth is None:
+            return None, "no depth"
+        hole = hole_mask(rgb, depth)
+        if hole is None:
+            return None, "hole not visible"
+        plane = table_plane(depth)
+        up = (depth > 0) & (plane - depth > perception.MIN_HEIGHT_MM)
+        blind = depth == 0
+        lab, _ = ndimage.label(up | blind)
+        held = np.isin(lab, np.unique(lab[-1][lab[-1] > 0]))
+        busy = up | blind | held
+        free = hole & ~busy
+        table = float(np.median(plane[hole]))
+        mm = rig.fx / table  # px per mm on the table
+
+        def room(half_u_mm: float, half_v_mm: float) -> np.ndarray:
+            # Pixels whose whole (2 half_v + 1) x (2 half_u + 1) rectangle is free; outside the image is not free
+            size = (2 * int(half_v_mm * mm) + 1, 2 * int(half_u_mm * mm) + 1)
+            return ndimage.minimum_filter(free.astype(np.uint8), size=size, mode="constant", cval=0).astype(bool)
+        across, along = size_mm
+        ok = room(SPOT_JAW_MM, SPOT_FINGER_MM) & room(across / 2, min(along / 2, SPOT_BODY_MAX_MM))
+        if not ok.any():
+            return None, (f"no room for the release on the white interior ({2 * SPOT_JAW_MM:.0f} mm finger strip "
+                          f"+ {across:.0f} x {min(along, 2 * SPOT_BODY_MAX_MM):.0f} mm object)")
+        vs, us = np.nonzero(hole)
+        cu, cv = us.mean(), vs.mean()
+        vs, us = np.nonzero(ok)
+        i = int(np.argmin((us - cu) ** 2 + (vs - cv) ** 2))
+        u, v = float(us[i]), float(vs[i])
+        xy = perception.world_xy(pose, intr(rig), u, v, float(plane[int(v), int(u)]))
+        off = math.hypot(u - cu, v - cv) * table / rig.fx
+        busy_px = int((hole & up).sum())
+        return (float(xy[0]), float(xy[1])), f"free spot {off:.0f} mm from the centre ({busy_px} px occupied)"
+    return choose
+
+
+def placed_ok(rig, rgb: np.ndarray, depth: np.ndarray, text: str, store) -> tuple:
+    """
+    (hole seen?, success?, why, segmentation) right after a place, from the retreat pose above the release point.
+
+    Success = the object at the release point (grasp point within RELEASE_MATCH_MM of the jaw axis) has its grasp
+    point on the white interior and is the target: best() over it accepts it, or it is not recognised as anything
+    else. Other objects in the square do not matter, and a long object hanging over the border passes by its
+    grasped section. Before: "wrong object in the hole" for the blue screwdriver (handle in, shaft out, the yellow
+    block also inside).
+    {VIAM CENTERAL 2026-10-29 "SUCCESS WHEN THE TARGET IS IN THE HOLE (BY RECOGNITION PLUS POSITION), REGARDLESS OF OTHER OBJECTS"}
+    [CONFIDENCE: SINGLE-SRC 80% — rule from the coordinator; recognition of the placed object not yet seen on the arm]
+    """
+    seg = perception.segment_full(rgb, depth) if depth is not None else None
+    hole = hole_mask(rgb, depth)
+    if hole is None or seg is None:
+        return False, False, "hole not visible", seg
+    pose = pose_dict(rig.last_pose) if rig.last_pose is not None else dict(rig.at)
+    k = intr(rig)
+    table = float(np.median(table_plane(depth)[hole]))
+    au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
+    best_o, best_d = None, RELEASE_MATCH_MM * rig.fx / table
+    for o in list(seg.objects) + [o for o, _ in seg.excluded]:
+        gu, gv, _ = grasp_px(o, pose, k)
+        inside = 0 <= int(gv) < hole.shape[0] and 0 <= int(gu) < hole.shape[1] and hole[int(gv), int(gu)]
+        d = math.hypot(gu - au, gv - av)
+        if inside and d < best_d:
+            best_o, best_d = o, d
+    if best_o is None:
+        return True, False, "nothing at the release point in the square", seg
+    found = clip_embed.best([best_o], text, store)
+    if found.get("obj") is not None:
+        return True, True, "target in the square", seg
+    if found.get("recognised") is None:
+        return True, True, "placed in the square (not re-recognised)", seg
+    return True, False, f"the object in the square is recognised as {found['recognised']!r}", seg
 
 
 def jpeg(rgb: np.ndarray) -> bytes:
@@ -513,11 +666,13 @@ async def look_here(rig, text: str, store, source: str = "demo") -> dict:
     rig.record("observe", rgb)
     seg = perception.segment_full(rgb, depth)
     publish_frame(store, rgb, seg, "observe")
-    if abs(pose["theta"]) <= 1.0:
-        record_sightings(store, rgb, depth, seg, pose, intr(rig), source)
+    # One CLIP batch for the sightings and for best(): it used to embed every crop twice per look
+    recs = record_sightings(store, rgb, depth, seg, pose, intr(rig), source) if abs(pose["theta"]) <= 1.0 else []
     hole = hole_mask(rgb, depth)
     objs = [o for o in seg.objects if not o.touches_edge and (hole is None or not in_hole(o, hole))]
-    found = clip_embed.best(objs, text, store) if objs else {"obj": None, "reason": "nothing seen", "searchable": True}
+    ids = {id(o) for o in objs}
+    found = (clip_embed.best(objs, text, store, recognised=[r for r in recs if id(r["obj"]) in ids])
+             if objs else {"obj": None, "reason": "nothing seen", "searchable": True})
     found.update(rgb=rgb, depth=depth, pose=pose, square=square_from_frame(rgb, depth, pose, intr(rig)))
     return found
 
@@ -532,7 +687,7 @@ def hint_for(text: str, store):
     return tuple(w["xy"]) if w else None
 
 
-async def search_and_find(rig, text: str, store, hint_xy=None, progress=None) -> dict:
+async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, skip_current: bool = False) -> dict:
     """
     Look for `text`, stopping at the FIRST frame whose best() accepts an object; no whole-table sweep first.
 
@@ -544,6 +699,7 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None) ->
     near the image centre) -> SWEEP_XY at SWEEP_Z, each next pose the nearest to where the arm is. One frame
     per pose; every frame still reaches the live map (Rig.frame -> on_map_frame). An ambiguous match stops at
     once (another view does not make two equal matches unequal). "Not found" only after every pose was seen.
+    skip_current: the caller just looked from here (module idle frame), start at the hint.
     Returns look_here()'s dict + "path" (current / hint / sweep) and "views"; when the found frame has no
     square but an earlier one did, "square" is that one and "square_from" is "search".
     progress(k, n, path, found) after each look (AGENT 2's module status: "searching... pose k/n", "found at
@@ -566,7 +722,8 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None) ->
         poses.append(("sweep", q[0], q[1], SWEEP_Z))
         at = q
     square, views, last = None, 0, {"obj": None, "reason": "nothing seen"}
-    for path, x, y, z in [("current", None, None, None)] + poses:
+    first = [] if skip_current else [("current", None, None, None)]
+    for path, x, y, z in first + poses:
         if path != "current":
             await ppa.travel(rig, x, y, theta=0.0, z=z)
         found = await look_here(rig, text, store, source="look" if path == "hint" else "demo")
@@ -575,7 +732,7 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None) ->
         square = found.get("square") or square
         if progress is not None:
             try:
-                r = progress(views, 1 + len(poses), path, found.get("obj") is not None)
+                r = progress(views, len(first) + len(poses), path, found.get("obj") is not None)
                 if inspect.isawaitable(r):
                     await r
             except Exception as e:
@@ -590,40 +747,70 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None) ->
     return last
 
 
+def wrist_for(pose: dict, k: dict, u: float, v: float, yaw: float, depth: float) -> float:
+    """
+    Wrist theta (deg, within +-90) that turns the image axis `yaw` (at pixel u, v of a frame taken at `pose`)
+    vertical, where the jaws close across it: the axis' two ends in table xy (world_xy), re-projected for every
+    candidate theta (project_xy); the smallest |theta| among the best fits wins.
+    """
+    du, dv = 30.0 * math.cos(math.radians(yaw)), -30.0 * math.sin(math.radians(yaw))
+    a = perception.world_xy(pose, k, u - du, v - dv, depth)
+    b = perception.world_xy(pose, k, u + du, v + dv, depth)
+    best = None
+    for t in range(-90, 91):
+        q = {"x": 0.0, "y": 0.0, "z": ppa.ALIGN_Z, "theta": float(t)}
+        (ua, va), (ub, vb) = perception.project_xy(q, k, a, depth), perception.project_xy(q, k, b, depth)
+        img = math.degrees(math.atan2(-(vb - va), ub - ua)) % 180.0
+        err = abs(((90.0 - img + 90.0) % 180.0) - 90.0)
+        key = (round(err), abs(t))
+        if best is None or key < best[0]:
+            best = (key, float(t))
+    return best[1]
+
+
 async def approach(rig, found: dict, tracker) -> None:
     """
-    Go straight to the pre-grasp pose computed from the found frame, in one move: jaws over the object's top
-    at ALIGN_Z, theta 0; move the tracker's seed pixel with it. No new look.
+    Go straight to the pre-grasp pose computed from the found frame, in ONE move with the wrist already turned:
+    jaws over the grasp point (grasp_px) at ALIGN_Z, long axis (or ring wall tangent) vertical in the image;
+    move the tracker's seed pixel with it and record the object's footprint (tracker.ref) for still_target().
+    No new look.
 
-    WHY: the yellow block's far servo started 530 px off and took 8 iterations (~31 s) of 60 mm steps; the
-    frame already gives the object's table xy (perception.world_xy of its top at its top depth), which is the
-    flange xy that puts the jaw axis over it, so pick()'s servo only refines (expected < 30 px). Works from any
-    frame pose (SWEEP_Z, observe, wrist turned). Falls back to the pose that centres it in view
-    (look_flange_xy), then to the frame's own xy, when that flange xy is out of reach.
-    {VIAM CENTERAL 2026-10-29 "COMPUTE THE TARGET'S WORLD XY FROM THE FRAME ... AND GO STRAIGHT TO ITS LOOK POSE IN ONE MOVE"}
-    [CONFIDENCE: INFERRED 80% — world_xy's jaw point and ppa.axis_pixel agree to < 1 px at 346 mm]
+    WHY: the yellow block's far servo started 530 px off and took 8 iterations (~31 s) of 60 mm steps, and the
+    wrist turn cost a separate rotation + re-servo (~3.8 s on the blue screwdriver). The frame already gives the
+    grasp point's table xy (perception.world_xy) and the axis direction; the camera model gives the flange xy and
+    theta that put the jaws over it. best() accepted the whole object in that frame, so identity is fixed there.
+    {VIAM CENTERAL 2026-10-29 "COMPUTE THE TARGET'S WORLD XY FROM THE FRAME ... GO STRAIGHT TO ITS LOOK POSE IN ONE MOVE"}
+    {VIAM CENTERAL 2026-10-29 "APPLY THE YAW IN THE SAME MOVE AS THE FIRST TRANSLATION"}
+    [CONFIDENCE: INFERRED 75% — camera model (THETA_SIGN, TOOL_AXIS_MM) checked on theta_test frames, not on a grasp]
+    Falls back to theta 0 and the pose that centres it in view (look_flange_xy), then the frame's own xy, when the
+    jaw-over pose is out of reach. Raises ppa.TooClose under MIN_GRASP_R_MM.
     """
     pose = found["pose"]
     obj, k = found["obj"], intr(rig)
-    u, v = obj.top_centroid_px or obj.centroid_px
+    u, v, yaw = grasp_px(obj, pose, k)
     xy = perception.world_xy(pose, k, u, v, obj.top_depth_mm)
-    fx, fy = xy
     # The jaws cannot reach down this close to the base: refuse before any servo time is spent
-    if math.hypot(fx, fy) < ppa.MIN_GRASP_R_MM:
-        raise ppa.TooClose(ppa.too_close_msg(fx, fy))
+    if math.hypot(*xy) < ppa.MIN_GRASP_R_MM:
+        raise ppa.TooClose(ppa.too_close_msg(*xy))
+    top = obj.top_depth_mm - (pose["z"] - ppa.ALIGN_Z)  # camera height above it shrinks by the z change
+    theta = wrist_for(pose, k, u, v, yaw, obj.top_depth_mm)
+    # Flange that puts the jaw axis (axis pixel at that depth) over xy at this theta: the offset is translation-free
+    au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top)
+    jx, jy = perception.world_xy({"x": 0.0, "y": 0.0, "z": ppa.ALIGN_Z, "theta": theta}, k, au, av, top)
+    fx, fy = xy[0] - jx, xy[1] - jy
     if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
+        theta = 0.0
         fx, fy = perception.look_flange_xy(xy)
         if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
             fx, fy = pose["x"], pose["y"]  # every closer pose out of reach: go down from where it was seen
     p = await rig.pose()
     # Already there (e.g. a retry from the same frame): skip the zero-length move and its settle time
-    if math.hypot(p.x - fx, p.y - fy) > 3.0 or abs(p.z - ppa.ALIGN_Z) > 3.0 or abs(p.theta) > 1.0:
-        await ppa.travel(rig, fx, fy, theta=0.0)
-    # Camera height above the object shrinks by the z change; the wrist angle does not change it
-    top = obj.top_depth_mm - (pose["z"] - ppa.ALIGN_Z)
-    seed = perception.project_xy({"x": fx, "y": fy, "z": ppa.ALIGN_Z, "theta": 0.0}, k, xy, top)
+    if math.hypot(p.x - fx, p.y - fy) > 3.0 or abs(p.z - ppa.ALIGN_Z) > 3.0 or abs(p.theta - theta) > 1.0:
+        await ppa.travel(rig, fx, fy, theta=theta)
+    seed = perception.project_xy({"x": fx, "y": fy, "z": ppa.ALIGN_Z, "theta": theta}, k, xy, top)
     tracker.far_uv = tracker.uv = (float(seed[0]), float(seed[1]))
-    print(f"  approach: object at ({xy[0]:.0f},{xy[1]:.0f}) -> flange ({fx:.0f},{fy:.0f}) z {ppa.ALIGN_Z:.0f}, "
+    tracker.ref = footprint(rig, obj, pose)
+    print(f"  approach: grasp point ({xy[0]:.0f},{xy[1]:.0f}) -> flange ({fx:.0f},{fy:.0f}) theta {theta:.0f}, "
           f"seed px ({seed[0]:.0f},{seed[1]:.0f})")
 
 
@@ -674,7 +861,8 @@ async def sweep_table(rig, progress=None) -> list:
     return frames
 
 
-async def execute(rig, text: str, store, mode: str = "demo", target=None, target_xy=None, progress=None) -> dict:
+async def execute(rig, text: str, store, mode: str = "demo", target=None, target_xy=None, progress=None,
+                  skip_current: bool = False) -> dict:
     """
     One command: put the object described by `text` into the blue square. Returns the logged attempt doc.
 
@@ -683,9 +871,12 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
     target_xy: a hint, table x/y where it was last seen (live map): search_and_find looks there right after the
       current frame, then keeps searching if it is gone. None: the object memory's last sighting is the hint.
     progress(k, n, path, found): passed to search_and_find (module status "searching... pose k/n").
+    skip_current: the caller has just looked from the current pose (the module's idle frame): the search starts
+      at the hint instead of taking that view again (~3.6 s on the arm).
     The square comes from the found frame, else any frame of this search, else known_square() (the newer of
     LAST_SQUARE and the live map's), else it is searched only while carrying. Always ends at the observe pose.
-    Never raises for an ordinary failure: status is done / not_found / ambiguous / too_wide / too_close / failed.
+    Never raises for an ordinary failure: status is done / not_found / ambiguous / too_wide / too_close /
+    square_full / failed.
     """
     doc = {"ts": time.time(), "mode": mode, "target_text": text, "success": False, "status": "failed",
            "fail_phase": None, "fail_reason": None}
@@ -703,7 +894,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
             if found.get("square") is None:
                 found["square"] = square_from_frame(found["rgb"], found.get("depth"), tp, intr(rig))
         else:
-            found = await search_and_find(rig, text, store, hint_xy=target_xy, progress=progress)
+            found = await search_and_find(rig, text, store, hint_xy=target_xy, progress=progress,
+                                          skip_current=skip_current)
             doc["find_path"], doc["find_views"] = found.get("path"), found.get("views")
         obj = found.get("obj")
         if obj is None:
@@ -715,7 +907,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if found.get("ambiguous"):
             doc.update(status="ambiguous", fail_phase="find", fail_reason=found.get("reason"))
             return doc
-        if width_mm(obj, rig.fx) > MAX_OPEN_MM:
+        # A ring is grasped by its wall (grasp_px), so its outside width does not matter
+        if width_mm(obj, rig.fx) > MAX_OPEN_MM and ring_geometry(obj) is None:
             doc.update(status="too_wide", fail_phase="find", fail_reason=f"{width_mm(obj, rig.fx):.0f} mm across")
             return doc
         # Where to put it: a frame of this search, else the last known square, else search while carrying
@@ -728,29 +921,33 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
             if square_xy is not None:
                 doc["square_path"] = src
         tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store)
-        # One move to the pre-grasp pose computed from the found frame; pick() then only refines
+        # One move (translation + wrist yaw) to the pre-grasp pose computed from the found frame, where best()
+        # already accepted the whole object: identity is fixed there (tracker.ref); pick() refines and checks
+        # continuity before the descent
         await approach(rig, found, tracker)
-        height, grip = await ppa.pick(rig, times, tracker, verify=lambda: verify_target(rig, text, store, tracker),
-                                      check=lambda: still_target(rig, text, store, tracker))
+        height, grip = await ppa.pick(rig, times, tracker, check=lambda: still_target(rig, text, store, tracker))
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
-        await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy)
-        # Released over the hole's centre (place_in_square servos onto it when visible): remember it
+        size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
+        await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy, choose_spot=square_spot(rig, size))
         q = await rig.pose()
-        LAST_SQUARE.update(xy=(q.x, q.y), ts=time.time())
         times["at"] = "check"
         rgb, depth = await rig.frame()
         rig.record("check", rgb)
-        seen, inside, seg = objects_in_hole(rgb, depth)
+        # Released at a free spot, not necessarily the centre: the square's position comes from this view
+        square_from_frame(rgb, depth, pose_dict(q), intr(rig))
+        seen, right, why, seg = placed_ok(rig, rgb, depth, text, store)
         if seg is not None:
             publish_frame(store, rgb, seg, "place")
         doc["img_after"] = jpeg(rgb)
-        # Only a success if what is in the hole is what was asked for
-        right = bool(seen and inside) and clip_embed.best(inside, text, store).get("obj") is not None
         doc["success"] = right
         doc["status"] = "done" if right else "failed"
+        doc["check"] = why
         if not right:
-            why = "hole not visible" if not seen else "nothing seen inside the hole" if not inside else "wrong object in the hole"
             doc.update(fail_phase="check", fail_reason=why)
+    except ppa.SquareFull as e:
+        # Nothing free in the square: put it back where it came from and say so
+        doc.update(status="square_full", fail_phase="place", fail_reason=str(e))
+        await recover(rig, doc)
     except ppa.TooClose as e:
         # A refusal, not a failure: nothing was grabbed; tell the person to move it out
         doc.update(status="too_close", fail_phase=times.get("at", "find"), fail_reason=str(e))
@@ -939,9 +1136,21 @@ async def clear_square(rig, store) -> dict:
             # Centred over the hole after the servo: drop_somewhere keeps away from here, the next run places here
             q = await rig.pose()
             LAST_SQUARE.update(xy=(q.x, q.y), ts=time.time())
-            if not inside:
+            # Done only when nothing stands on the interior at all (a stack segments as one overhanging blob)
+            raised = raised_in_hole(depth, hole_mask(rgb, depth))
+            doc["raised_px"] = raised
+            if not inside and raised < SQUARE_CLEAR_RAISED_PX:
                 doc.update(success=True, status="done", square_xy=[q.x, q.y])
                 break
+            if not inside:
+                print(f"reset: no object segmented but {raised} raised px on the interior: wiping")
+                if doc["wipes"] >= 2:
+                    raise RuntimeError(f"square still not empty after 2 wipes ({raised} raised px)")
+                await wipe(rig)
+                doc["wipes"] += 1
+                await ppa.search_square(rig)
+                await rig.servo(ppa.find_square, False, "square")
+                continue
             obj = inside[0]
             print(f"reset: {len(inside)} object(s) in the square; removing one ({obj.colour}, {obj.height_mm:.0f} mm)")
             picked = False

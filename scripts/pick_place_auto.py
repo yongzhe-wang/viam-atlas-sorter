@@ -590,12 +590,14 @@ class Rig:
     async def holding(self) -> bool:
         return (await self.call("holding", lambda: self.gripper.is_holding_something())).is_holding_something
 
-    async def goto(self, x: float, y: float, z: float, theta: float = None) -> None:
+    async def goto(self, x: float, y: float, z: float, theta: float = None, settle: bool = True) -> None:
         """
         Move the flange to (x, y, z) with the tool pointing straight down.
 
         WHY: single choke point for limits. Refuses anything below the measured floor, outside reach,
         or a jump larger than MAX_STEP_MM, so a bad calculation raises instead of hitting the table.
+        settle=False skips the SETTLE_S wait: only for moves that no frame follows (descend to grab, lift,
+        intermediate travel legs); the wait exists for the camera's stale frame, not for the motion.
         """
         if z < max(self.floor_z, SANITY_MIN_Z):
             raise RuntimeError(f"refusing z={z:.0f} below floor {max(self.floor_z, SANITY_MIN_Z):.0f}")
@@ -612,7 +614,8 @@ class Rig:
         # get_images() right after a move returns a stale frame; servo on stale frames diverged (68->142->297 px)
         # {LAGTEST 2026-10-29 "T+0S: BLOCK=(107, 475, 34)" "T+0.5S: BLOCK=(107, 496, 34)"}
         # [CONFIDENCE: CONFIRMED 90% — measured on sfhack4; 1 s gives margin over the observed ~0.5 s]
-        await asyncio.sleep(SETTLE_S)
+        if settle:
+            await asyncio.sleep(SETTLE_S)
 
     async def frame(self) -> tuple:
         res = await self.call("get images", lambda: self.cam.get_images())
@@ -677,12 +680,13 @@ class Rig:
         self.floor_z = p.z - (table - TIP_BELOW_CAM - TIP_CLEARANCE)
         return p.z, table, top
 
-    async def lift(self) -> None:
+    async def lift(self, settle: bool = True) -> None:
         """Straight up to ALIGN_Z; the safe response to any failure."""
         p = await self.pose()
-        await self.goto(p.x, p.y, ALIGN_Z)
+        await self.goto(p.x, p.y, ALIGN_Z, settle=settle)
 
-    async def servo(self, finder, use_top: bool, label: str, plane_at=None, offset=(0.0, 0.0)) -> None:
+    async def servo(self, finder, use_top: bool, label: str, plane_at=None, offset=(0.0, 0.0),
+                    blind_step: bool = True) -> None:
         """
         Bring the target found by `finder` onto the gripper axis, closed loop.
 
@@ -693,6 +697,7 @@ class Rig:
         `offset` (px): servo the target to axis pixel + offset instead, then make one open-loop move of
         J^-1 (-offset) with the last measured Jacobian. Used while carrying: the held object covers the
         bottom-right of the image, where the axis pixel is, so the square is aligned somewhere visible.
+        blind_step=False stops at the offset alignment (the caller picks the final spot from that view).
         """
         J, probing, prev = None, not SERVO_MODEL_J, None  # prev: error before an uncapped model step
         for it in range(8):
@@ -721,7 +726,7 @@ class Rig:
             if not probing:
                 J = model_jacobian(self.fx, self.fy, self.cx, self.cy, p.theta, plane)
             if err < TOL_PX and (J is not None or not any(offset)):
-                if any(offset):
+                if any(offset) and blind_step:
                     # Final blind step from the visible alignment point onto the real axis pixel
                     move = np.linalg.solve(J, -np.array(offset, float))
                     print(f"  {label}: offset step ({move[0]:.0f},{move[1]:.0f}) mm")
@@ -758,19 +763,20 @@ class Rig:
             await self.goto(p.x + move[0], p.y + move[1], p.z)
         raise RuntimeError(f"{label}: did not converge")
 
-    async def align_wrist(self, finder=find_block) -> None:
+    async def align_wrist(self, finder=find_block) -> bool:
         """
         Rotate the wrist so the block's long axis is vertical in the image (jaws close along image u).
 
         WHY: the finger axis was seen along image u, so the jaws then clamp across the block's short side.
         The sign of theta is not assumed: try one direction, keep it only if the angle error shrank.
+        Returns False when it was already aligned (no move: the caller's alignment still holds).
         """
         hit = finder((await self.frame())[0])
         if hit is None:
             raise RuntimeError("block: not visible for wrist alignment")
         err = ((90.0 - hit[2] + 90.0) % 180.0) - 90.0  # signed distance to vertical, in [-90, 90)
         if abs(err) < 4:
-            return
+            return False
         p = await self.pose()
         await self.goto(p.x, p.y, p.z, theta=self.theta + err)
         hit2 = finder((await self.frame())[0])
@@ -780,6 +786,7 @@ class Rig:
         print(f"  wrist: angle err {err:.0f} -> {err2:.0f}")
         if abs(err2) > abs(err) * 0.5:
             await self.goto(p.x, p.y, p.z, theta=self.theta - 2 * err)
+        return True
 
     async def wait_clear(self, near_uv=None, timeout_s: float = 120.0) -> None:
         """
@@ -816,18 +823,18 @@ class Rig:
                 raise RuntimeError("workspace not clear for too long")
             await asyncio.sleep(0.5)
 
-    async def descend(self, z_target: float) -> None:
+    async def descend(self, z_target: float, settle: bool = True) -> None:
         """
         Straight down to z_target, in as few moves as MAX_STEP_MM allows (one, in practice).
 
         Was 50 mm steps; the hand pause (wait_clear) runs before every descent and goto() still enforces the
-        measured floor, so the steps only added move/settle time.
+        measured floor, so the steps only added move/settle time. settle=False when a grab/release follows.
         """
         p = await self.pose()
         z = p.z
         while z > z_target + 0.5:
             z = max(z_target, z - (MAX_STEP_MM - 10.0))
-            await self.goto(p.x, p.y, z)
+            await self.goto(p.x, p.y, z, settle=settle and z <= z_target + 0.5)
 
 
 class PickFailed(RuntimeError):
@@ -889,8 +896,9 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         print(f"  identity check: {why}")
         if not ok:
             raise PickFailed(f"lost the target, refusing to grab something else: {why}")
-    await rig.align_wrist(finder)
-    await rig.servo(finder, True, "block")
+    # Already turned (e.g. approach() applied the yaw with its move): no second servo needed
+    if await rig.align_wrist(finder):
+        await rig.servo(finder, True, "block")
     t = mark(times, "servo", t)
 
     print("2/5 measure + descend + grab")
@@ -928,7 +936,7 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
         print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
         try:
-            await rig.descend(z_grasp)
+            await rig.descend(z_grasp, settle=False)  # the grab follows, no frame
         except MoveRefused as e:
             # The planner refused the straight descent (the arm did not move): say why instead of retrying
             q = await rig.pose()
@@ -948,7 +956,8 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
             # Open down here, where the object stands: if the holding sensor missed a thin object, it stays put
             # instead of falling from ALIGN_Z
             await rig.open()
-        await rig.goto(p.x, p.y, ALIGN_Z)
+        # Holding: the carry follows (no frame). Missed: the re-servo's frame needs the settle
+        await rig.goto(p.x, p.y, ALIGN_Z, settle=not grabbed)
         t = mark(times, "grab", t)
         if grabbed:
             break
@@ -976,7 +985,7 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
     # Block bottom hangs (height - grip) below the fingertips; release it PLACE_GAP above the table
     z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z)
     print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
-    await rig.descend(z_place)
+    await rig.descend(z_place, settle=False)  # the release follows, no frame
     await rig.open()
     save_state(False)
     if observe:
@@ -1001,19 +1010,25 @@ async def locate_square(rig: Rig) -> tuple:
     return p.x, p.y
 
 
-async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None) -> None:
+async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None,
+                          choose_spot=None) -> None:
     """
-    Steps 3-4: carry to the square, release over its hole (with calibration samples).
+    Steps 3-4: carry to the square, release over its hole.
 
     With `square_xy` (a frame or cache, empty gripper) go there and refine by servo; if the hole is not seen
     there the paper was moved, so search and servo while holding, exactly as without `square_xy` (works when
     the held object does not hide the hole). Before 2026-10-29 an unseen hole at square_xy still got the release
     there: a moved paper meant an object put down at the old spot. Raises (still holding) if the hole is nowhere.
+    `choose_spot(rgb, depth, pose) -> (flange xy or None, why)` (the executor's free-spot finder): the servo stops
+    at the carry-offset view, where the hole is clear of the held object, and the release goes to the spot it
+    picks instead of the hole's centre; None raises SquareFull (still holding). The blue screwdriver was put down
+    on the yellow block already in the hole (2026-10-29).
     """
     times = {} if times is None else times
     t = time.monotonic()
     print("3/5 carry to the blue square")
     times["at"] = "carry"
+    blind = choose_spot is None
     seen = False
     if square_xy is not None:
         # Wrist back to 0 so the nominal Jacobian holds if a probe loses the square behind the held object
@@ -1021,8 +1036,10 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
         seen = find_square((await rig.frame())[0]) is not None
         if seen:
             try:
-                await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX)
+                await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX, blind_step=blind)
             except RuntimeError as e:
+                if not blind:
+                    raise
                 print(f"  refine skipped ({e}); placing at the located square")
                 await travel(rig, *square_xy)
         else:
@@ -1032,15 +1049,28 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
         q = await rig.pose()
         await rig.goto(q.x, q.y, ALIGN_Z, theta=0.0)
         await search_square(rig)
-        await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX)
+        await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX, blind_step=blind)
+    if not blind:
+        q = await rig.pose()
+        rgb, depth = await rig.frame()
+        spot, why = choose_spot(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
+        rig.record("square-spot", rgb, spot=None if spot is None else [round(spot[0]), round(spot[1])], why=why)
+        print(f"  drop spot in the square: {why}")
+        if spot is None:
+            raise SquareFull(f"square is full, clear it first ({why})")
+        await travel(rig, *spot, theta=0.0)
     t = mark(times, "carry", t)
 
     if not await rig.holding():
         raise ObjectLost("object no longer in the gripper during the carry")
     print("4/5 lower + release")
     times["at"] = "place"
-    await release_here(rig, height, grip, observe=True)
+    await release_here(rig, height, grip)
     mark(times, "place", t)
+
+
+class SquareFull(RuntimeError):
+    """No free part of the square's interior fits the held object; still holding it."""
 
 
 # Observation points for finding the square, flange x/y mm, inside the reach the arm has used safely
@@ -1208,16 +1238,22 @@ async def search_square(rig: Rig) -> None:
     raise RuntimeError("square: not found anywhere on the table")
 
 
-async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = ALIGN_Z) -> None:
-    """Move at height z (default ALIGN_Z) to (x, y) in legs short enough for the MAX_STEP_MM guard."""
+async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = ALIGN_Z, settle: bool = True) -> None:
+    """
+    Move at height z (default ALIGN_Z) to (x, y) in legs short enough for the MAX_STEP_MM guard.
+
+    Only the last leg waits SETTLE_S (and only with settle=True): the lift and middle legs are never followed
+    by a frame, and each wait cost 0.6 s.
+    """
     if not allowed(x, y):
         raise RuntimeError(f"refusing ({x:.0f},{y:.0f}): inside an obstacle keep-out zone")
     p = await rig.pose()
     if p.z < z - 1:
-        await rig.goto(p.x, p.y, z)
+        await rig.goto(p.x, p.y, z, settle=False)
     legs = max(1, math.ceil(math.hypot(x - p.x, y - p.y) / 200.0))
     for i in range(1, legs + 1):
-        await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, z, theta=theta)
+        await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, z, theta=theta,
+                       settle=settle and i == legs)
 
 
 async def place_at(rig: Rig, x: float, y: float, height: float, grip: float, clear_mm: float = None) -> bool:
