@@ -466,10 +466,25 @@ def table_map():
             o["age_s"] = round(robot_now - (o.get("seen_ts") or m.get("ts") or robot_now), 1)
         if m.get("swept_ts"):
             m["swept_s_ago"] = round(robot_now - m["swept_ts"], 1)
+        if m.get("cleared_ts"):
+            m["cleared_s_ago"] = round(robot_now - m["cleared_ts"], 1)
     for s in sightings:
         s["age_s"] = round(robot_now - (s.get("ts") or robot_now), 1)
     hl = dict(_map_highlight) if _map_highlight.get("until", 0) > time.time() else None
     return {"map": m, "sightings": sightings, "sweep": sweep, "reach_mm": [120, 650], "highlight": hl}
+
+
+@app.post("/api/clear_map")
+async def clear_map():
+    """
+    "Clear map" button: someone rearranged the table. Module mode: DoCommand clear_map (live map, sightings and
+    the cached frame; old ones to the Store's history). Queue mode: the same on the Store directly.
+    """
+    _map_highlight.clear()
+    if MODULE_MODE:
+        return {"module": await module_call({"clear_map": True, "reason": "dashboard Clear map"})}
+    empty = store.clear_table_map("dashboard Clear map")
+    return {"ok": True, "cleared_objects": empty["cleared_objects"], "cleared_sightings": store.clear_sightings()}
 
 
 @app.get("/api/labels")

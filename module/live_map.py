@@ -7,7 +7,9 @@ evidence for ones that are gone); this class only schedules it, so the arm never
   - one update at a time, in a worker thread, on a deep copy of the map: readers always see a whole map;
   - newest frame wins: a frame offered while an update runs replaces the one waiting (counted as dropped);
     frames offered with keep=True (a sweep) queue instead and are never dropped;
-  - the map is saved with Store.put_table_map at most every persist_s, so the Store's latest map is the live one.
+  - the map is saved with Store.put_table_map at most every persist_s, so the Store's latest map is the live one;
+  - it starts empty and is never reloaded from the Store: the table may have changed while the module was down
+    (VIAM CENTERAL: "remember to clear [the map] if we restart"); clear() forgets it all on demand.
 """
 import asyncio
 import copy
@@ -21,17 +23,11 @@ LOGGER = getLogger(__name__)
 
 
 class LiveMap:
-    def __init__(self, store, update_fn, persist_s: float = 2.0):
+    def __init__(self, store, update_fn, persist_s: float = 2.0, initial: Optional[dict] = None):
         self.store, self.update_fn, self.persist_s = store, update_fn, persist_s
-        # Resume from the last saved map (with embeddings), so a restart keeps what the robot has already seen
-        try:
-            self.map: Optional[dict] = store.get_table_map() or None
-        except Exception as e:
-            LOGGER.warning(f"live map: could not load the saved map: {e}")
-            self.map = None
-        if self.map:
-            self.map.pop("age_s", None)
-        self.swept_ts = float((self.map or {}).get("swept_ts") or 0.0)  # last whole-table sweep
+        self.map: Optional[dict] = initial  # empty: the cleared map the module starts from (Store.clear_table_map)
+        self.swept_ts = 0.0  # last whole-table sweep
+        self._gen = 0  # bumped by clear(): an update still running on the old map is thrown away
         params = inspect.signature(update_fn).parameters
         self._takes_recognised, self._takes_seg = "recognised" in params, "seg" in params
         self._newest = None  # newest droppable frame waiting for the worker
@@ -95,7 +91,7 @@ class LiveMap:
         kw = {"recognised": recs} if recs is not None and self._takes_recognised else {}
         if seg is not None and self._takes_seg:
             kw["seg"] = seg
-        snapshot = self.map  # replaced, never mutated in place, so the reference is stable in the thread
+        snapshot, gen = self.map, self._gen  # map: replaced, never mutated in place, so stable in the thread
         t0 = time.monotonic()
         try:
             m = await asyncio.to_thread(lambda: self.update_fn(copy.deepcopy(snapshot), rgb, depth, pose, intr,
@@ -105,6 +101,8 @@ class LiveMap:
             self.stats["last_error"] = f"{type(e).__name__}: {e}"[:200]
             LOGGER.warning(f"live map: update_map failed on a {source} frame: {self.stats['last_error']}")
             return
+        if gen != self._gen:
+            return  # the map was cleared while this frame (taken before the clear) was being applied
         if m is not None:
             m["ts"] = time.time()  # last update; each object keeps its own seen_ts
             m["swept_ts"] = self.swept_ts
@@ -128,6 +126,24 @@ class LiveMap:
                 self._dirty = True  # retried at the next round
                 LOGGER.warning(f"live map: save failed: {type(e).__name__}: {e}")
             self._saved_at = time.time()
+
+    async def clear(self, reason: str) -> dict:
+        """
+        Forget the table (someone rearranged it): pending frames are dropped, an update in flight is thrown away,
+        the current map goes to the Store's history and the map restarts empty. Returns the empty map
+        (cleared_ts, cleared_objects).
+        """
+        self._gen += 1
+        self._newest = None
+        for _, f in self._keep:
+            if not f.done():
+                f.cancel()
+        self._keep.clear()
+        if self.map is not None:  # the in-memory map is up to persist_s newer than the saved one: that one goes to history
+            await asyncio.to_thread(self.store.put_table_map, self.map, False)
+        self.map = await asyncio.to_thread(self.store.clear_table_map, reason)
+        self.swept_ts, self._dirty, self._saved_at = 0.0, False, time.time()
+        return self.map
 
     async def mark_swept(self) -> None:
         """A whole-table sweep was just applied: the map now covers the whole table. Saved at once, with history."""
@@ -156,6 +172,7 @@ class LiveMap:
         m = self.map or {}
         return {"live": True, "objects": len(m.get("objects") or []),
                 "updated_s_ago": round(now - m["ts"], 1) if m.get("ts") else None,
+                "cleared_s_ago": round(now - m["cleared_ts"], 1) if m.get("cleared_ts") else None,
                 "swept_s_ago": round(now - self.swept_ts, 1) if self.swept_ts else None,
                 "pending": len(self._keep) + (self._newest is not None), **self.stats}
 

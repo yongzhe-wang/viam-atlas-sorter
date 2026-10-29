@@ -497,6 +497,44 @@ class Store:
         doc["age_s"] = round(time.time() - (doc.get("ts") or 0), 1)
         return doc
 
+    def clear_table_map(self, reason: str) -> dict:
+        """
+        Forget the table (module restart, someone rearranged it; VIAM CENTERAL: "clear [the map] if we restart"):
+        the latest map moves to the history (logs, Atlas), and an empty map with cleared_ts / cleared_reason
+        becomes the latest, so nothing finds objects from before. Returns that empty map.
+        """
+        old = self.get_table_map() or {}
+        n = len(old.get("objects") or [])
+        if n:
+            old.pop("age_s", None)
+            self.put_table_map(old, history=True)  # also rewrites it as latest, replaced right below
+        now = time.time()
+        empty = {"ts": now, "objects": [], "frames": [], "cleared_ts": now, "cleared_reason": reason, "cleared_objects": n}
+        self.put_table_map(empty, history=False)
+        return empty
+
+    def clear_sightings(self) -> int:
+        """
+        Forget every object's last-seen position, for the same reasons as clear_table_map: they move to
+        sightings_history (online) / data/sightings_history/<ts_ms>.json (offline). Returns how many there were.
+        """
+        now = time.time()
+        if self.online:
+            docs = list(self.db.sightings.find({}))
+            if docs:
+                self.db.sightings_history.insert_many(
+                    [{**d, "_id": f"{d['_id']}@{int(now * 1000)}", "label": d["_id"], "cleared_at": now} for d in docs])
+                self.db.sightings.delete_many({})
+            return len(docs)
+        with self._lock("sightings"):
+            d = self._json_dict("sightings.json")
+            if d:
+                hist = self.data / "sightings_history"
+                hist.mkdir(exist_ok=True)
+                _write_atomic(hist / f"{int(now * 1000)}.json", json.dumps(d, default=str).encode())
+            _write_atomic(self.data / "sightings.json", b"{}")  # flush() would otherwise resend them to Atlas
+        return len(d)
+
     # Names used in AGENT3's sorter/table_map.py docstring
     save_map = put_table_map
     latest_map = get_table_map

@@ -135,6 +135,7 @@
       <button class="primary" type="submit">Grasp</button>
       <button type="button" id="b-prev">Preview</button>
       <button type="button" id="b-reset">Clear square</button>
+      <button type="button" id="b-clearmap" title="Someone rearranged the table: forget the map and every last-seen position">Clear map</button>
     </form>
     <div id="msg"></div>
     <div id="known" hidden><span class="muted">Known objects:</span> <span id="known-list"></span></div>
@@ -376,6 +377,15 @@ $("b-reset").addEventListener("click", async () => {
   try { const r = await send("__reset__"); $("msg").textContent = sentMsg(r, "clear the blue square"); }
   catch (err) { $("msg").textContent = "error: " + err.message; }
 });
+$("b-clearmap").addEventListener("click", async () => {
+  try {
+    const d = await api("/api/clear_map", {method: "POST"}), r = d.module || d;
+    const pl = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+    $("msg").textContent = r.ok ? `map cleared: ${pl(r.cleared_objects, "object")} and ${pl(r.cleared_sightings, "last-seen position")} forgotten`
+      : r.error === "busy" ? `module is busy with "${r.running?.text || "a job"}", clear the map when it is idle` : `not cleared: ${r.error || r.reason}`;
+    safe(refreshMap)();
+  } catch (err) { $("msg").textContent = "error: " + err.message; }
+});
 let commandPath = "queue";
 function sentMsg(r, what) {
   if (!r.module) return `queued: ${what}`;
@@ -567,8 +577,10 @@ async function refreshMap() {
   }
   placeLabels(svg, mk, marks, labels, [{x0: bx - 12, y0: by - 12, x1: bx + 40, y1: by + 6}], frames);
   const head = d.sweep && d.sweep.n ? `scanning table… pose ${d.sweep.k}/${d.sweep.n}`
+    : m && m.cleared_s_ago != null && !(m.objects || []).length ? `map cleared ${agoText(m.cleared_s_ago)} · 0 objects`
     : m ? `map updated ${agoText(m.age_s)} · ${(m.objects || []).length} objects`
-          + (m.swept_s_ago != null ? ` · whole table scanned ${agoText(m.swept_s_ago)}` : "") : "no table map yet";
+          + (m.swept_s_ago != null ? ` · whole table scanned ${agoText(m.swept_s_ago)}` : "")
+          + (m.cleared_s_ago != null ? ` · cleared ${agoText(m.cleared_s_ago)}` : "") : "no table map yet";
   const nSeen = (d.sightings || []).length;
   $("map-head").textContent = head + (nSeen ? ` · ${nSeen} sighting${nSeen === 1 ? "" : "s"}` : "");
 }

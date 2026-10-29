@@ -88,8 +88,11 @@ await sorter.do_command({"reset": True})                    # empty the square (
   - every sweep frame, none dropped, applied while the arm moves on.
 
   One update runs at a time in a worker thread, and a newer frame replaces one still waiting, so a slow update
-  only drops pictures and never holds up the arm. The map is saved with `Store.put_table_map` at most every 2 s
-  and loaded back on restart. `{"status": true}` → `"map"` reports objects, `updates`, `dropped` and `last_ms`.
+  only drops pictures and never holds up the arm. The map is saved with `Store.put_table_map` at most every 2 s.
+  It is **never** loaded back: every module start begins with an empty map, because the table may have changed
+  while the module was down. The old map and the sightings move to the Store's history (logs, Atlas), never to
+  finding. `{"clear_map": true}` (dashboard **Clear map**) does the same on demand when someone rearranges the
+  table; it is refused while a job runs. `{"status": true}` → `"map"` reports objects, `updates`, `dropped` and `last_ms`.
   Sweep frames are also saved by the executor under `$VIAM_MODULE_DATA/data/sweeps` (the module sets
   `SORTER_DATA_DIR`). Only the newest 30 sweeps (about 8 MB each) are kept.
 - **Finding objects anywhere on the table**, in this order: (1) the cached idle frame → go at once; (2) the

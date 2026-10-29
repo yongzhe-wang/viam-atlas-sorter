@@ -23,6 +23,9 @@ DoCommand:
   {"status": true}                   busy / running / last / warm / seen / library / store mode / live map stats
   {"seen_image": true}               last idle frame as base64 JPEG (<= 640 px) with the seen boxes scaled to it
   {"table_map": true}                the live table map (no embeddings; each object's seen_ts), sightings, sweep progress
+  {"clear_map": true}                forget the table (someone rearranged it): live map + sightings + cached frame;
+                                     the old map and sightings go to the Store's history. Refused while a job runs.
+The map also starts empty at every module start: the table may have changed while the module was down.
 One job at a time; a second request while busy returns {"accepted": false, "error": "busy"}.
 
 Config attributes (all optional except where the defaults don't match your machine):
@@ -214,6 +217,8 @@ class GraspByDescription(Generic, EasyResource):
         self._no_target_warned = False
         self.timelapse_dir = (Path(module_data) if module_data else self.store.data) / "timelapse"
         loop = asyncio.get_event_loop()
+        # Start from an empty table: the saved map and sightings go to history before anything can find from them
+        self._forgotten = loop.create_task(self._forget_table("module start"))
         self.tasks = [loop.create_task(self._heartbeat_loop()), loop.create_task(self._warmup()),
                       loop.create_task(self._watch_loop()), loop.create_task(self._timelapse_loop())]
         if attrs.get("consume_dashboard_commands", False):
@@ -287,12 +292,50 @@ class GraspByDescription(Generic, EasyResource):
         phase = rt.executor.phase_now(rig) if hasattr(rt.executor, "phase_now") else "task"
         self.live.offer(rgb, depth, pose, intr, "sweep" if self._sweeping else phase, keep=self._sweeping)
 
-    def _start_live_map(self) -> None:
-        """The one live map (AGENT3's table_map.update_map), carried over from the saved map; part of warm-up."""
+    async def _forget_table(self, reason: str) -> dict:
+        """
+        Module start (VIAM CENTERAL: "remember to clear [the map] if we restart"; the table may have changed while
+        the module was down): the saved map and the sightings move to the Store's history, an empty map becomes
+        the latest. Returns that empty map, which the live map starts from. A Store error only skips the history.
+        """
+        try:
+            empty = await asyncio.to_thread(self.store.clear_table_map, reason)
+            n = await asyncio.to_thread(self.store.clear_sightings)
+            LOGGER.info(f"{self.name}: table cleared at {reason}: {empty['cleared_objects']} map objects and "
+                        f"{n} sightings moved to history")
+            return empty
+        except Exception as e:
+            LOGGER.warning(f"{self.name}: could not move the saved map / sightings to history: {type(e).__name__}: {e}")
+            now = time.time()
+            return {"ts": now, "objects": [], "frames": [], "cleared_ts": now, "cleared_reason": reason,
+                    "cleared_objects": 0}
+
+    async def _start_live_map(self) -> None:
+        """The one live map (AGENT3's table_map.update_map), empty from the start; part of warm-up."""
         if self.live is None:
-            self.live = LiveMap(self.store, _runtime().table_map.update_map, MAP_PERSIST_S)
-            n = len((self.live.map or {}).get("objects") or [])
-            LOGGER.info(f"{self.name}: live table map on ({n} objects carried over from the saved map)")
+            initial = await self._forgotten
+            self.live = LiveMap(self.store, _runtime().table_map.update_map, MAP_PERSIST_S, initial=initial)
+            LOGGER.info(f"{self.name}: live table map on, empty since the module started")
+
+    async def _clear_map(self, reason: str) -> Dict[str, ValueTypes]:
+        """
+        {"clear_map": true}: someone rearranged the table, so forget it: the live map (old one to history), every
+        sighting, the cached idle frame. The next grasp decides from a fresh frame or sweeps, as usual.
+        Refused while a job runs, since it is reading and updating the map.
+        """
+        if self._busy():
+            return {"ok": False, "error": "busy", "running": dict(self.job_info)}
+        async with self._look_lock:  # no idle look half done across the clear
+            if self.live is not None:
+                empty = await self.live.clear(reason)
+            else:
+                empty = await asyncio.to_thread(self.store.clear_table_map, reason)
+            n = await asyncio.to_thread(self.store.clear_sightings)
+            self._seen_raw = None
+            self.seen = {"ts": time.time(), "at_observe": None, "objects": [], "intruders": [], "reason": "map cleared"}
+        LOGGER.info(f"{self.name}: map cleared ({reason}): {empty['cleared_objects']} objects, {n} sightings to history")
+        return {"ok": True, "cleared_objects": empty["cleared_objects"], "cleared_sightings": n,
+                "cleared_ts": empty["cleared_ts"]}
 
     # ---- always ready: warm-up and idle perception ---------------------------------------------------
 
@@ -323,7 +366,7 @@ class GraspByDescription(Generic, EasyResource):
             t0 = time.monotonic()
             try:
                 await asyncio.to_thread(self._warm_sync)
-                self._start_live_map()
+                await self._start_live_map()
                 self.warm, self.warm_ms, self.warm_error = True, _ms(t0), None
                 LOGGER.info(f"{self.name}: warm in {self.warm_ms} ms ({self.library['views']} library views)")
             except Exception as e:
@@ -814,6 +857,8 @@ class GraspByDescription(Generic, EasyResource):
             return self._status()
         if command.get("seen_image"):
             return self._seen_image()
+        if command.get("clear_map"):
+            return await self._clear_map(str(command.get("reason") or "clear_map command"))
         if command.get("table_map"):
             # Dashboard top-down view: the live map (no embeddings, each object with its seen_ts; up to
             # MAP_PERSIST_S newer than the saved one) + each object's latest sighting
@@ -871,7 +916,7 @@ class GraspByDescription(Generic, EasyResource):
             await asyncio.sleep(1.0)
 
     async def close(self) -> None:
-        for t in self.tasks + ([self.job] if self.job else []):
+        for t in self.tasks + [self._forgotten] + ([self.job] if self.job else []):
             t.cancel()
         if self.live is not None:
             await self.live.close()
