@@ -101,7 +101,8 @@ await sorter.do_command({"reset": True})                    # empty the square (
   map (each object with `seen_ts`) and the sightings for the dashboard.
 - One job at a time. A request while busy returns `{"accepted": false, "error": "busy", "running": {...}}`.
 - Summaries contain `status` (`done`, `failed`, `not_found`, `ambiguous` = two objects match about equally,
-  `too_wide`, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
+  `already_in_square` = the named object is only in the drop square (answered at once, no sweep), `too_wide`,
+  `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
 - A hand or arm reaching into the workspace pauses the robot; it resumes 2 s after the workspace is clear.
 
 From our web dashboard (no Atlas needed): start it with `DASH_COMMAND_PATH=module` (and `DASH_MODULE_NAME` if

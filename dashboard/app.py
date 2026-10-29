@@ -369,7 +369,7 @@ async def add_command(body: TextIn):
         entry.update(status="running", job=res.get("job"),
                      chosen={"label": target.get("label"), "colour": target.get("colour"), "score": target.get("score")}
                      if target else None)
-    elif res.get("status") in ("not_found", "ambiguous"):
+    elif res.get("status") in ("not_found", "ambiguous", "already_in_square"):
         # Always-ready module answers at once from its cached frame: nothing started, here is why
         entry.update(status=res["status"], fail_reason=res.get("reason"))
     else:

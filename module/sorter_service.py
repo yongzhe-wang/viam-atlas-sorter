@@ -592,6 +592,10 @@ class GraspByDescription(Generic, EasyResource):
             return {**out, "found": True, "xy": [round(float(v), 1) for v in b["xy"]], "label": o.get("label"),
                     "colour": o.get("colour"), "score": round(float(b.get("score") or 0.0), 3),
                     "seen_s_ago": round(seen_ago, 1), "look_first": bool(b.get("look_first"))}
+        if b.get("already_in_square"):
+            # AGENT3: the named object is only in the drop square (delivered): say so at once, never sweep for it
+            # or pick it out again
+            return {**out, "found": False, "status": "already_in_square", "reason": b.get("reason")}
         if swept_ago > MAP_FRESH_S:
             return None
         if b.get("ambiguous"):
@@ -682,10 +686,12 @@ class GraspByDescription(Generic, EasyResource):
                     m = self.live.map or {"objects": []}
                     b = await asyncio.to_thread(rt.table_map.best_on_map, m, text, self.store)
                     if b.get("map_obj") is None or b.get("ambiguous"):
-                        status = "ambiguous" if b.get("ambiguous") else "not_found"
-                        summary = {"status": status, "fail_phase": "find", "via": "sweep",
-                                   "fail_reason": f"no {text!r} on the table after scanning it" if status == "not_found"
-                                   else f"two objects match {text!r} about equally after scanning the table"}
+                        status = ("already_in_square" if b.get("already_in_square")
+                                  else "ambiguous" if b.get("ambiguous") else "not_found")
+                        reason = {"already_in_square": b.get("reason"),
+                                  "ambiguous": f"two objects match {text!r} about equally after scanning the table",
+                                  "not_found": f"no {text!r} on the table after scanning it"}[status]
+                        summary = {"status": status, "fail_phase": "find", "via": "sweep", "fail_reason": reason}
                         self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"),
                                      "finished": time.time(), **summary}
                         return summary
