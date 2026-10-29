@@ -104,7 +104,11 @@ DEMO = [("grasp green square", "green cube", ["033", "034", "035"]),
         ("pick up the yellow block", "yellow block", ["036", "038", "066", "073"]),
         ("trick or treat: candy", "kind bar", ["014", "015", "035"]),
         ("the blue cylinder", "blue cylinder", ["010", "011", "012"]),
-        ("red ball", None, ["032", "035", "036"])]
+        ("red ball", None, ["032", "035", "036"]),
+        # Knives (frames 077-088); 088 (z 580) has both, so "utility knife" / "box cutter" must not pick the red one
+        ("grab the utility knife", "utility knife", ["081", "083", "088"]),
+        ("box cutter", "utility knife", ["082", "088"]),
+        ("pick up the red knife", "red knife", ["085", "087", "088"])]
 
 
 def demo() -> None:

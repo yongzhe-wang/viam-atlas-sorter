@@ -266,6 +266,12 @@ def phone_propose(photo_dir: Path) -> None:
 
 CARRY_XY_MM = 50.0  # a new group this close to a labelled one (same height/colour) is that object
 CARRY_COS = 0.88  # appearance-only carry (the object moved): mean-crop cosine at least this
+# Same-place carry also needs a looser appearance match: a new object put where an old one used to lie
+# (silver knife on the KIND bar's spot: same height, blue-ish colours) was carried as "kind bar" on place alone.
+# {CARRY 2026-10-29 "G16: -> KIND BAR | SAME PLACE | N=5 H=18"; G16 TOP COS "(0.726, 'RED SCREWDRIVER')" (KIND BAR < 0.65);
+#  G33 SAME-PLACE BLUE BLOCK "(0.9, 'BLUE BLOCK')"}
+# [CONFIDENCE: INFERRED 75% — one bad and one good same-place case; 0.80 sits between them]
+CARRY_PLACE_COS = 0.80
 
 
 def _applied_items(groups: dict, applied: dict) -> dict:
@@ -321,7 +327,7 @@ def carry(labels_path: str) -> None:
         if prior:
             label, how = max(set(prior), key=prior.count), "same sightings"
         else:
-            near = [r for r in ok if math.dist(r["xy"], g["xy"]) <= CARRY_XY_MM]
+            near = [r for r in ok if math.dist(r["xy"], g["xy"]) <= CARRY_XY_MM and float(r["emb"] @ e) >= CARRY_PLACE_COS]
             if near:
                 label, how = min(near, key=lambda r: math.dist(r["xy"], g["xy"]))["label"], "same place"
             else:

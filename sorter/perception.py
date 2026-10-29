@@ -417,8 +417,10 @@ THETA_SIGN = -1.0
 # The wrist turns about the pose point, not about the jaw axis that world_xy() maps to the flange xy: the jaw axis
 # sits TOOL_AXIS_MM from the rotation axis (world frame at theta 0). Fitted so 079 matches 077 (residuals <= 2.5 mm).
 # Zero effect at theta 0, so the map / look / travel convention (map xy = theta-0 flange xy over the point) is kept.
-# {THETA_FIT "J = [21.74 -3.25]" "RED RESID [-2.5 0.]" "YELLOW RESID [0.5 0.]"}
-# [CONFIDENCE: SINGLE-SRC 75% — one theta pair; re-fit if a theta +90 pair disagrees]
+# Independent check at theta +90: the blue block in 078 lands at (417, -173); the theta-0 frame 080 two minutes
+# later sees it at (419, -175) (uncorrected 078 said (442, -154)).
+# {THETA_FIT "J = [21.74 -3.25]" "RED RESID [-2.5 0.]"} {080 "EDGE BLUE H=30 … XY=(419,-175)"}
+# [CONFIDENCE: CONFIRMED 85% — fitted on theta -90, confirmed within 3 mm at theta +90 on an edge-cut sighting]
 TOOL_AXIS_MM = (21.7, -3.3)
 
 
@@ -477,12 +479,13 @@ SQUARE_MIN_AREA_PX = 15000  # the white interior is ~290x300 px at the observe p
 
 def find_drop_square(rgb: np.ndarray, depth: np.ndarray, plane: tuple = None) -> dict:
     """
-    The drop zone: white interior enclosed by the blue tape, fully in view. {centroid_px, bbox, area, depth_mm} or None.
+    The drop zone: white interior enclosed by the blue tape. {centroid_px, bbox, area, depth_mm[, partial, cut]} or None.
 
     Blue tape by hue/saturation, as measured by AGENT1 (tape reads ~(0,64,116), PIL hue ~147).
     {PICK_PLACE_AUTO.PY "(HSV[..., 0] >= 130) & (HSV[..., 0] <= 165) & (HSV[..., 1] > 120) & (HSV[..., 2] > 50)"}
     [CONFIDENCE: CONFIRMED 80% — AGENT1's servo uses the same mask on this paper square]
-    The hole must not touch the image border and must be mostly white paper (low saturation, bright).
+    The hole must be mostly white paper (low saturation, bright). A hole fully in view wins; otherwise a border-cut
+    one ringed by tape comes back with partial=True (visible part only).
     """
     from PIL import Image
 
@@ -494,40 +497,96 @@ def find_drop_square(rgb: np.ndarray, depth: np.ndarray, plane: tuple = None) ->
     # Strict tape mask first; one looser retry (lower saturation/brightness, wider hue) because the real z=500 sweep
     # found no square although geometry and a simulated higher view both say it was fully in view: exposure at a
     # different height is the remaining suspect. The hole checks (enclosed, large, mostly white) stay the same.
-    for hlo, hhi, smin, vmin in ((130, 165, 120, 50), (120, 172, 70, 40)):
-        blue = (hsv[..., 0] >= hlo) & (hsv[..., 0] <= hhi) & (hsv[..., 1] > smin) & (hsv[..., 2] > vmin)
-        hit = _enclosed_white_hole(hsv, ndimage.binary_closing(blue, iterations=3), min_area, (a, b, c))
+    masks = [(hsv[..., 0] >= hlo) & (hsv[..., 0] <= hhi) & (hsv[..., 1] > smin) & (hsv[..., 2] > vmin)
+             for hlo, hhi, smin, vmin in ((130, 165, 120, 50), (120, 172, 70, 40))]
+    # Closing on an edge-padded mask: plain binary_closing erodes 3 px off the image border (border_value 0), which
+    # opened the tape where it runs off the frame and joined a border-cut hole to the whole table (080)
+    masks = [ndimage.binary_closing(np.pad(m, 4, mode="edge"), iterations=3)[4:-4, 4:-4] for m in masks]
+    for blue in masks:
+        hit = _enclosed_white_hole(hsv, blue, min_area, (a, b, c))
         if hit:
             return hit
-    return None
+    # Not fully in view: frame 080 (observe pose, after a place pushed the paper ~40 mm) had the hole cut by the
+    # top edge, so the delivered yellow block was not "in the square" on the map. Accept a border-cut hole whose
+    # in-image rim is tape, flagged partial: its centroid/bbox are only the visible part, never a place target.
+    # {SQ_76_80 "080: WHITE INTERIOR V 0-270 (TOUCHES THE TOP EDGE)" VS 076 "V 30-360"}
+    # [CONFIDENCE: CONFIRMED 85% — seen on 080/082/084; partial rim check mirrors AGENT1's find_square ring test]
+    # Strict tape mask only: with the loose one, transparent cups (bluish reflections, paper-like brightness) came
+    # back as border-cut squares on 000/016/032/056
+    return _enclosed_white_hole(hsv, masks[0], min_area * SQUARE_PARTIAL_AREA_FRAC, (a, b, c), border_cut=True)
 
 
-def _enclosed_white_hole(hsv: np.ndarray, blue: np.ndarray, min_area: float, plane: tuple):
-    """Largest non-blue region not touching the border, >= min_area and mostly white paper; or None."""
+# Paper reads light blue to this camera: PIL saturation median 52-60 (010-076), 66 (080), 103 (082), so the old
+# "S < 60" white test failed whole exposures. Tape is S > 120 by the mask itself; brightness tells paper from wood.
+# {PAPER S P50: 076 "60", 080 "69", 082 "103"; WOOD "V P10/50 [86 130]" … "[117 128]" VS V_WHITE 150}
+# [CONFIDENCE: CONFIRMED 85% — measured on 9 frames; wood V>v_white share 0.00-0.09, paper 0.95-1.00]
+SQUARE_WHITE_S = 120
+# A hole whose bbox comes this close to the image border is treated as cut there (partial)
+# {060 "BBOX (376, 427, 818, 718)" "ROWS 700-719 BLUE FRAC … [0.72 … 0.88]"} [CONFIDENCE: CONFIRMED 85% — 060 vs 061/084]
+SQUARE_EDGE_PX = 6
+SQUARE_PARTIAL_AREA_FRAC = 0.4  # a border-cut hole may show less than the full interior
+# Border-cut hole checks, from 5 real (010/015/019/043/050) vs 7 fake partials (cups, tape strips, a tape roll):
+# real rim 1.00 and rect_fill 0.92-0.99; fakes rect_fill 0.67-0.89 or paper-like V on < 80 % of the region
+# [CONFIDENCE: CONFIRMED 80% — 12 labelled cases, all separated; thresholds sit in the gap]
+SQUARE_RIM_BLUE = 0.9  # share of the in-image rim that must be tape
+SQUARE_PARTIAL_RECT = 0.9  # rect_fill of the hole-filled region: a clipped rectangle stays a rectangle
+SQUARE_PARTIAL_WHITE_V = 0.8  # share of bright (paper) pixels; 0.6 for a fully seen hole
+
+
+def _enclosed_white_hole(hsv: np.ndarray, blue: np.ndarray, min_area: float, plane: tuple, border_cut: bool = False):
+    """
+    Largest non-blue region, >= min_area and mostly white paper; or None.
+
+    border_cut False: the region must not touch the image border (the whole hole in view); still flagged partial
+    when its bbox is within SQUARE_EDGE_PX of the border.
+    border_cut True: only regions touching the border, and the rest of their rim must be tape; the result carries
+    "partial": True and "cut" (the image sides it runs off).
+    """
     a, b, c = plane
     lab, n = ndimage.label(~blue)
     if not n:
         return None
+    H, W = blue.shape
     border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
     # "White" relative to this frame's exposure: at 60 % brightness the paper fell below a fixed V>150 and the square
     # was lost at every height in simulation; capped at 150 so normal exposures behave exactly as before
     v_white = min(150.0, 0.8 * float(np.percentile(hsv[::4, ::4, 2], 95)))
     best = None
     for i, sl in enumerate(ndimage.find_objects(lab), start=1):
-        if sl is None or i in border:
+        if sl is None or (i in border) != border_cut:
             continue
         m = lab[sl] == i
         area = int(m.sum())
         if area < min_area or (best and area <= best["area"]):
             continue
-        white = (hsv[sl][..., 1][m] < 60).mean() > 0.6 and (hsv[sl][..., 2][m] > v_white).mean() > 0.6
+        bright = SQUARE_PARTIAL_WHITE_V if border_cut else 0.6
+        white = (hsv[sl][..., 1][m] < SQUARE_WHITE_S).mean() > 0.6 and (hsv[sl][..., 2][m] > v_white).mean() > bright
         if not white:
             continue
         vs, us = np.nonzero(m)
+        bbox = (int(sl[1].start + us.min()), int(sl[0].start + vs.min()), int(sl[1].start + us.max()), int(sl[0].start + vs.max()))
+        e = SQUARE_EDGE_PX
+        cut = [s for s, hit in (("top", bbox[1] <= e), ("bottom", bbox[3] >= H - 1 - e),
+                                ("left", bbox[0] <= e), ("right", bbox[2] >= W - 1 - e)) if hit]
+        if border_cut:
+            # The interior (~14x19 cm) is smaller than the view, so it can run off one side or one corner only;
+            # a region off opposite sides is the table/paper around the tape (032-039 false positives)
+            if len(cut) > 2 or {"top", "bottom"} <= set(cut) or {"left", "right"} <= set(cut):
+                continue
+            # Outer rim inside the image (10 px ring around the hole-filled region, slice padded so the ring is
+            # not clipped) must be mostly tape; holes are filled so objects lying in the region do not count as rim
+            pad = (slice(max(sl[0].start - 12, 0), min(sl[0].stop + 12, H)), slice(max(sl[1].start - 12, 0), min(sl[1].stop + 12, W)))
+            mp = ndimage.binary_fill_holes(lab[pad] == i)
+            band = ndimage.binary_dilation(mp, iterations=10) & ~mp
+            if not band.any() or blue[pad][band].mean() < SQUARE_RIM_BLUE or rect_fill(mp) < SQUARE_PARTIAL_RECT:
+                continue
         u, v = sl[1].start + us.mean(), sl[0].start + vs.mean()
-        best = {"centroid_px": (float(u), float(v)), "area": area,
-                "bbox": (int(sl[1].start + us.min()), int(sl[0].start + vs.min()), int(sl[1].start + us.max()), int(sl[0].start + vs.max())),
+        best = {"centroid_px": (float(u), float(v)), "area": area, "bbox": bbox,
                 "depth_mm": float(a * u + b * v + c)}  # flat paper: the table plane at its centre
+        if cut:
+            # Border-cut, or "enclosed" only by a few edge rows: on 060 the vignetted bottom rows of the paper read as
+            # tape, so a hole running off the bottom looked whole and its centroid sat 20 mm off on the map
+            best.update(partial=True, cut=cut)
     return best
 
 

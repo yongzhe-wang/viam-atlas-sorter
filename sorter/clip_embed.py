@@ -45,6 +45,12 @@ VIEW_DH_MM = 15.0  # ... and its height within this of the object's
 SOURCE_WEIGHT = {"phone": 0.5}
 LABEL_BONUS = 0.15  # object recognised as something the query names
 LABEL_PENALTY = 0.10  # object recognised as something else
+# Query is exactly one of the object's names, not just contained in one: "utility knife" is the silver knife's
+# label but is also contained in the red one's "red utility knife" (same for "box cutter"); without this both get
+# LABEL_BONUS and the pick is a coin flip between two look-alike knives. Bare "knife" names neither exactly.
+# {USER VIA VIAM CENTERAL "I ADDED THE KNIVES, INCLUDE THOSE TOO"; ALIASES SILVER "UTILITY KNIFE", RED "RED UTILITY KNIFE"}
+# [CONFIDENCE: INFERRED 80% — 0.05 > AMBIGUOUS_MARGIN and above the CLIP gap between the two knives]
+EXACT_NAME_BONUS = 0.05
 # Below this the best crop is not really what was asked for. On frame t01 the correct objects scored
 # 0.27-0.35 while "green square" (no green object present) topped out at 0.203 on a laptop key.
 # [CONFIDENCE: SINGLE-SRC 60% — one frame, 6 objects; re-tune on the scanned set]
@@ -294,6 +300,9 @@ def rank(objs: list, text: str, store=None, recognised: list = None) -> list:
             o.recognised, o.recognised_names = lab, names
             if lab is not None:
                 score += LABEL_BONUS if name_matches(q, names) else -LABEL_PENALTY
+                # Exact name beats a name that merely contains the query (see EXACT_NAME_BONUS)
+                if _words(q) and any(_words(q) == _words(n) for n in names):
+                    score += EXACT_NAME_BONUS
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
 
