@@ -567,24 +567,30 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None) ->
 
 async def approach(rig, found: dict, tracker) -> None:
     """
-    Put the arm where ppa.pick starts (ALIGN_Z, theta 0) with the found object near the image centre, and move
-    the tracker's seed pixel with it; no new look.
+    Go straight to the pre-grasp pose computed from the found frame, in one move: jaws over the object's top
+    at ALIGN_Z, theta 0; move the tracker's seed pixel with it. No new look.
 
-    WHY: pick() drops straight to ALIGN_Z at its current xy, but from a SWEEP_Z frame an object near the image
-    edge would leave the narrower ALIGN_Z view (~300 x 540 mm vs ~445 x 790 mm). So: table xy of the object's top
-    (perception.world_xy) -> flange that centres it (look_flange_xy) -> its pixel there (project_xy, camera
-    SWEEP_Z - ALIGN_Z closer). Nothing to do when the frame was already taken at ALIGN_Z, theta 0.
+    WHY: the yellow block's far servo started 530 px off and took 8 iterations (~31 s) of 60 mm steps; the
+    frame already gives the object's table xy (perception.world_xy of its top at its top depth), which is the
+    flange xy that puts the jaw axis over it, so pick()'s servo only refines (expected < 30 px). Works from any
+    frame pose (SWEEP_Z, observe, wrist turned). Falls back to the pose that centres it in view
+    (look_flange_xy), then to the frame's own xy, when that flange xy is out of reach.
+    {VIAM CENTERAL 2026-10-29 "COMPUTE THE TARGET'S WORLD XY FROM THE FRAME ... AND GO STRAIGHT TO ITS LOOK POSE IN ONE MOVE"}
+    [CONFIDENCE: INFERRED 80% — world_xy's jaw point and ppa.axis_pixel agree to < 1 px at 346 mm]
     """
     pose = found["pose"]
-    if abs(pose["z"] - ppa.ALIGN_Z) <= 15.0 and abs(pose["theta"]) <= 1.0:
-        return
     obj, k = found["obj"], intr(rig)
     u, v = obj.top_centroid_px or obj.centroid_px
     xy = perception.world_xy(pose, k, u, v, obj.top_depth_mm)
-    fx, fy = perception.look_flange_xy(xy)
+    fx, fy = xy
     if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
-        fx, fy = pose["x"], pose["y"]  # centring pose out of reach: drop straight down from where it was seen
-    await ppa.travel(rig, fx, fy, theta=0.0)
+        fx, fy = perception.look_flange_xy(xy)
+        if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
+            fx, fy = pose["x"], pose["y"]  # every closer pose out of reach: go down from where it was seen
+    p = await rig.pose()
+    # Already there (e.g. a retry from the same frame): skip the zero-length move and its settle time
+    if math.hypot(p.x - fx, p.y - fy) > 3.0 or abs(p.z - ppa.ALIGN_Z) > 3.0 or abs(p.theta) > 1.0:
+        await ppa.travel(rig, fx, fy, theta=0.0)
     # Camera height above the object shrinks by the z change; the wrist angle does not change it
     top = obj.top_depth_mm - (pose["z"] - ppa.ALIGN_Z)
     seed = perception.project_xy({"x": fx, "y": fy, "z": ppa.ALIGN_Z, "theta": 0.0}, k, xy, top)
@@ -665,10 +671,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if target is not None and target.get("obj") is not None and abs(float((target.get("pose") or {}).get("theta", 99.0))) <= 1.0:
             found, doc["find_path"] = target, "frame"
             tp = target["pose"]
-            p = await rig.pose()
-            # The tracker seeds at the target's pixel: be where that frame was taken
-            if math.hypot(p.x - tp["x"], p.y - tp["y"]) > 15.0 or abs(p.z - tp["z"]) > 15.0 or abs(p.theta) > 1.0:
-                await ppa.travel(rig, tp["x"], tp["y"], theta=0.0, z=tp["z"])
+            # No move back to where that frame was taken: approach() goes from here straight to the object
             if found.get("square") is None:
                 found["square"] = square_from_frame(found["rgb"], found.get("depth"), tp, intr(rig))
         else:
@@ -697,7 +700,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
             if square_xy is not None:
                 doc["square_path"] = src
         tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store)
-        # Found from a sweep pose (z 580): centre it at ALIGN_Z, where pick starts, without another look
+        # One move to the pre-grasp pose computed from the found frame; pick() then only refines
         await approach(rig, found, tracker)
         height, grip = await ppa.pick(rig, times, tracker, verify=lambda: verify_target(rig, text, store, tracker),
                                       check=lambda: still_target(rig, text, store, tracker))

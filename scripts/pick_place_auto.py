@@ -66,6 +66,29 @@ GRAB_TRIES = 3  # first grab + 2 retries
 # {ARXIV 2001.05650 (HAVILAND ET AL.) RGB-D MIN RANGE ~30 CM; DEPTH-BASED GRASPING FAILS IN THE FINAL PHASE}
 # [CONFIDENCE: SINGLE-SRC 70% — literature + our clips; open-loop accuracy on the arm not measured yet]
 CLOSE_SERVO = False  # True restores the close-range re-alignment at APPROACH_GAP, for A/B on the arm
+# Servo steps from the camera model's image Jacobian (model_jacobian) instead of two 15 mm probe moves per
+# iteration: the yellow block's far servo took 8 iterations x ~4.6 s (530 -> 383 -> 236 -> 82 -> 12 -> 2 px, the
+# 60 mm cap and the probes) and the carry-offset square servo 5. The model is the one THETA_SIGN/TOOL_AXIS_MM were
+# fitted for; a step that does not cut the error below 30% switches that servo back to probing.
+# {VIAM CENTERAL 2026-10-29 "ANALYTIC IMAGE JACOBIAN FROM INTRINSICS, DEPTH AND THE CAMERA ROTATION AT THE CURRENT THETA"}
+# [CONFIDENCE: INFERRED 75% — matches the measured nominal Jacobian at theta 0 (+x -> +v, +y -> +u, f/depth px/mm)]
+SERVO_MODEL_J = True
+MODEL_STEP_CAP_MM = 200.0  # one model step may cross most of the view; goto() still enforces MAX_STEP_MM
+
+
+def model_jacobian(fx: float, fy: float, cx: float, cy: float, theta: float, depth: float) -> np.ndarray:
+    """
+    Image Jacobian (px per mm of flange x, y; columns = arm x, arm y) of a table point seen at `depth`, from
+    sorter.perception's camera model at wrist angle `theta`. A flange translation moves every point the same.
+    """
+    from sorter.perception import project_xy
+
+    k = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
+    base = {"x": 0.0, "y": 0.0, "z": ALIGN_Z, "theta": float(theta)}
+    u0 = np.array(project_xy(base, k, (300.0, 0.0), depth))
+    ux = np.array(project_xy({**base, "x": 1.0}, k, (300.0, 0.0), depth))
+    uy = np.array(project_xy({**base, "y": 1.0}, k, (300.0, 0.0), depth))
+    return np.column_stack([ux - u0, uy - u0])
 # Wait after every move before trusting a camera frame: the lag test measured ~0.5 s of stale frames
 SETTLE_S = 0.6
 # Jaw-axis model fitted from released blocks (data/jaw_calib.json); None until `jaw_calib.py fit` has run
@@ -98,14 +121,14 @@ async def observe_release(rig, z1: float, table: float, height: float) -> None:
     Record where the just-released block appears, as jaw-axis calibration samples.
 
     WHY: the block was clamped centred between the jaws, so right after release it sits on the real jaw
-    axis; its pixel at a known depth measures the jaw-axis pixel the servo relies on. Seen from the close
-    servo height and from ALIGN_Z, so each place gives two depths. Moves only straight up. Never raises:
-    calibration must not break a run.
+    axis; its pixel at a known depth measures the jaw-axis pixel the servo relies on. Seen from ALIGN_Z only,
+    where the open-loop grasp is aimed, on the lift the place makes anyway: the extra stop at the close-servo
+    height cost a move per place and its samples were the biased ones (jaw_calib_candidate rejected). Moves
+    only straight up. Never raises: calibration must not break a run.
     """
     top1 = table - height  # block-top depth when the flange was at z1 (where the table was measured)
-    z_close = z1 - (top1 - TIP_BELOW_CAM - APPROACH_GAP)
     p = await rig.pose()
-    for z in (z_close, ALIGN_Z):
+    for z in (ALIGN_Z,):
         try:
             await rig.goto(p.x, p.y, max(z, (await rig.pose()).z))
             q = await rig.pose()
@@ -643,7 +666,7 @@ class Rig:
         J^-1 (-offset) with the last measured Jacobian. Used while carrying: the held object covers the
         bottom-right of the image, where the axis pixel is, so the square is aligned somewhere visible.
         """
-        J = None
+        J, probing, prev = None, not SERVO_MODEL_J, None  # prev: error before an uncapped model step
         for it in range(8):
             p = await self.pose()
             rgb, depth = await self.frame()
@@ -659,47 +682,51 @@ class Rig:
             tu, tv = axis_pixel(self.fx, self.fy, self.cx, self.cy, plane)
             tu, tv = tu + offset[0], tv + offset[1]
             e = np.array([hit[0] - tu, hit[1] - tv])
-            print(f"  {label} iter {it}: px=({hit[0]:.0f},{hit[1]:.0f}) want=({tu:.0f},{tv:.0f}) depth={plane:.0f} err={np.linalg.norm(e):.0f}px")
+            err = float(np.linalg.norm(e))
+            print(f"  {label} iter {it}: px=({hit[0]:.0f},{hit[1]:.0f}) want=({tu:.0f},{tv:.0f}) depth={plane:.0f} err={err:.0f}px")
             self.record(label, rgb, iter=it, px=[round(hit[0]), round(hit[1])], want=[round(tu), round(tv)],
-                        err_px=round(float(np.linalg.norm(e)), 1), depth_mm=round(float(plane)))
-            if np.linalg.norm(e) < TOL_PX and (J is not None or not any(offset)):
+                        err_px=round(err, 1), depth_mm=round(float(plane)))
+            # A model step that did not cut the error to < 30% means the model is off here: probe instead
+            if not probing and prev is not None and err > max(TOL_PX, 0.3 * prev):
+                print(f"  {label}: model Jacobian step left {err:.0f}px of {prev:.0f}px; probing from here")
+                probing = True
+            if not probing:
+                J = model_jacobian(self.fx, self.fy, self.cx, self.cy, p.theta, plane)
+            if err < TOL_PX and (J is not None or not any(offset)):
                 if any(offset):
                     # Final blind step from the visible alignment point onto the real axis pixel
                     move = np.linalg.solve(J, -np.array(offset, float))
                     print(f"  {label}: offset step ({move[0]:.0f},{move[1]:.0f}) mm")
                     await self.goto(p.x + move[0], p.y + move[1], p.z)
                 return
-            # The Jacobian is re-probed every iteration. Reusing it (to save the probe moves) made the servo
-            # oscillate on the arm (414 -> 476 -> 326 -> 372 ... px) and run out of iterations for yellow block
-            # and green cube; fresh probes converged in 2-3 iterations in every trial.
-            # Probe +15 mm along arm x then y, record how the target moves in the image
-            probe = 15.0
-            cols = []
-            for dx, dy in ((probe, 0.0), (0.0, probe)):
-                await self.goto(p.x + dx, p.y + dy, p.z)
-                h2 = finder((await self.frame())[0])
-                await self.goto(p.x, p.y, p.z)
-                if h2 is None:
-                    break
-                cols.append([(h2[0] - hit[0]) / probe, (h2[1] - hit[1]) / probe])
-            if len(cols) == 2:
-                J = np.array(cols).T  # px per mm, columns = arm x, arm y
-            elif J is None:
-                # A probe lost the target (the held object covered it): fall back to the nominal Jacobian,
-                # valid at wrist theta 0: arm +x moves the image +v, arm +y moves it +u, at f/depth px/mm
-                # {SHIFT TEST 2026-10-29 "+40 X: DU=0 DV=60" "+40 Y: DU=87 DV=-3"}
-                # [CONFIDENCE: CONFIRMED 80% — measured at another height; only the signs and rough scale matter]
-                if abs(self.theta) > 1.0:
-                    raise RuntimeError(f"{label}: lost during probe (no Jacobian at theta {self.theta:.0f})")
-                k = self.fx / plane
-                J = np.array([[0.0, k], [k, 0.0]])
-                print(f"  {label}: probe lost the target; using the nominal Jacobian")
-            # Arm move that cancels the pixel error (damped); the image moves by J @ move
-            move = np.linalg.solve(J, -e) * 0.85
+            if probing:
+                # Reusing one probed Jacobian made the servo oscillate on the arm (414 -> 476 -> 326 -> 372 ...
+                # px); fresh probes converged in 2-3 iterations. Probe +15 mm along arm x then y.
+                probe = 15.0
+                cols = []
+                for dx, dy in ((probe, 0.0), (0.0, probe)):
+                    await self.goto(p.x + dx, p.y + dy, p.z)
+                    h2 = finder((await self.frame())[0])
+                    await self.goto(p.x, p.y, p.z)
+                    if h2 is None:
+                        break
+                    cols.append([(h2[0] - hit[0]) / probe, (h2[1] - hit[1]) / probe])
+                if len(cols) == 2:
+                    J = np.array(cols).T  # px per mm, columns = arm x, arm y
+                elif J is None:
+                    # A probe lost the target (the held object covered it): the camera model's Jacobian
+                    J = model_jacobian(self.fx, self.fy, self.cx, self.cy, p.theta, plane)
+                    print(f"  {label}: probe lost the target; using the model Jacobian")
+            # Arm move that cancels the pixel error; the image moves by J @ move. A probed J is noisy (damped,
+            # short steps); the model J is exact up to calibration, so it goes the whole way in one move
+            gain, cap = (0.85, 60.0) if probing else (1.0, MODEL_STEP_CAP_MM)
+            move = np.linalg.solve(J, -e) * gain
             n = np.linalg.norm(move)
             # Cap each correction so one bad Jacobian cannot throw the target out of view
-            if n > 60:
-                move *= 60 / n
+            if n > cap:
+                move *= cap / n
+            # Only a full (uncapped) model step is expected to land; a capped one says nothing about the model
+            prev = err if n <= cap else None
             await self.goto(p.x + move[0], p.y + move[1], p.z)
         raise RuntimeError(f"{label}: did not converge")
 
@@ -903,7 +930,8 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
         # Free calibration data: the released block marks where the jaw axis really is
         await observe_release(rig, z1, table, height)
     q = await rig.pose()
-    await rig.goto(q.x, q.y, ALIGN_Z)
+    if q.z < ALIGN_Z - 1.0:  # observe_release already lifted there: no zero-length move + settle
+        await rig.goto(q.x, q.y, ALIGN_Z)
 
 
 async def locate_square(rig: Rig) -> tuple:
