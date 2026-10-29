@@ -95,6 +95,16 @@ await sorter.do_command({"reset": True})                    # empty the square (
   table; it is refused while a job runs. `{"status": true}` → `"map"` reports objects, `updates`, `dropped` and `last_ms`.
   Sweep frames are also saved by the executor under `$VIAM_MODULE_DATA/data/sweeps` (the module sets
   `SORTER_DATA_DIR`). Only the newest 30 sweeps (about 8 MB each) are kept.
+- **Observation log** (user: "all data should be saved to continuously form the map"): every frame folded into the
+  live map is appended with `Store.log_observation`. Each record holds time, source/phase, pose, intrinsics, what
+  `update_map` detected (labels, scores, table xy, boxes), square, intruders and map version, plus a JPEG of at
+  most 640 px and a 320×180 16-bit depth PNG. Records go to `$VIAM_MODULE_DATA/data/observations/<YYYYMMDD>/`;
+  with Atlas, also to `observations` (images to `observation_images` up to `SORTER_OBS_ATLAS_MB`, default 300).
+  Nothing is ever deleted by Clear map or a restart: they only move the map's epoch. `{"rebuild_map": {"since":
+  ts}}` folds the log since `ts` (default: the epoch) back into the live map with AGENT3's
+  `table_map.fold_observations`, e.g. after a crash. When free disk drops under 5 GB, the images of the oldest idle
+  frames are removed first; their records stay, and search, grasp and sweep frames are never thinned.
+  `{"status": true}` → `"observations"` gives `count`, `bytes` and `free_bytes`.
 - **Finding objects anywhere on the table**: a grasp starts picking at once, with no scan first (the user's
   rule: "just search, and if found just start grasp; do NOT have an initial step").
   1. Cached idle frame shows it → go.

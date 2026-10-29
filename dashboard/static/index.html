@@ -593,7 +593,10 @@ async function refreshMap() {
           + (m.swept_s_ago != null ? ` · whole table scanned ${agoText(m.swept_s_ago)}` : "")
           + (m.cleared_s_ago != null ? ` · cleared ${agoText(m.cleared_s_ago)}` : "") : "no table map yet";
   const nSeen = (d.sightings || []).length;
-  $("map-head").textContent = head + (nSeen ? ` · ${nSeen} sighting${nSeen === 1 ? "" : "s"}` : "");
+  // Every frame folded into the map is kept as an observation (the map is rebuilt from them after a crash)
+  const nObs = d.observations;
+  $("map-head").textContent = head + (nSeen ? ` · ${nSeen} sighting${nSeen === 1 ? "" : "s"}` : "")
+    + (nObs ? ` · ${nObs} observation${nObs === 1 ? "" : "s"} stored` : "");
 }
 
 // Known objects from the view library: shows the audience what it can ask for; a click fills the box

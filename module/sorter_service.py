@@ -27,6 +27,8 @@ DoCommand:
   {"table_map": true}                the live table map (no embeddings; each object's seen_ts), sightings, sweep progress
   {"clear_map": true}                forget the table (someone rearranged it): live map + sightings + cached frame;
                                      the old map and sightings go to the Store's history. Refused while a job runs.
+  {"rebuild_map": {"since": ts}}     rebuild the live map from the observation log (every frame folded in is
+                                     logged) since ts, default the current epoch; needs AGENT3's fold_observations
 The map also starts empty at every module start: the table may have changed while the module was down.
 One job at a time; a second request while busy returns {"accepted": false, "error": "busy"}.
 
@@ -91,6 +93,7 @@ TIMELAPSE_KEEP_S = 2 * 3600.0  # ... kept for the last 2 hours
 MAP_FRESH_S = 60.0  # a live-map object seen this recently is gone to directly; a sweep this recent covers the table
 MAP_PERSIST_S = 2.0  # live map -> Store.put_table_map at most this often (VIAM CENTERAL)
 MAP_TASK_EVERY_S = 1.0  # during a task, at most one executor frame per second goes to the live map (servo keeps CPU)
+OBS_THIN_EVERY_S = 60.0  # how often the observation log checks free disk space (thins idle images under 5 GB)
 SWEEPS_KEEP = 30  # saved sweep frame sets (AGENT1, ~8 MB each: 4 x jpg + 1280x720 uint16 depth): keep the newest 30
 
 
@@ -216,6 +219,7 @@ class GraspByDescription(Generic, EasyResource):
         self._intr: Optional[dict] = None  # camera intrinsics for update_map, read once through the Rig
         self._sweeping = False  # while a sweep runs, every frame goes to the live map (none dropped)
         self._task_map_at = 0.0  # when the last other executor frame went to the live map
+        self._thinned_at = 0.0  # when the observation log last checked free disk space
         self._no_target_warned = False
         self.timelapse_dir = (Path(module_data) if module_data else self.store.data) / "timelapse"
         loop = asyncio.get_event_loop()
@@ -303,6 +307,7 @@ class GraspByDescription(Generic, EasyResource):
         try:
             empty = await asyncio.to_thread(self.store.clear_table_map, reason)
             n = await asyncio.to_thread(self.store.clear_sightings)
+            await asyncio.to_thread(self.store.observation_stats)  # one pass over the log now, not in a status call
             LOGGER.info(f"{self.name}: table cleared at {reason}: {empty['cleared_objects']} map objects and "
                         f"{n} sightings moved to history")
             return empty
@@ -318,6 +323,23 @@ class GraspByDescription(Generic, EasyResource):
             initial = await self._forgotten
             self.live = LiveMap(self.store, _runtime().table_map.update_map, MAP_PERSIST_S, initial=initial)
             LOGGER.info(f"{self.name}: live table map on, empty since the module started")
+
+    async def _rebuild_map(self, since: Optional[float]) -> Dict[str, ValueTypes]:
+        """
+        {"rebuild_map": {"since": ts}}: the live map from the observation log since ts (default: the current
+        epoch), folded by AGENT3's table_map.fold_observations, e.g. after a crash. Refused while a job runs.
+        """
+        fold = getattr(_runtime().table_map, "fold_observations", None)
+        if fold is None:
+            return {"ok": False, "error": "rebuilding needs table_map.fold_observations (AGENT3)"}
+        if self._busy():
+            return {"ok": False, "error": "busy", "running": dict(self.job_info)}
+        if self.live is None:
+            return {"ok": False, "error": "warming up"}
+        async with self._look_lock:
+            res = await self.live.rebuild(float(since if since is not None else self.live.epoch), fold)
+        LOGGER.info(f"{self.name}: map rebuilt from {res['observations']} observations: {res['objects']} objects")
+        return {"ok": True, **res}
 
     async def _clear_map(self, reason: str) -> Dict[str, ValueTypes]:
         """
@@ -536,6 +558,11 @@ class GraspByDescription(Generic, EasyResource):
                          else "idle")
                 await asyncio.to_thread(self._timelapse_save, jpeg, time.time(), label)
                 await asyncio.to_thread(self._prune_sweeps)
+                if time.time() - self._thinned_at >= OBS_THIN_EVERY_S:
+                    self._thinned_at = time.time()
+                    freed = await asyncio.to_thread(self.store.thin_observations)
+                    if freed:
+                        LOGGER.warning(f"{self.name}: disk under 5 GB free: {freed / 1e6:.0f} MB of old idle frames thinned")
             except Exception as e:
                 LOGGER.warning(f"timelapse frame skipped: {type(e).__name__}: {e}")
 
@@ -851,7 +878,8 @@ class GraspByDescription(Generic, EasyResource):
                 "store": "atlas" if self.store.online else "jsonl", "worker_id": self.worker_id,
                 "library": dict(self.library), "warm": self.warm, "warm_ms": self.warm_ms,
                 "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats(),
-                "map": self.live.summary() if self.live is not None else {"live": False}}
+                "map": self.live.summary() if self.live is not None else {"live": False},
+                "observations": self.store.observation_stats()}
 
     async def do_command(self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None,
                          **kwargs) -> Mapping[str, ValueTypes]:
@@ -859,6 +887,9 @@ class GraspByDescription(Generic, EasyResource):
             return self._status()
         if command.get("seen_image"):
             return self._seen_image()
+        if "rebuild_map" in command:
+            arg = command.get("rebuild_map")
+            return await self._rebuild_map(arg.get("since") if isinstance(arg, dict) else None)
         if command.get("clear_map"):
             return await self._clear_map(str(command.get("reason") or "clear_map command"))
         if command.get("scan_table"):
@@ -872,6 +903,7 @@ class GraspByDescription(Generic, EasyResource):
                     "sweep": dict(self.job_info.get("sweep") or {}) if self._busy() else {},
                     "search": dict(self.job_info.get("search") or {}) if self._busy() else {},
                     "live": self.live.summary() if self.live is not None else {"live": False},
+                    "observations": self.store.observation_stats()["count"],
                     "now": time.time()}  # robot clock, so the dashboard can age objects without clock skew
         for key in ("grasp", "preview"):
             if key in command:
@@ -882,7 +914,8 @@ class GraspByDescription(Generic, EasyResource):
         if command.get("reset"):
             return await self._start("reset", None, bool(command.get("wait")))
         return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"preview\": \"<description>\"}, "
-                         "{\"reset\": true}, {\"scan_table\": true}, {\"clear_map\": true}, {\"status\": true}, "
+                         "{\"reset\": true}, {\"scan_table\": true}, {\"clear_map\": true}, {\"rebuild_map\": {}}, "
+                         "{\"status\": true}, "
                          "{\"seen_image\": true} or {\"table_map\": true}"}
 
     # ---- background loops --------------------------------------------------------------------------

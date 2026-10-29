@@ -14,7 +14,8 @@ can show them; offline they are written to data/img/ and the doc keeps {"path": 
 Offline mode only shares data between processes on the same machine; the arm worker on the Linux box and
 the dashboard on the laptop need Atlas to see each other's commands.
 
-Env: MONGODB_URI, MONGODB_DB (default "sorter"), SORTER_DATA (default <repo>/data)
+Env: MONGODB_URI, MONGODB_DB (default "sorter"), SORTER_DATA (default <repo>/data),
+     SORTER_OBS_ATLAS_MB (observation image budget in Atlas, default 300)
 """
 import fcntl
 import io
@@ -38,6 +39,10 @@ IMAGE_FIELDS = {"attempts": ("img_before", "img_after"), "views": ("jpeg",)}
 _ID_OK = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _PHASE_BAD = re.compile(r"[^A-Za-z0-9_-]")
 MAX_IMG_WIDTH = 640
+OBS_DIR = "observations"  # data/observations/<YYYYMMDD>/obs.jsonl + images: the module's observation log
+OBS_ATLAS_IMAGE_MB = 300  # observation images uploaded to Atlas up to this (env SORTER_OBS_ATLAS_MB): an M0 cluster
+#                           holds 512 MB in all, and ~100 KB a frame at ~1 frame/s would fill it in under 2 hours
+OBS_MIN_FREE_BYTES = 5e9  # below this much free disk, thin_observations drops the oldest idle frames' images
 
 
 def _new_id() -> str:
@@ -102,6 +107,8 @@ class Store:
         self.db = None
         self._views_cache = None  # ((mtime_ns, size), views, normalised matrix) for offline search_views
         self._online_lib = None  # (normalised matrix, labels) loaded once from Atlas by library_matrix()
+        self._obs_counts = None  # {"count", "bytes"} of the observation log, built on first use then kept current
+        self._obs_atlas_bytes = None  # observation image bytes already in Atlas (budget), read on first upload
         if uri:
             from pymongo import MongoClient
 
@@ -539,6 +546,149 @@ class Store:
     save_map = put_table_map
     latest_map = get_table_map
 
+    # ---- observation log: every frame folded into the live map (VIAM CENTERAL) ---------------------
+
+    def log_observation(self, doc: dict, jpeg: bytes = None, depth_png: bytes = None) -> str:
+        """
+        Append one observation: a frame the module folded into its live map, with what it saw there.
+
+        WHY: the user wants "all data ... saved to continuously form the map": the live map is a fold over this
+        append-only log, so it can be rebuilt after a crash, and the log is never deleted (clear_map only moves the
+        fold's start). The robot's disk is the full archive in both modes: data/observations/<YYYYMMDD>/obs.jsonl
+        plus <id>.jpg / <id>_depth.png. Online, the doc also goes to Atlas `observations` at once (images to
+        `observation_images` while under OBS_ATLAS_IMAGE_MB); flush() uploads what Atlas missed.
+        """
+        oid, ts = _new_id(), float(doc.get("ts") or time.time())
+        self._obs_stats()  # build the counters from the archive before this record is in it, or it counts twice
+        day = time.strftime("%Y%m%d", time.localtime(ts))
+        folder = self.data / OBS_DIR / day
+        folder.mkdir(parents=True, exist_ok=True)
+        rec = {**doc, "_id": oid, "ts": ts, "day": day, "bytes": len(jpeg or b"") + len(depth_png or b"")}
+        if jpeg:
+            (folder / f"{oid}.jpg").write_bytes(jpeg)
+            rec["jpeg_path"] = f"{OBS_DIR}/{day}/{oid}.jpg"
+        if depth_png:
+            (folder / f"{oid}_depth.png").write_bytes(depth_png)
+            rec["depth_path"] = f"{OBS_DIR}/{day}/{oid}_depth.png"
+        line = json.dumps(rec, default=str) + "\n"
+        with self._lock("observations"), (folder / "obs.jsonl").open("a") as f:
+            f.write(line)
+        self._obs_stats(add=rec)
+        if self.online:
+            try:
+                self._obs_upload(rec)
+            except Exception as e:  # Atlas unreachable: the local copy is complete, flush() retries
+                print(f"observation {oid}: Atlas insert failed ({type(e).__name__}); kept locally")
+        return oid
+
+    def _obs_upload(self, rec: dict) -> None:
+        """One observation into Atlas (upsert by id); its images too while the image budget lasts."""
+        from bson import Binary
+
+        self.db.observations.replace_one({"_id": rec["_id"]}, _with_date(dict(rec)), upsert=True)
+        if self._obs_atlas_bytes is None:
+            agg = list(self.db.observation_images.aggregate([{"$group": {"_id": None, "b": {"$sum": "$bytes"}}}]))
+            self._obs_atlas_bytes = agg[0]["b"] if agg else 0
+        budget = float(os.environ.get("SORTER_OBS_ATLAS_MB", OBS_ATLAS_IMAGE_MB)) * 1e6
+        if rec["bytes"] and self._obs_atlas_bytes + rec["bytes"] <= budget:
+            img = {"_id": rec["_id"], "ts": rec["ts"], "bytes": rec["bytes"]}
+            for key, field in (("jpeg_path", "jpeg"), ("depth_path", "depth")):
+                if rec.get(key) and (self.data / rec[key]).exists():
+                    img[field] = Binary((self.data / rec[key]).read_bytes())
+            self.db.observation_images.replace_one({"_id": rec["_id"]}, img, upsert=True)
+            self._obs_atlas_bytes += rec["bytes"]
+
+    def list_observations(self, since: float = None, until: float = None) -> list:
+        """Observations with since <= ts < until, oldest first, from the local archive (complete in both modes)."""
+        root = self.data / OBS_DIR
+        first = time.strftime("%Y%m%d", time.localtime(since)) if since else ""
+        out = []
+        for folder in sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []:
+            if folder.name < first or not (folder / "obs.jsonl").exists():
+                continue
+            for line in (folder / "obs.jsonl").read_text().splitlines():
+                if line.strip():
+                    rec = json.loads(line)
+                    if (since is None or rec["ts"] >= since) and (until is None or rec["ts"] < until):
+                        out.append(rec)
+        return sorted(out, key=lambda r: r["ts"])
+
+    def observation_depth(self, obs: dict):
+        """An observation's downsampled depth (uint16 mm, 180x320), or None when it was not kept / was thinned."""
+        p = self.data / obs["depth_path"] if obs.get("depth_path") else None
+        if p is None or not p.exists():
+            return None
+        from PIL import Image
+
+        return np.asarray(Image.open(p), dtype=np.uint16)
+
+    def observation_stats(self) -> dict:
+        """{count, bytes, free_bytes}: stored observations, their image bytes on disk, free space there."""
+        st = self._obs_stats()
+        import shutil
+
+        return {**st, "free_bytes": shutil.disk_usage(self.data).free}
+
+    def _obs_stats(self, add: dict = None) -> dict:
+        """Counters kept in memory; built once from the archive (one pass over the obs.jsonl files)."""
+        if self._obs_counts is None:
+            n = b = 0
+            root = self.data / OBS_DIR
+            for f in root.glob("*/obs.jsonl") if root.exists() else []:
+                for line in f.read_text().splitlines():
+                    if line.strip():
+                        n += 1
+                        b += json.loads(line).get("bytes") or 0
+            b -= self._obs_thinned_bytes()
+            self._obs_counts = {"count": n, "bytes": max(0, b)}
+        if add is not None:
+            self._obs_counts["count"] += 1
+            self._obs_counts["bytes"] += add.get("bytes") or 0
+        return dict(self._obs_counts)
+
+    def _obs_thinned_bytes(self) -> int:
+        """Image bytes already removed by thin_observations (recorded in data/observations/thinned.json)."""
+        return int(self._json_dict(f"{OBS_DIR}/thinned.json").get("bytes") or 0)
+
+    def thin_observations(self, min_free_bytes: float = OBS_MIN_FREE_BYTES) -> int:
+        """
+        Keep everything unless free disk space drops under min_free_bytes; then delete the images of the oldest
+        idle observations (their docs stay, so the fold still has what was seen) until 1 GB above it. Search,
+        grasp and sweep frames are never thinned. Returns the bytes freed.
+        """
+        import shutil
+
+        free = shutil.disk_usage(self.data).free
+        if free >= min_free_bytes:
+            return 0
+        need = min_free_bytes + 1e9 - free
+        freed = 0
+        for rec in self.list_observations():
+            if freed >= need:
+                break
+            if rec.get("source") != "idle":
+                continue
+            for key in ("jpeg_path", "depth_path"):
+                p = self.data / rec[key] if rec.get(key) else None
+                if p is not None and p.exists():
+                    freed += p.stat().st_size
+                    p.unlink()
+        if freed:
+            t = self._json_dict(f"{OBS_DIR}/thinned.json")
+            t["bytes"] = int(t.get("bytes") or 0) + freed
+            _write_atomic(self.data / OBS_DIR / "thinned.json", json.dumps(t).encode())
+            if self._obs_counts is not None:
+                self._obs_counts["bytes"] = max(0, self._obs_counts["bytes"] - freed)
+        return freed
+
+    def _flush_observations(self) -> int:
+        """Upload every locally archived observation (upsert by id, so repeats are harmless)."""
+        n = 0
+        for rec in self.list_observations():
+            self._obs_upload(rec)
+            n += 1
+        return n
+
     # ---- clips: every frame of an attempt, for replay ----------------------------------------------
 
     @staticmethod
@@ -689,6 +839,7 @@ class Store:
                 self._file(coll).rename(self.data / f"{coll}.jsonl.flushed-{int(time.time())}")
             counts[coll] = len(docs)
         counts["clips"] = self._flush_clips()
+        counts["observations"] = self._flush_observations()
         # Latest-value records kept as JSON files offline: upsert their current content
         sightings = self._json_dict("sightings.json")
         for label, d in sightings.items():
