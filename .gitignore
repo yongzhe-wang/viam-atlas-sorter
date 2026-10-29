@@ -5,3 +5,4 @@ __pycache__/
 *.capture
 .DS_Store
 scripts/poses.json
+data/
