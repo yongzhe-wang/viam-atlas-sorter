@@ -315,6 +315,8 @@ def openvocab() -> None:
         def search_views(self, emb, k=8, label=None):
             s = (1 + E @ (np.asarray(emb, float) / np.linalg.norm(emb))) / 2
             s[~self.keep] = -1
+            if label:
+                s[[r["label"] != label for r in rows]] = -1
             return [{**{a: b for a, b in rows[i].items() if a != "embedding"}, "score": float(s[i])}
                     for i in np.argsort(-s)[:k] if s[i] >= 0]
 
@@ -350,6 +352,7 @@ def openvocab() -> None:
     absent = {"tuned": collections.Counter(), "unseen": collections.Counter()}
     picks, asked = collections.Counter(), collections.Counter()
     seen_full = set()
+    cand_stats = {"unknown (held out)": collections.Counter(), "known (full library)": collections.Counter()}
     for label, idx in sorted(cases.items()):
         step = max(1, len(idx) // 5)
         for i in idx[::step][:5]:
@@ -374,6 +377,20 @@ def openvocab() -> None:
                     if b["obj"] is not None:
                         (right_s if out == "right" else wrong_s).append(b["score"])
                         ambiguous[(out, bool(b["ambiguous"]))] += 1
+            # candidates(): where does the target rank, and did it rescue what best() refused?
+            full = Lib(None, fr)
+            rf = recs(objs, embs, full)
+            for cond, st, rr in (("unknown (held out)", held, rh), ("known (full library)", full, rf)):
+                c = clip_embed.candidates(objs, label, st, recognised=rr)
+                pos = next(k for k, x in enumerate(c) if x["obj"] is target)
+                b = clip_embed.best(objs, label, st, recognised=rr)
+                t = cand_stats[cond]
+                t["n"] += 1
+                t["top1"] += pos == 0
+                t["top2"] += pos <= 1
+                t["best right"] += b["obj"] is target
+                t["rescued"] += b["obj"] is None and pos <= 1
+                t["best wrong, cand right"] += b["obj"] is not None and b["obj"] is not target and pos == 0
             libs = [("held out", held, rh)]
             if fr not in seen_full:  # the full-library condition once per frame
                 seen_full.add(fr)
@@ -402,6 +419,9 @@ def openvocab() -> None:
         print(f"absent {group}: picked " + ", ".join(f"{absent[group][n]}/{asked[(group, n)]} ({n})" for n in ("full", "held out")))
     if picks:
         print("absent picks (query, library, picked colour, height, frame):", dict(picks))
+    for cond, t in cand_stats.items():
+        print(f"candidates, {cond}: target first {t['top1']}/{t['n']}, in top 2 {t['top2']}/{t['n']}; best() right {t['best right']}; "
+              f"best() refused but target in top 2 {t['rescued']}; best() wrong but target first {t['best wrong, cand right']}")
     t = tally["full name"]
     ok = t["right"] >= 55 and t["WRONG"] <= 3 and not sum(absent["tuned"].values())
     print(f"GATE {'PASS' if ok else 'FAIL'}: full name right {t['right']} >= 55, WRONG {t['WRONG']} <= 3, tuned absent picks {sum(absent['tuned'].values())} == 0")

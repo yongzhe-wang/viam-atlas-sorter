@@ -344,7 +344,7 @@ def rank(objs: list, text: str, store=None, recognised: list = None, known: bool
                 if _words(q) and any(_words(q) == _words(n) for n in names):
                     score += EXACT_NAME_BONUS
             elif not known:
-                o.open_gate = {"x_gap": float(emb @ _name_emb(lab)) - float(s) if lab else None,
+                o.open_gate = {"x_gap": float(emb @ _name_emb(lab)) - float(s) if lab else None, "emb": emb,
                                "neg_gap": float(s) - max(float(emb @ _name_emb(n)) for n in OPEN_NEGATIVES)}
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
@@ -467,3 +467,97 @@ def _best_open(ranked: list, text: str, qcol: set, out: dict) -> dict:
     else:
         reason = f"best match only {s:.2f}"
     return {**out, "reason": reason, "searchable": False}
+
+
+# ---- candidates: everything that could be it, best first, for a search that can go and look closer ---------------------
+# Scoring weights. A category word says nothing about which member, so there graspability may decide; on real crops "snack"
+# prefers the M&M bag over the KIND bar's back by 0.07-0.08, and "m&m" by the same amount, so the word decides, not the gap.
+# {CROPS MULTI1.JPG "SNACK 0.197 / 0.280" "M&M 0.215 / 0.290"; VIAM CENTERAL 2026-10-30 "KIND BAR 排在 M&M'S 前面，但用户明确说 M&M 时不改"}
+# [CONFIDENCE: INFERRED 75% — two real crops; the word list is a judgement call]
+CATEGORY_WORDS = {"snack", "snacks", "food", "treat", "tool", "toy", "thing", "item", "stuff", "object", "something"}
+GRASP_BONUS_CATEGORY = 0.12
+GRASP_BONUS = 0.03  # otherwise graspability only settles near ties
+HEIGHT_FIT_BONUS = 0.02
+HEIGHT_MISFIT_PENALTY = 0.04
+# Must match what the arm can do: sorter.grasp.MAX_OPEN_MM (not imported: grasp pulls in the arm's script)
+GRASP_MAX_WIDTH_MM = 78.0
+GRASP_MIN_HEIGHT_MM = 10.0  # the descent refuses less: pick_place_auto "implausible block height"
+GRASP_MIN_SIZE_MM = 8.0  # narrower than this is a fragment, not an object
+
+
+def graspable(o, fx: float = 909.93) -> tuple:
+    """(can the jaws take it, why not). Geometry only; a map entry without depth information is given the benefit of the doubt."""
+    depth = getattr(o, "top_depth_mm", None)
+    if getattr(o, "touches_edge", False):
+        return False, "cut by the image border"
+    if getattr(o, "flat", False) or (o.height_mm or 0.0) < GRASP_MIN_HEIGHT_MM:
+        return False, f"too flat ({o.height_mm or 0.0:.0f} mm)"
+    if depth is None:
+        return True, ""
+    mm = depth / fx
+    width, length = o.width_px * mm, o.length_px * mm
+    if width > GRASP_MAX_WIDTH_MM:
+        return False, f"too wide ({width:.0f} mm)"
+    if width < GRASP_MIN_SIZE_MM:
+        return False, f"a fragment ({length:.0f}x{width:.0f} mm)"
+    return True, ""
+
+
+def _label_heights(names_of_label: str, store, emb) -> list:
+    """Heights the library has seen this label at, including its other resting pose."""
+    views = store.search_views(emb, k=60, label=names_of_label)
+    return [v["height_mm"] for v in views if v.get("label") == names_of_label and v.get("height_mm") is not None] + list(
+        POSE_HEIGHTS_MM.get(names_of_label, ()))
+
+
+def candidates(objs: list, text: str, store=None, recognised: list = None) -> list:
+    """
+    Every object as a possible answer, best first; refuses nothing, best() is unchanged.
+
+    WHY: "known name, so it must be recognised" made the search give up on a tape seen from high up and on a KIND bar
+    showing its back (recognised as granola bar). A two-stage search can look closer at the top candidates instead.
+    Each: {obj, score, source ("library": recognised as what was named; "clip": by appearance), why, graspable,
+    graspable_why, clip (CLIP similarity), neg_gap (beats the generic prompts by), x_gap (more like its recognised label
+    by), likely (named, or clears the open-set test)}.
+    `recognised`: recognise_all() output for these objects, as for best(). Sets the same attributes on the objects as rank().
+    """
+    if not objs:
+        return []
+    known = _known(text, store)
+    words = _words(text)
+    category = bool(words & CATEGORY_WORDS)
+    # known=False: the base score without the library term, whose flat penalty is what this function replaces
+    ranked = rank(objs, text, store, recognised, known=False)
+    out = []
+    for o, base in ranked:
+        g = getattr(o, "open_gate", None) or {"x_gap": None, "neg_gap": 0.0}
+        lab, names = getattr(o, "recognised", None), getattr(o, "recognised_names", []) or []
+        named = lab is not None and name_matches(text, names)
+        score, why = base, []
+        if named:
+            score += LABEL_BONUS + (EXACT_NAME_BONUS if any(words == _words(n) for n in names) else 0.0)
+            why.append(f"recognised as {lab!r}")
+        elif lab is not None:
+            score -= max(0.0, g["x_gap"] or 0.0)  # only as far as it really looks more like that
+            why.append(f"library says {lab!r}" + (f", {g['x_gap']:+.2f} against the query" if g["x_gap"] is not None else ""))
+        else:
+            why.append("unknown to the library")
+        if known and store is not None and not named:
+            # Named by the library but not recognised here: does it at least have the right height for that?
+            emb = g.get("emb")
+            labels = {ns[0] for ns in library_names(store) if name_matches(text, ns)}
+            heights = [h for label in sorted(labels) if emb is not None for h in _label_heights(label, store, emb)]
+            if heights and o.height_mm is not None:
+                fits = any(abs(h - o.height_mm) <= VIEW_DH_MM for h in heights)
+                score += HEIGHT_FIT_BONUS if fits else -HEIGHT_MISFIT_PENALTY
+                why.append("height fits" if fits else f"height {o.height_mm:.0f} mm does not fit")
+        ok, why_not = graspable(o)
+        if ok:
+            score += GRASP_BONUS_CATEGORY if category else GRASP_BONUS
+        else:
+            why.append(why_not)
+        clip_sim = base  # base includes the colour and shape terms; the gate's own numbers are in neg_gap / x_gap
+        out.append({"obj": o, "score": float(score), "source": "library" if named else "clip", "why": "; ".join(why),
+                    "graspable": ok, "graspable_why": why_not, "clip": float(clip_sim), "neg_gap": float(g["neg_gap"]),
+                    "x_gap": g["x_gap"], "likely": bool(named or (g["neg_gap"] >= OPEN_NEG_MARGIN and (g["x_gap"] is None or g["x_gap"] <= OPEN_SET_DELTA)))})
+    return sorted(out, key=lambda c: -c["score"])
