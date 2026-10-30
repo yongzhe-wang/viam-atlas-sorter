@@ -185,20 +185,43 @@ def record_sightings(store, rgb, depth, seg, pose: dict, intrinsics: dict, sourc
 RING_HOLE_FRAC = 0.2  # share of an object's hole-filled mask that is hole: a ring (tape roll), grasped by its wall
 
 
-def ring_geometry(o):
-    """((cu, cv) ring centre px, radius px of the middle of the wall) if `o` is ring-like, else None."""
+def ring_geometry(o, wall_mm: float = None):
+    """
+    ((cu, cv) ring centre px, radius px of the middle of the wall) if `o` is ring-like, else None.
+
+    wall_mm: the object is known to be a ring (ObjTracker remembers it from the found frame) with this wall radius:
+    the centre comes from the hole-filled mask even when this frame's hole looks small. The black tape's servo did
+    not converge (65 s): frames that missed the hole switched the target from the wall to the top centroid, ~45 mm
+    away, and back.
+    """
     u0, v0, u1, v1 = o.bbox
     sub = o.mask[v0:v1 + 1, u0:u1 + 1]
     filled = ndimage.binary_fill_holes(sub)
     hole = filled & ~sub
-    if not filled.any() or hole.sum() < RING_HOLE_FRAC * filled.sum():
+    if not filled.any() or (wall_mm is None and hole.sum() < RING_HOLE_FRAC * filled.sum()):
         return None
     vs, us = np.nonzero(filled)
-    r_out, r_in = math.sqrt(filled.sum() / math.pi), math.sqrt(hole.sum() / math.pi)
-    return (u0 + float(us.mean()), v0 + float(vs.mean())), 0.5 * (r_out + r_in)
+    if wall_mm is not None:
+        r = wall_mm * perception.INTRINSICS["fx"] / max(o.top_depth_mm, 1.0)
+    else:
+        r = 0.5 * (math.sqrt(filled.sum() / math.pi) + math.sqrt(hole.sum() / math.pi))
+    return (u0 + float(us.mean()), v0 + float(vs.mean())), r
 
 
-def grasp_px(o, pose: dict = None, k: dict = None) -> tuple:
+def ring_world(o, pose: dict, k: dict):
+    """(ring centre table xy, outer radius mm, wall radius mm) of a ring-like object, or None."""
+    ring = ring_geometry(o)
+    if ring is None:
+        return None
+    (cu, cv), r_mid = ring
+    u0, v0, u1, v1 = o.bbox
+    filled = ndimage.binary_fill_holes(o.mask[v0:v1 + 1, u0:u1 + 1])
+    mm = o.top_depth_mm / k["fx"]
+    c = perception.world_xy(pose, k, cu, cv, o.top_depth_mm)
+    return (float(c[0]), float(c[1])), math.sqrt(filled.sum() / math.pi) * mm, r_mid * mm
+
+
+def grasp_px(o, pose: dict = None, k: dict = None, wall_mm: float = None) -> tuple:
     """
     (u, v, yaw_deg): where the jaws close on `o` in this frame; yaw is the image angle align_wrist turns vertical
     (the jaws close across it, along image u).
@@ -212,7 +235,7 @@ def grasp_px(o, pose: dict = None, k: dict = None) -> tuple:
     {VIAM CENTERAL 2026-10-29 "FOR RING-LIKE OBJECTS ... GRASP THE WALL: GRASP POINT ON THE RING AT THE SIDE NEAREST THE ARM"}
     [CONFIDENCE: INFERRED 60% — the ring mask (table visible in the hole) is not yet seen on the arm]
     """
-    ring = ring_geometry(o) if pose is not None and k is not None else None
+    ring = ring_geometry(o, wall_mm) if pose is not None and k is not None else None
     if ring is None:
         u, v = o.top_centroid_px or o.centroid_px
         return float(u), float(v), float(o.yaw_deg)
@@ -253,6 +276,9 @@ class ObjTracker:
         self.close_uv = None  # last position in a close frame; cleared when the arm goes back up
         self.close_target = None  # jaw pixel for the close servo, set by ppa.pick before it starts
         self.ref = None  # {"xy", "area"} of the object best() accepted (set by approach); still_target() compares
+        ring = ring_geometry(obj)
+        # A ring stays a ring for the whole pick (its grasp point must not jump to the hole between frames)
+        self.wall_mm = ring[1] * obj.top_depth_mm / rig.fx if ring else None
         self.uv = self.far_uv
         self._learn(rgb, obj.mask)
 
@@ -332,7 +358,7 @@ class ObjTracker:
                 self._learn(rgb, o.mask)
             # Servo onto the grasp point (handle / ring wall, grasp_px); matching between frames stays on the
             # overall centroid (far_uv)
-            gu, gv, yaw = grasp_px(o, self.rig.at, intr(self.rig))
+            gu, gv, yaw = grasp_px(o, self.rig.at, intr(self.rig), self.wall_mm)
             return (gu, gv, yaw, int(o.mask.sum()))
         ref = self.close_uv or self.far_uv
         lab, n = ndimage.label(self._close_mask(rgb))
@@ -575,11 +601,8 @@ def objects_in_hole(rgb: np.ndarray, depth: np.ndarray, pose: dict = None, k: di
     return True, [o for o in objs if in_hole(o, hole)], seg, hole
 
 
-# Clear room a release needs, around the drop point at theta 0 (the jaws close along image u): the fingers open to
-# ~84 mm, so a strip +-SPOT_JAW_MM along u and +-SPOT_FINGER_MM across it, plus the object's own grasped section
+# The fingers open to ~84 mm at a release: they sweep +-SPOT_JAW_MM from the jaw axis along the closing direction
 SPOT_JAW_MM = 45.0
-SPOT_FINGER_MM = 12.0
-SPOT_BODY_MAX_MM = 40.0  # half-length of the object counted at most: a long object's rest hangs over the border
 RELEASE_MATCH_MM = 60.0  # the check looks for the placed object's grasp point this close to the release point
 
 
@@ -590,55 +613,100 @@ def table_plane(depth: np.ndarray) -> np.ndarray:
     return a * np.arange(w)[None, :] + b * np.arange(h)[:, None] + c
 
 
-def square_spot(rig, size_mm: tuple = (40.0, 40.0)):
+def held_ring(rig, obj, frame_pose: dict):
     """
-    ppa.place_in_square's choose_spot: (flange xy over the free point of the white interior nearest its centre,
-    why), or (None, why) if no point of the interior has the room a release needs: the finger strip (+-SPOT_JAW_MM
-    along image u, +-SPOT_FINGER_MM along v) and the held object's grasped section (size_mm = (across the jaws,
-    along them), half-length capped at SPOT_BODY_MAX_MM).
+    For a ring grasped by its wall: {"offset": ring centre - jaw point (table xy, at the grasp), "theta": grasp
+    theta, "r_out": outer radius mm}, from the found frame and rig.picked_at; None for anything else.
+    """
+    k = intr(rig)
+    rw = ring_world(obj, frame_pose, k)
+    if rw is None or rig.picked_at is None:
+        return None
+    (cx, cy), r_out, _ = rw
+    fx, fy, theta = rig.picked_at
+    au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, ppa.TABLE_DEPTH_MM)
+    jx, jy = perception.world_xy({"x": fx, "y": fy, "z": ppa.ALIGN_Z, "theta": theta}, k, au, av, ppa.TABLE_DEPTH_MM)
+    return {"offset": (cx - jx, cy - jy), "theta": float(theta), "r_out": float(r_out)}
 
-    WHY (2026-10-29): the blue screwdriver was put down on top of the yellow block already in the square. Seen
-    from the carry-offset view (hole up-left, held object at the bottom edge): occupied = raised above the fitted
-    table or unreadable; the held object (blind / raised and connected to the bottom row) counts as unknown, not
-    free. The free point keeps the jaws' clearance from every occupied pixel and from the tape.
-    {VIAM CENTERAL 2026-10-29 "DEPTH-FREE CELL NEAREST THE CENTRE WITH CLEARANCE FOR THE FOOTPRINT, OR FAIL WITH 'SQUARE IS FULL'"}
-    [CONFIDENCE: INFERRED 70% — offline on synthetic depth only]
+
+PAPER_BORDER_MM = 40.0  # a footprint may reach this far past the white interior onto the tape (ring ~55 mm wide)
+SPOT_GRID_MM = 5.0  # candidate release points over the interior
+OCC_MARGIN_MM = 8.0  # kept between the footprint / fingers and anything already standing there
+
+
+def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None):
+    """
+    ppa.place_in_square's choose_spot: (flange xy at theta 0 for the release, why), or (None, why) if no point fits.
+
+    Worked out in table coordinates from the carry-offset frame: the interior from drop_square (centre, yaw, size);
+    occupied = points standing 8-100 mm above the fitted table (the held object hangs ~200 mm up and does not
+    count: in the image it hid the empty interior and the black tape was refused "no room", 2026-10-29). The
+    object's centre must be on the white interior; its footprint may lie on the tape but not past the paper
+    (PAPER_BORDER_MM); neither it nor the finger strip at the jaws may touch anything standing there.
+    {VIAM CENTERAL 2026-10-29 "只要物体中心在白色内区里、FOOTPRINT 不超出纸（外框），就算可以放 ... 手指带只要求不碰到已有物体"}
+    Footprint: at theta 0 the held long axis lies along world x (image v): a rectangle of the object's length
+    (<= 200 mm) by its width; a ring (`ring` = held_ring()) is a disc around its centre, which sits `offset` (turned
+    with the wrist back to 0) from the jaws: the jaws go there, the ring's centre goes to the chosen point.
+    [CONFIDENCE: INFERRED 70% — offline on synthetic and real frames; not run on the arm]
     """
     def choose(rgb: np.ndarray, depth: np.ndarray, pose: dict) -> tuple:
-        if depth is None:
-            return None, "no depth"
-        # The full interior only (no border-cut fallback): the release needs all of it in view
-        hole = hole_mask(rgb)
-        if hole is None:
+        k = intr(rig)
+        sq = frame_square(rgb, depth, pose, k)
+        if sq is None or sq.get("partial"):
             raise ppa.SquareNotFound("the square's full interior is not in view at the carry-offset pose")
         plane = table_plane(depth)
-        up = (depth > 0) & (plane - depth > perception.MIN_HEIGHT_MM)
-        blind = depth == 0
-        lab, _ = ndimage.label(up | blind)
-        held = np.isin(lab, np.unique(lab[-1][lab[-1] > 0]))
-        busy = up | blind | held
-        free = hole & ~busy
-        table = float(np.median(plane[hole]))
-        mm = rig.fx / table  # px per mm on the table
-
-        def room(half_u_mm: float, half_v_mm: float) -> np.ndarray:
-            # Pixels whose whole (2 half_v + 1) x (2 half_u + 1) rectangle is free; outside the image is not free
-            size = (2 * int(half_v_mm * mm) + 1, 2 * int(half_u_mm * mm) + 1)
-            return ndimage.minimum_filter(free.astype(np.uint8), size=size, mode="constant", cval=0).astype(bool)
-        across, along = size_mm
-        ok = room(SPOT_JAW_MM, SPOT_FINGER_MM) & room(across / 2, min(along / 2, SPOT_BODY_MAX_MM))
-        if not ok.any():
-            return None, (f"no room for the release on the white interior ({2 * SPOT_JAW_MM:.0f} mm finger strip "
-                          f"+ {across:.0f} x {min(along, 2 * SPOT_BODY_MAX_MM):.0f} mm object)")
-        vs, us = np.nonzero(hole)
-        cu, cv = us.mean(), vs.mean()
-        vs, us = np.nonzero(ok)
-        i = int(np.argmin((us - cu) ** 2 + (vs - cv) ** 2))
-        u, v = float(us[i]), float(vs[i])
-        xy = perception.world_xy(pose, intr(rig), u, v, float(plane[int(v), int(u)]))
-        off = math.hypot(u - cu, v - cv) * table / rig.fx
-        busy_px = int((hole & up).sum())
-        return (float(xy[0]), float(xy[1])), f"free spot {off:.0f} mm from the centre ({busy_px} px occupied)"
+        h = plane - depth
+        standing = ndimage.binary_opening((depth > 0) & (h > perception.MIN_HEIGHT_MM)
+                                          & (h < perception.MAX_OBJ_HEIGHT_MM), iterations=2)
+        vs, us = np.nonzero(standing[::4, ::4])
+        occ = np.array([perception.world_xy(pose, k, 4.0 * u, 4.0 * v, float(depth[4 * v, 4 * u]))
+                        for u, v in zip(us, vs)]).reshape(-1, 2)
+        c = np.array(sq["xy"], float)
+        t = math.radians(sq["yaw_deg"])
+        ax, bx = np.array([math.cos(t), math.sin(t)]), np.array([-math.sin(t), math.cos(t)])
+        sa, sb = sq["size_mm"]
+        if ring:
+            # Ring centre relative to the jaws, turned from the grasp theta back to the release theta 0
+            r = math.radians(perception.THETA_SIGN * (0.0 - ring["theta"]))
+            off = np.array(perception._rot(r, *ring["offset"]))
+            R = ring["r_out"] + OCC_MARGIN_MM
+            box = None
+        else:
+            off = np.zeros(2)
+            across, along = size_mm
+            box = (min(along, 200.0) / 2 + OCC_MARGIN_MM, across / 2 + OCC_MARGIN_MM)  # half extents along x, y
+        strip = (FINGER_W_MM / 2 + OCC_MARGIN_MM, SPOT_JAW_MM + FINGER_T_MM + OCC_MARGIN_MM)  # around the jaws, x/y
+        best = None
+        for da in np.arange(-sa / 2, sa / 2 + 0.1, SPOT_GRID_MM):
+            for db in np.arange(-sb / 2, sb / 2 + 0.1, SPOT_GRID_MM):
+                d = math.hypot(da, db)
+                if best is not None and d >= best[0]:
+                    continue
+                C = c + da * ax + db * bx  # where the object's centre goes
+                if ring:
+                    # Disc stays on the paper; nothing standing inside it
+                    if abs(da) + R > sa / 2 + PAPER_BORDER_MM or abs(db) + R > sb / 2 + PAPER_BORDER_MM:
+                        continue
+                    if len(occ) and (np.hypot(*(occ - C).T) < R).any():
+                        continue
+                else:
+                    hx, hy = box
+                    corners = C + np.array([[sx * hx, sy * hy] for sx in (-1, 1) for sy in (-1, 1)])
+                    rel = corners - c
+                    if (np.abs(rel @ ax) > sa / 2 + PAPER_BORDER_MM).any() or (np.abs(rel @ bx) > sb / 2 + PAPER_BORDER_MM).any():
+                        continue
+                    if len(occ) and ((np.abs(occ[:, 0] - C[0]) < hx) & (np.abs(occ[:, 1] - C[1]) < hy)).any():
+                        continue
+                J = C - off  # where the jaws go
+                if len(occ) and ((np.abs(occ[:, 0] - J[0]) < strip[0]) & (np.abs(occ[:, 1] - J[1]) < strip[1])).any():
+                    continue
+                best = (d, J, C)
+        if best is None:
+            what = f"ring {2 * ring['r_out']:.0f} mm" if ring else f"{size_mm[1]:.0f} x {size_mm[0]:.0f} mm object"
+            return None, f"no room on the square for the {what} ({len(occ)} occupied points)"
+        d, J, C = best
+        return (float(J[0]), float(J[1])), (f"object centre ({C[0]:.0f},{C[1]:.0f}) {d:.0f} mm from the interior "
+                                            f"centre, jaws ({J[0]:.0f},{J[1]:.0f}), {len(occ)} occupied points")
     return choose
 
 
@@ -1031,11 +1099,12 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         height, grip = await ppa.pick(rig, times, tracker, check=lambda: still_target(rig, text, store, tracker))
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
+        ring = held_ring(rig, obj, found["pose"])
         # Look first where the found frame saw part of the paper, then the recent sightings; search the observe
         # pose before any z 580 pose (most squares are in that view)
         partial = partial_square_xy(found, rig)
         centre = await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy,
-                                           choose_spot=square_spot(rig, size),
+                                           choose_spot=square_spot(rig, size, ring),
                                            more_guesses=([partial] if partial else []) + [xy for xy, _ in sightings],
                                            search_poses=[(*ppa.HOME_XY, ppa.ALIGN_Z)]
                                            + [(x, y, SWEEP_Z) for x, y in SWEEP_XY])

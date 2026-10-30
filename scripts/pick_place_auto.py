@@ -74,6 +74,9 @@ CLOSE_SERVO = False  # True restores the close-range re-alignment at APPROACH_GA
 # {VIAM CENTERAL 2026-10-29 "ANALYTIC IMAGE JACOBIAN FROM INTRINSICS, DEPTH AND THE CAMERA ROTATION AT THE CURRENT THETA"}
 # [CONFIDENCE: INFERRED 75% — matches the measured nominal Jacobian at theta 0 (+x -> +v, +y -> +u, f/depth px/mm)]
 SERVO_MODEL_J = True
+# A servo that has not converged by now will not: give up and let the caller retry from a fresh look. The black
+# tape's servo probed for 65.5 s before failing. {VIAM CENTERAL 2026-10-29 "BLOCK SERVO 最多 N 轮就 GIVE UP，在 10 S 内结束"}
+SERVO_MAX_S = 12.0
 MODEL_STEP_CAP_MM = 200.0  # one model step may cross most of the view; goto() still enforces MAX_STEP_MM
 
 
@@ -721,7 +724,10 @@ class Rig:
         blind_step=False stops at the offset alignment (the caller picks the final spot from that view).
         """
         J, probing, prev = None, not SERVO_MODEL_J, None  # prev: error before an uncapped model step
+        t_end = time.monotonic() + SERVO_MAX_S
         for it in range(8):
+            if time.monotonic() > t_end:
+                break
             p = await self.pose()
             rgb, depth = await self.frame()
             hit = finder(rgb)
@@ -782,7 +788,7 @@ class Rig:
             # Only a full (uncapped) model step is expected to land; a capped one says nothing about the model
             prev = err if n <= cap else None
             await self.goto(p.x + move[0], p.y + move[1], p.z)
-        raise RuntimeError(f"{label}: did not converge")
+        raise RuntimeError(f"{label}: did not converge (8 iterations or {SERVO_MAX_S:.0f} s)")
 
     async def align_wrist(self, finder=find_block) -> bool:
         """
