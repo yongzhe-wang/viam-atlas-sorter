@@ -137,6 +137,7 @@ async def back_to_observe(rig) -> None:
     if ppa.ESTOP["on"]:
         print(f"  not returning to the observe pose: {ppa.ESTOP_STATUS}")
         return
+    rig.work_z = ppa.ALIGN_Z  # the task's lowered working height (approach) ends with it
     # A failure may have ended the task with the arm still slowed for a heavy object
     if getattr(rig, "slowed", False):
         await rig.set_arm_speed(False)
@@ -1625,9 +1626,47 @@ async def approach(rig, found: dict, tracker) -> None:
         if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
             fx, fy = pose["x"], pose["y"]  # every closer pose out of reach: go down from where it was seen
     p = await rig.pose()
+    rig.work_z = ppa.ALIGN_Z
     # Already there (e.g. a retry from the same frame): skip the zero-length move and its settle time
     if math.hypot(p.x - fx, p.y - fy) > 3.0 or abs(p.z - ppa.ALIGN_Z) > 3.0 or abs(p.theta - theta) > 1.0:
-        await ppa.travel(rig, fx, fy, theta=theta)
+        try:
+            await ppa.travel(rig, fx, fy, theta=theta)
+        except ppa.EStop:
+            raise
+        except ppa.MoveRefused as e:
+            # Far out the arm reaches lower down: the same pose lower (the highest the planner takes), the flange worked
+            # out for the nearer top {VIAM CENTERAL 2026-10-30 "远处的物体降低高度靠近：LOOK 和 APPROACH 用 Z300（或者 PLANNER 能解的最高高度）"}
+            print(f"  approach: z {ppa.ALIGN_Z:.0f} refused ({e})")
+            # Across up high as far as the arm goes, then down: only the last stretch at the low height, where an empty
+            # gripper's fingertips (~170 mm up) would not clear the bucket's rim
+            rr = math.hypot(fx, fy)
+            if rr > ppa.LOW_APPROACH_FROM_MM:
+                await ppa.travel(rig, fx * ppa.LOW_APPROACH_FROM_MM / rr, fy * ppa.LOW_APPROACH_FROM_MM / rr, theta=theta)
+            for z in ppa.LOW_WORK_Z:
+                top = obj.top_depth_mm - (pose["z"] - z)
+                if top < ppa.MIN_SEEN_DEPTH_MM:
+                    break  # lower, depth would not see its top: no measure, no descent
+                au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top)
+                jx, jy = perception.world_xy({"x": 0.0, "y": 0.0, "z": z, "theta": theta}, k, au, av, top)
+                fx, fy = xy[0] - jx, xy[1] - jy
+                try:
+                    await ppa.travel(rig, fx, fy, theta=theta, z=z)
+                    break
+                except ppa.EStop:
+                    raise
+                except ppa.MoveRefused as e2:
+                    print(f"  approach: z {z:.0f} refused too ({e2})")
+                    e = e2
+            else:
+                z = None
+            if z is None or top < ppa.MIN_SEEN_DEPTH_MM or (await rig.pose()).z > z + 1.0:
+                raise ppa.MoveRefused(f"the arm reaches no pose over ({xy[0]:.0f},{xy[1]:.0f}) at any working height: {e}")
+            rig.work_z = z
+            seed = perception.project_xy({"x": fx, "y": fy, "z": z, "theta": theta}, k, xy, top)
+            tracker.far_uv = tracker.uv = (float(seed[0]), float(seed[1]))
+            tracker.ref = footprint(rig, obj, pose)
+            print(f"  approach: grasp point ({xy[0]:.0f},{xy[1]:.0f}) -> flange ({fx:.0f},{fy:.0f}) z {z:.0f} theta {theta:.0f}")
+            return
     seed = perception.project_xy({"x": fx, "y": fy, "z": ppa.ALIGN_Z, "theta": theta}, k, xy, top)
     tracker.far_uv = tracker.uv = (float(seed[0]), float(seed[1]))
     tracker.ref = footprint(rig, obj, pose)

@@ -100,6 +100,13 @@ async def locate(rig, k: dict, poses: list):
     return best
 
 
+def lowest_release_z(b: dict, height: float, grip: float) -> float:
+    """The lowest flange z at which the held object's bottom still clears the rim by RIM_CLEAR_MM: for a far bucket."""
+    tips_at_align = ppa.TABLE_DEPTH_MM - ppa.TIP_BELOW_CAM
+    need = float(b.get("rim_height_mm") or bucket.RIM_HEIGHT_MM) + RIM_CLEAR_MM + (height - grip)
+    return ppa.ALIGN_Z + need - tips_at_align
+
+
 def release_z(b: dict, height: float, grip: float) -> float:
     """
     Flange z at which the held object's bottom is RIM_CLEAR_MM over the rim: at least ALIGN_Z. At ALIGN_Z the fingertips are
@@ -122,14 +129,18 @@ def release_xy(b: dict, z: float, off=(0.0, 0.0)):
     r = max(0.0, float(b.get("radius_mm") or bucket.RADIUS_MM) - MOUTH_MARGIN_MM)
     near = ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM
     best = None
+    # The reach model only orders the points (the planner decides): within it first, then nearest the base
     for dx in np.arange(-r, r + 0.1, 5.0):
         for dy in np.arange(-r, r + 0.1, 5.0):
             d = math.hypot(dx, dy)
-            if d > r or (best is not None and d >= best[0]):
+            if d > r:
                 continue
             x, y = c[0] + dx - off[0], c[1] + dy - off[1]
-            if ppa.reachable(x, y, z) and math.hypot(x, y) >= near:
-                best = (d, float(x), float(y))
+            if not ppa.allowed(x, y) or not near <= math.hypot(x, y) <= ppa.SAFE_REACH_MM:
+                continue
+            key = (not ppa.reachable(x, y, z), d if ppa.reachable(x, y, z) else math.hypot(x, y))
+            if best is None or key < best[0]:
+                best = (key, float(x), float(y))
     return None if best is None else (best[1], best[2])
 
 
@@ -148,6 +159,42 @@ def where_to_move(b: dict, z: float) -> str:
     if d + mouth < near:
         return f"move it about {near - d - mouth + 30:.0f} mm away from the arm"
     return "move it out of the arm's keep-out area"
+
+
+async def carry_over(rig, b: dict, xy, z: float, z_low: float) -> float:
+    """
+    Up, then across to the release point at z, the object crossing the rim above it; where the planner refuses that, the
+    same at z_low, and from a pose too far out to rise in, first in toward the base at this height (not past the bucket).
+    Returns the z it got to; raises BucketOutOfReach (still holding) when neither works.
+    {VIAM CENTERAL 2026-10-30 "搬运到桶也一样：桶远时，降低搬运高度，前提是高于桶沿 25 MM"}
+    """
+    for zz in ([z, z_low] if z_low < z - 1.0 else [z]):
+        try:
+            p = await rig.pose()
+            if p.z < zz - 1.0:
+                try:
+                    await rig.rise(zz, settle=False)
+                except ppa.EStop:
+                    raise
+                except ppa.MoveRefused:
+                    q = await rig.pose()
+                    r = math.hypot(q.x, q.y)
+                    ix, iy = (q.x * (r - 120.0) / r, q.y * (r - 120.0) / r) if r > 400.0 else (q.x, q.y)
+                    # The way in must not pass the bucket at this low height
+                    t = np.clip(np.dot(np.subtract(b["xy"], (q.x, q.y)), np.subtract((ix, iy), (q.x, q.y)))
+                                / max(1.0, math.dist((q.x, q.y), (ix, iy)) ** 2), 0.0, 1.0)
+                    closest = np.add((q.x, q.y), t * np.subtract((ix, iy), (q.x, q.y)))
+                    if math.dist(closest, b["xy"]) < float(b.get("radius_mm") or bucket.RADIUS_MM) + 60.0:
+                        raise
+                    await rig.goto(ix, iy, q.z, settle=False)
+                    await rig.rise(zz, settle=False)
+            await ppa.travel(rig, xy[0], xy[1], theta=0.0, z=zz)
+            return zz
+        except ppa.EStop:
+            raise
+        except ppa.MoveRefused as e:
+            print(f"  bucket: carry at z {zz:.0f} refused ({e})")
+    raise BucketOutOfReach(f"bucket at ({b['xy'][0]:.0f},{b['xy'][1]:.0f}): the arm cannot get over its mouth: {where_to_move(b, z)}")
 
 
 async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict, k: dict, poses: list,
@@ -172,10 +219,7 @@ async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict,
                                    f"{where_to_move(b, z)}")
         print(f"3/5 carry to the bucket ({b.get('source')}): centre ({b['xy'][0]:.0f},{b['xy'][1]:.0f}), "
               f"release at ({xy[0]:.0f},{xy[1]:.0f}) z {z:.0f}")
-        p = await rig.pose()
-        if p.z < z - 1.0:
-            await rig.rise(z, settle=False)
-        await ppa.travel(rig, xy[0], xy[1], theta=0.0, z=z)
+        z = await carry_over(rig, b, xy, z, lowest_release_z(b, height, grip))
         seen = await look(rig, k)
         if seen is None:
             # Over the mouth the bucket may fill the view: from higher up it is whole

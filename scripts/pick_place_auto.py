@@ -68,6 +68,12 @@ ALIGN_Z = 400.0  # observation height; sees the whole table scene
 SANITY_MIN_Z = 120.0  # absolute flange floor; Viam's own collision check refuses below ~132
 HOME_XY = (250.0, 0.0)
 MAX_STEP_MM = 250.0
+SAFE_REACH_MM = 760.0  # goto's far guard against a bad calculation only: past the xArm6's ~700 mm; the planner decides the rest
+# A far object is approached and picked from the highest of these the planner accepts when it refuses ALIGN_Z, as long as
+# depth still sees the object's top from there (MIN_SEEN_DEPTH_MM: the sensor's minimum is ~280)
+LOW_WORK_Z = (360.0, 330.0)
+MIN_SEEN_DEPTH_MM = 285.0
+LOW_APPROACH_FROM_MM = 560.0  # the low approach goes down here, within the ALIGN_Z reach, and only then out
 MAX_TRAVEL_MM = 1000.0  # goto(long_ok=True) only: travel() checked the line first, the guard still stops a wild target
 TRAVEL_MIN_R_MM = 150.0  # a one-move travel's straight line stays this far from the base (the looks' own limit)
 # Arm speed (deg/s, deg/s^2) with a heavy round object on the jaws, and the machine's configured one to go back to: the
@@ -832,7 +838,7 @@ class Rig:
         """
         if z < max(self.floor_z, SANITY_MIN_Z):
             raise RuntimeError(f"refusing z={z:.0f} below floor {max(self.floor_z, SANITY_MIN_Z):.0f}")
-        if math.hypot(x, y) > 650 or math.hypot(x, y) < 120:
+        if math.hypot(x, y) > SAFE_REACH_MM or math.hypot(x, y) < 120:
             raise RuntimeError(f"refusing xy=({x:.0f},{y:.0f}) outside safe reach")
         p = await self.pose()
         if math.dist((p.x, p.y, p.z), (x, y, z)) > (MAX_TRAVEL_MM if long_ok else MAX_STEP_MM):
@@ -940,8 +946,8 @@ class Rig:
             print(f"  clear_error failed: {type(e).__name__}: {e}")
 
     async def lift(self, settle: bool = True) -> None:
-        """Straight up to ALIGN_Z; the safe response to any failure."""
-        await self.rise(ALIGN_Z, settle=settle)
+        """Straight up to the working height (ALIGN_Z, or lower where only that reaches); the safe response to any failure."""
+        await self.rise(min(ALIGN_Z, getattr(self, "work_z", ALIGN_Z)), settle=settle)
 
     async def rise(self, z: float, settle: bool = True) -> None:
         """
@@ -953,8 +959,20 @@ class Rig:
         p = await self.pose()
         cur = p.z
         while cur < z - 0.5:
-            cur = min(z, cur + MAX_STEP_MM - 10.0)
-            await self.goto(p.x, p.y, cur, settle=settle and cur >= z - 0.5)
+            nxt = min(z, cur + MAX_STEP_MM - 10.0)
+            try:
+                await self.goto(p.x, p.y, nxt, settle=settle and nxt >= z - 0.5)
+            except EStop:
+                raise
+            except MoveRefused as e:
+                if "overcurrent" in str(e):
+                    raise  # a collision, not the reach: nothing more is tried here
+                # Out here the arm reaches only lower: up to the working height it came down from, and say so
+                work = getattr(self, "work_z", ALIGN_Z)
+                if cur < work - 0.5 < nxt:
+                    await self.goto(p.x, p.y, work, settle=settle)
+                raise
+            cur = nxt
 
     async def servo(self, finder, use_top: bool, label: str, plane_at=None, offset=(0.0, 0.0),
                     blind_step: bool = True, tol_mm: tuple = None) -> None:
@@ -1056,7 +1074,7 @@ class Rig:
             # Where the target leads must be a pose the arm may take: never chase it into the base or out of reach
             if math.hypot(nx, ny) < 120.0:
                 raise TooClose(f"{label}: {too_close_msg(nx, ny)} (the refine would move the arm there)")
-            if not allowed(nx, ny) or math.hypot(nx, ny) > 650.0:
+            if not allowed(nx, ny) or math.hypot(nx, ny) > SAFE_REACH_MM:
                 raise RuntimeError(f"{label}: the target leads out of reach, flange ({nx:.0f},{ny:.0f}): not following it")
             await self.goto(nx, ny, p.z)
         raise RuntimeError(f"{label}: did not converge (8 iterations or {SERVO_MAX_S:.0f} s)")
@@ -1387,7 +1405,8 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     rig.picked_at = None  # set again only by this pick's successful grab
     await rig.open()
     p = await rig.pose()
-    await rig.goto(p.x, p.y, ALIGN_Z, theta=None if not align else 0.0)
+    # The working height: ALIGN_Z, or lower where approach() found only that reaches (rig.work_z)
+    await rig.goto(p.x, p.y, min(ALIGN_Z, getattr(rig, "work_z", ALIGN_Z)), theta=None if not align else 0.0)
 
     print("1/5 find + align over block" if align else "1/5 refine over the target (wrist already turned)")
     # Only this first refine may stop early: after a missed grab the object is not where the frame said
@@ -1473,7 +1492,7 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         # First 30 mm as a short, slow move (the fingers leave the table without a jerk), then up to ALIGN_Z.
         # Holding: the carry follows (no frame). Missed: the re-servo's frame needs the settle
         await rig.goto(p.x, p.y, min(p.z + 30.0, ALIGN_Z), settle=False)
-        await rig.goto(p.x, p.y, ALIGN_Z, settle=not grabbed or slipped is not None)
+        await rig.goto(p.x, p.y, min(ALIGN_Z, getattr(rig, "work_z", ALIGN_Z)), settle=not grabbed or slipped is not None)
         t = mark(times, "grab", t)
         if grabbed:
             # Held at the grab, gone after the lift: the red box cutter (16 mm, gripped by its top 3-4 mm) slipped
@@ -1595,7 +1614,7 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
         await observe_release(rig, z1, table, height)
     q = await rig.pose()
     if q.z < ALIGN_Z - 1.0:  # observe_release already lifted there: no zero-length move + settle
-        await rig.goto(q.x, q.y, ALIGN_Z)
+        await rig.goto(q.x, q.y, min(ALIGN_Z, getattr(rig, "work_z", ALIGN_Z)))
 
 
 async def locate_square(rig: Rig) -> tuple:
@@ -2018,13 +2037,28 @@ async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = A
     """
     if not allowed(x, y):
         raise RuntimeError(f"refusing ({x:.0f},{y:.0f}): inside an obstacle keep-out zone")
-    if not reachable(x, y, z):
-        raise MoveRefused(f"refusing ({x:.0f},{y:.0f},{z:.0f}): beyond the arm's reach at that height")
+    # No reach test here: the planner answers (a refused move is MoveRefused, the arm stays where it was). The fixed reach
+    # model refused the KIND bar at r 692 mm without trying. {USER 2026-10-30 "THAT IS WRONG THERE ARE MORE JOINTS IF YOU MOVE ALL IT SHOULD WORK"}
     p = await rig.pose()
     cur = p.z
     if cur < min(z, ALIGN_Z) - 1:
-        cur = min(z, ALIGN_Z)
-        await rig.rise(cur, settle=False)
+        try:
+            await rig.rise(min(z, ALIGN_Z), settle=False)
+            cur = min(z, ALIGN_Z)
+        except EStop:
+            raise
+        except MoveRefused as e:
+            if "overcurrent" in str(e):
+                raise  # a collision: no sideways step, the caller clears the error and rises
+            # Too far out to rise here: a short step in toward the base at this height, then up; never a long low crossing
+            q = await rig.pose()
+            r = math.hypot(q.x, q.y)
+            ix, iy = (q.x * (r - 150.0) / r, q.y * (r - 150.0) / r) if r > 350.0 else (q.x, q.y)
+            print(f"  travel: rising here refused ({e}); in to ({ix:.0f},{iy:.0f}) at z {q.z:.0f}, then up")
+            await rig.goto(ix, iy, q.z, settle=False)
+            await rig.rise(min(z, ALIGN_Z), settle=False)
+            p = await rig.pose()
+            cur = p.z
     if z < cur - 1:
         cur = z
         await rig.goto(p.x, p.y, cur, settle=False)
