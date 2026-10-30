@@ -382,7 +382,8 @@ def footprint(rig, o, pose: dict) -> dict:
     xy = perception.world_xy(pose, intr(rig), gu, gv, o.top_depth_mm)
     return {"xy": (float(xy[0]), float(xy[1])),
             "area": float(o.mask.sum()) * (o.top_depth_mm / perception.REF_TABLE_DEPTH_MM) ** 2,
-            "colour": getattr(o, "colour", None), "merged": getattr(o, "n_fragments", 1) > 1}
+            "colour": getattr(o, "colour", None), "merged": getattr(o, "n_fragments", 1) > 1,
+            "colours": dict(getattr(o, "colours", None) or {})}
 
 
 # A merged object's frame may show only one piece of it (perception joins them frame by frame): the bottle's label alone
@@ -392,7 +393,21 @@ SLIP_XY_MM = 40.0  # the picked object counts as still lying there within this o
 # A squeezed soft bag changes size and shifts: 32 -> 45 mm high over five grabs, each read as "nothing like it left", each
 # followed by a release of nothing. So: anything of its colour this close, not already standing there when it was found.
 # {VIAM CENTERAL 2026-10-30 "如果原位置附近（放宽到 80 MM）还有同颜色的物体，就算滑落"}
-SLIP_WIDE_MM, SLIP_WIDE_AREA = 80.0, 0.2
+SLIP_WIDE_MM, SLIP_WIDE_AREA = 80.0, (0.2, 3.0)
+SLIP_COLOUR_SHARE = 0.15  # a colour making up this much of either object counts as the same colour
+
+
+def same_colour(ref: dict, o) -> bool:
+    """
+    Same colour as the picked object, by presence: a red lollipop (red head, white stick) need not come out "red" overall
+    in every frame. It was pushed ~40 mm by the grasp, left on the table, and reported done (2026-10-30).
+    {VIAM CENTERAL 2026-10-30 "滑落判断对棒棒糖这种「被推开 30–50 MM」的情况要算滑落：放宽到 80 MM 内同色同形状"}
+    """
+    c = ref.get("colour")
+    if c is None:
+        return True
+    return (o.colour == c or (getattr(o, "colours", None) or {}).get(c, 0.0) >= SLIP_COLOUR_SHARE
+            or (ref.get("colours") or {}).get(o.colour, 0.0) >= SLIP_COLOUR_SHARE)
 SLIP_SAME_SPOT_MM = 25.0  # a neighbour in the found frame and an object now this close are the same one
 
 
@@ -418,7 +433,8 @@ def still_on_table(rig, tracker, rgb: np.ndarray, depth: np.ndarray, pose: dict)
     for o in list(seg.objects) + [o for o, _ in seg.excluded]:
         now = footprint(rig, o, pose)
         d = math.hypot(now["xy"][0] - ref["xy"][0], now["xy"][1] - ref["xy"][1])
-        if (d <= SLIP_WIDE_MM and now["area"] >= SLIP_WIDE_AREA * ref["area"] and ref.get("colour") in (None, o.colour)
+        ratio = now["area"] / max(ref["area"], 1.0)
+        if (d <= SLIP_WIDE_MM and SLIP_WIDE_AREA[0] <= ratio <= SLIP_WIDE_AREA[1] and same_colour(ref, o)
                 and not near_any(now["xy"], neighbours_of(rig, tracker), SLIP_SAME_SPOT_MM)):
             return True, f"a {o.colour} object lies {d:.0f} mm from the pick point, changed shape or moved: not held"
     return False, "nothing like it left at the pick point"

@@ -24,6 +24,7 @@ Run it with a hand near the e-stop. Ctrl-C stops the script; the arm finishes it
 """
 import asyncio
 import io
+import json
 import math
 import os
 import re
@@ -120,6 +121,18 @@ def model_jacobian(fx: float, fy: float, cx: float, cy: float, theta: float, dep
 SETTLE_S = 0.6
 # Jaw-axis model fitted from released blocks (data/jaw_calib.json); None until `jaw_calib.py fit` has run
 JAW_CAL = jaw_calib.load()
+# scripts/fine_calib.py's fit, shipped with the module (sorter/fine_calib.json): the jaw axis's shift in the camera, mm
+FINE_CALIB_FILE = Path(__file__).resolve().parent.parent / "sorter" / "fine_calib.json"
+
+
+def _fine_shift() -> tuple:
+    try:
+        return tuple(float(v) for v in json.loads(FINE_CALIB_FILE.read_text())["axis_shift_mm"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return (0.0, 0.0)
+
+
+AXIS_SHIFT_MM = _fine_shift()
 
 
 def default_jaw_model(cx: float, cy: float) -> tuple:
@@ -127,7 +140,7 @@ def default_jaw_model(cx: float, cy: float) -> tuple:
     return (cx, cy), ((JAW_TIP_PX[0] - cx) * TIP_BELOW_CAM, (JAW_TIP_PX[1] - cy) * TIP_BELOW_CAM)
 
 
-def axis_pixel(fx: float, fy: float, cx: float, cy: float, depth: float) -> tuple:
+def axis_pixel(fx: float, fy: float, cx: float, cy: float, depth: float, shift_mm: tuple = None) -> tuple:
     """
     Pixel where the jaw axis pierces a plane `depth` mm in front of the camera.
 
@@ -140,7 +153,9 @@ def axis_pixel(fx: float, fy: float, cx: float, cy: float, depth: float) -> tupl
     Once released blocks have been observed and fitted (jaw_calib.py), that fit replaces the hand model.
     """
     a, k = JAW_CAL if JAW_CAL else default_jaw_model(cx, cy)
-    return a[0] + k[0] / depth, a[1] + k[1] / depth
+    # fine_calib's shift (mm in the camera at any depth): pixels shrink as 1/depth, like the offset itself
+    sx, sy = AXIS_SHIFT_MM if shift_mm is None else shift_mm
+    return a[0] + (k[0] + sx * fx) / depth, a[1] + (k[1] + sy * fy) / depth
 
 
 async def observe_release(rig, z1: float, table: float, height: float) -> None:

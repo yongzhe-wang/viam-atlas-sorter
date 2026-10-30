@@ -912,6 +912,10 @@ THETA_SIGN = -1.0
 # {THETA_FIT "J = [21.74 -3.25]" "RED RESID [-2.5 0.]"} {080 "EDGE BLUE H=30 … XY=(419,-175)"}
 # [CONFIDENCE: CONFIRMED 85% — fitted on theta -90, confirmed within 3 mm at theta +90 on an edge-cut sighting]
 TOOL_AXIS_MM = (21.7, -3.3)
+try:  # scripts/fine_calib.py's fit, when one was made (sorter/fine_calib.json); delete the file to go back
+    TOOL_AXIS_MM = tuple(float(v) for v in json.loads((Path(__file__).resolve().parent / "fine_calib.json").read_text())["tool_axis_mm"])
+except (OSError, ValueError, KeyError, TypeError):
+    pass
 
 
 def _rot(t: float, x: float, y: float) -> tuple:
