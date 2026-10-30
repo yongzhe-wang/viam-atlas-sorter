@@ -108,7 +108,12 @@ await sorter.do_command({"reset": True})                    # empty the square (
   ts}}` folds the log since `ts` (default: the epoch) back into the live map with AGENT3's
   `table_map.fold_observations`, e.g. after a crash. When free disk drops under 5 GB, the images of the oldest idle
   frames are removed first; their records stay, and search, grasp and sweep frames are never thinned.
-  `{"status": true}` → `"observations"` gives `count`, `bytes` and `free_bytes`.
+  `{"status": true}` → `"observations"` gives `count`, `bytes` and `free_bytes`. To read the log off the robot
+  (e.g. to make library views from its frames), use the read-only
+  `{"observations": {"since": ts, "until": ts, "images": false, "limit": 200, "source": "idle"}}`. It returns
+  the records as logged, oldest first; with `images`, each record also carries `jpeg_b64` and `depth_png_b64`.
+  A page holds at most 200 records (40 with images) and 3 MB, and `"more"` plus `"next_since"` page on. It never
+  touches the map, a job or the arm, and it answers while busy.
 - **Finding objects anywhere on the table**: a grasp starts picking at once, with no scan first (the user's
   rule: "just search, and if found just start grasp; do NOT have an initial step").
   1. Cached idle frame shows it → go.

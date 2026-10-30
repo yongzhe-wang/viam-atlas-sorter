@@ -27,6 +27,9 @@ DoCommand:
   {"table_map": true}                the live table map (no embeddings; each object's seen_ts), sightings, sweep progress
   {"clear_map": true}                forget the table (someone rearranged it): live map + sightings + cached frame;
                                      the old map and sightings go to the Store's history. Refused while a job runs.
+  {"observations": {"since": ts, "until": ts, "images": false, "limit": 200, "source": "idle"}}
+                                     read-only page of the observation log (records as logged; with images: jpeg_b64 /
+                                     depth_png_b64), oldest first; "more" + "next_since" for the next page
   {"rebuild_map": {"since": ts}}     rebuild the live map from the observation log (every frame folded in is
                                      logged) since ts, default the current epoch; needs AGENT3's fold_observations
 The map also starts empty at every module start: the table may have changed while the module was down.
@@ -102,6 +105,9 @@ MAP_PERSIST_S = 2.0  # live map -> Store.put_table_map at most this often (VIAM 
 MAP_TASK_EVERY_S = 1.0  # during a task, at most one executor frame per second goes to the live map (servo keeps CPU)
 IDLE_SIG_PX = 12  # idle pictures differ when a box centre moved this many pixels (or labels / intruders changed)
 IDLE_MAP_KEEPALIVE_S = 20.0  # ... else one idle picture this often still goes into the map and the log
+OBS_PAGE_LIMIT = 200  # {"observations"}: records per page without images ...
+OBS_PAGE_IMAGES_LIMIT = 40  # ... and with them (a JPEG + depth PNG is ~60 KB on top of a ~11 KB record)
+OBS_PAGE_BYTES = 3_000_000  # a page stays under this much JSON: a DoCommand answer goes through one gRPC message
 OBS_THIN_EVERY_S = 60.0  # how often the observation log checks free disk space (thins idle images under 5 GB)
 SWEEPS_KEEP = 30  # saved sweep frame sets (AGENT1, ~8 MB each: 4 x jpg + 1280x720 uint16 depth): keep the newest 30
 
@@ -363,6 +369,44 @@ class GraspByDescription(Generic, EasyResource):
         for o in m["objects"]:
             if o.get("label") and o.get("seen_ts") is not None and o.get("id") not in keep:
                 o["superseded"] = True
+
+    async def _observations(self, arg) -> Dict[str, ValueTypes]:
+        """
+        {"observations": {"since", "until", "images", "limit", "source"}}: a read-only page of the observation log,
+        oldest first, for building library views off the robot (AGENT3: the records' emb16 / height / colour make
+        a view without recomputing CLIP; the JPEG is its thumbnail). Never touches the map, a job or the arm, so
+        it answers while busy too. A page holds at most `limit` records and OBS_PAGE_BYTES of JSON; "more" and
+        "next_since" (pass it as the next since) page through the rest.
+        """
+        arg = arg if isinstance(arg, dict) else {}
+        images = bool(arg.get("images"))
+        cap = OBS_PAGE_IMAGES_LIMIT if images else OBS_PAGE_LIMIT
+        limit = max(1, min(int(arg.get("limit") or cap), cap))
+        since = float(arg["since"]) if arg.get("since") is not None else None
+        until = float(arg["until"]) if arg.get("until") is not None else None
+        return await asyncio.to_thread(self._observations_page, since, until, images, limit, arg.get("source"))
+
+    def _observations_page(self, since, until, images: bool, limit: int, source) -> dict:
+        """One page of _observations (worker thread: it reads the log files and the images)."""
+        recs = self.store.list_observations(since=since, until=until)
+        if source:
+            recs = [r for r in recs if r.get("source") == source]
+        out, size = [], 0
+        for r in recs[:limit]:
+            r = dict(r)
+            if images:
+                for key, field in (("jpeg_path", "jpeg_b64"), ("depth_path", "depth_png_b64")):
+                    p = self.store.data / r[key] if r.get(key) else None
+                    if p is not None and p.exists():  # thinned idle frames have no images left
+                        r[field] = base64.b64encode(p.read_bytes()).decode()
+            n = len(json.dumps(r, default=str))
+            if out and size + n > OBS_PAGE_BYTES:
+                break
+            out.append(r)
+            size += n
+        more = len(out) < len(recs)
+        return {"ok": True, "records": out, "count": len(out), "total": len(recs), "more": more,
+                "next_since": out[-1]["ts"] + 1e-6 if more and out else None, "bytes": size}
 
     async def _rebuild_map(self, since: Optional[float]) -> Dict[str, ValueTypes]:
         """
@@ -1036,6 +1080,8 @@ class GraspByDescription(Generic, EasyResource):
             return self._status()
         if command.get("seen_image"):
             return self._seen_image()
+        if "observations" in command:
+            return await self._observations(command.get("observations"))
         if "rebuild_map" in command:
             arg = command.get("rebuild_map")
             return await self._rebuild_map(arg.get("since") if isinstance(arg, dict) else None)
@@ -1065,6 +1111,7 @@ class GraspByDescription(Generic, EasyResource):
             return await self._start("reset", None, bool(command.get("wait")))
         return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"preview\": \"<description>\"}, "
                          "{\"reset\": true}, {\"scan_table\": true}, {\"clear_map\": true}, {\"rebuild_map\": {}}, "
+                         "{\"observations\": {}}, "
                          "{\"status\": true}, "
                          "{\"seen_image\": true} or {\"table_map\": true}"}
 
