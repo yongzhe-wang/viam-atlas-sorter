@@ -262,7 +262,8 @@ function renderJob(c) {
     for (const i of c.items) {
       const li = el("li");
       li.appendChild(el("span", ITEM_ICON[i.status] || "❌"));
-      li.appendChild(el("span", `${i.text}${i.label && i.label !== i.text ? ` → ${i.label}` : ""}`));
+      // "of": one of several objects that fit the name, all of which go in ("lollipop (2/2)")
+      li.appendChild(el("span", `${i.text}${i.of ? ` (${i.of})` : ""}${i.label && i.label !== i.text ? ` → ${i.label}` : ""}`));
       const why = i.status === "already_in_bucket" ? "already in the bucket"
         : i.fail_reason || (ITEM_ICON[i.status] ? "" : String(i.status || "").replace(/_/g, " "));
       if (why) li.appendChild(el("span", why, "why"));

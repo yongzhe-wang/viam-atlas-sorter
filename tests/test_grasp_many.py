@@ -298,6 +298,44 @@ async def main():
     await s.job
     assert len(calls) == 1
     print("12. seen on the table after it went in (taken out): grasped as usual")
+
+    # One name, several objects on the table: all of them, one after the other
+    # {USER 2026-10-30 "AND IF WE HAVE TWO THEN GRASP ALL IN SEUQENCE INSTEDA OF RANDOM"}
+    now = time.time()
+    red = {"label": "red lollipop", "names": ["red lollipop"], "xy": [300.0, 50.0], "colour": "red", "seen_ts": now}
+    blue = {"label": "blue lollipop", "names": ["blue lollipop"], "xy": [350.0, -50.0], "colour": "blue", "seen_ts": now}
+    MAP["lollipop"] = red
+    s.live.map = {"ts": now, "objects": [red, blue]}
+    calls.clear()
+    r = await s.do_command({"grasp": "lollipop", "wait": True})
+    assert [c["text"] for c in calls] == ["lollipop", "lollipop"] and st(r) == ["done", "done"], (calls, r)
+    assert [i.get("of") for i in r["items"]] == ["1/2", "2/2"] and r["status"] == "done" and r["total"] == 2, r
+    # The other name in the list comes after every one of this name; a name that fits one object is tried once
+    calls.clear()
+    r = await s.do_command({"grasp": "lollipop, tape", "wait": True})
+    assert [c["text"] for c in calls] == ["lollipop", "lollipop", "tape"] and st(r) == ["done", "done", "done"], (calls, r)
+    # A repeat that finds no other: that name's repeats end there, and the job is still done
+    silver = {"label": "silver lollipop", "names": ["silver lollipop"], "xy": [400.0, 0.0], "colour": "grey", "seen_ts": now}
+    s.live.map = {"ts": now, "objects": [red, blue, silver]}
+    OUTCOME["lollipop"] = [dict(DONE), {"status": "not_found", "fail_phase": "find", "fail_reason": "gone", "_id": "b"}]
+    calls.clear()
+    r = await s.do_command({"grasp": "lollipop", "wait": True})
+    assert len(calls) == 2 and st(r) == ["done"] and r["items"][0]["of"] == "1/3" and r["status"] == "done", (calls, r)
+    OUTCOME.clear()
+    # A repeat with nothing in view or on the map answers at once: no search of the table for it
+    del MAP["lollipop"]
+    s.live.map = {"ts": now, "objects": []}
+    calls.clear()
+    res = await s._list_item("lollipop", repeat=True)
+    assert res["status"] == "not_found" and not calls, (res, calls)
+    s._between_items = False
+    # One object of the name: the single path, as ever
+    MAP["lollipop"] = red
+    s.live.map = {"ts": now, "objects": [red]}
+    calls.clear()
+    r = await s.do_command({"grasp": "lollipop", "wait": True})
+    assert len(calls) == 1 and "items" not in r, (calls, r)
+    print("14. a name that fits two objects: both, in sequence ('of' 1/2, 2/2); a repeat that finds none ends them; one object: single path")
     await s.close()
 
     # The rule itself: another object of the same name on the table, a reset

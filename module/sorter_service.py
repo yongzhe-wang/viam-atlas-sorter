@@ -104,6 +104,7 @@ SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "durat
 # search {USER 2026-10-29 "I ALSO WANT RETRY WHEN FAIL"} [CONFIDENCE: SINGLE-SRC 90% — 3 is my pick: a 4th
 # try past ~45 s of retries loses the demo minute anyway]
 GRASP_ATTEMPTS = 3
+MAX_SAME_NAME = 5  # one name that fits several objects on the table: at most this many go in, one after the other
 # best()'s margin over the runner-up above which the refused object is surely the one named: no search for another
 # [CONFIDENCE: INFERRED 70% — the red box cutter had 0.40; ambiguous picks (blue lolipop 0.005, m&m 0.015) stay below]
 CLEAR_MARGIN = 0.2
@@ -1287,6 +1288,10 @@ class GraspByDescription(Generic, EasyResource):
         # {USER 2026-10-30 "BLUE LOLIPOP / AMBIGUOUS ... THEN JUST CHOOSE A RANDOM ONE"}
         # [CONFIDENCE: CONFIRMED 95% — the top-scoring match, not a coin flip: deterministic and still "any one"]
         d = await self._decision(text, any_match=True)
+        if not d.get("status") and self._known_matches(text) > 1:
+            # Several objects fit the name: every one goes in, one after the other, instead of one of them
+            # {USER 2026-10-30 "AND IF WE HAVE TWO THEN GRASP ALL IN SEUQENCE INSTEDA OF RANDOM"}
+            return await self._grasp_many([text], [], wait)
         if d.get("status"):
             cached = {"decided_from_cache": True} if d.get("decided_from_cache") else {}
             self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": d["status"],
@@ -1409,7 +1414,26 @@ class GraspByDescription(Generic, EasyResource):
                  "message": f"{len(items)} objects, one after the other: {text}"}
         return {**reply, **(await self.job)} if wait else reply
 
-    async def _list_item(self, text: str) -> dict:
+    def _known_matches(self, text: str) -> int:
+        """
+        How many objects named `text` (label or alias, by name_matches' word containment, so "blue block" is never the blue
+        cylinder) are known on the table now: in the newest frame's recognised objects, and on the live map outside the
+        drop square. The larger count, as they are the same objects seen twice; at most MAX_SAME_NAME.
+        """
+        rt = _runtime()
+        match = getattr(rt.clip_embed, "name_matches", grasp_policy.words_match)
+
+        def named(label, names) -> bool:
+            return bool(label) and match(text, [label, *(names or [])])
+
+        raw = self._seen_raw
+        in_frame = sum(1 for r in ((raw or {}).get("recs") or []) if named(r.get("label"), r.get("names")))
+        objs = ((self.live.map if self.live is not None else None) or {}).get("objects") or []
+        current = getattr(rt.table_map, "_current", lambda o: o)(objs)
+        on_map = sum(1 for m in current if not m.get("in_square") and named(m.get("label"), m.get("names")))
+        return min(MAX_SAME_NAME, max(in_frame, on_map))
+
+    async def _list_item(self, text: str, repeat: bool = False) -> dict:
         """
         One object of a list: the same decision and the same retries as a single grasp, except that several objects
         fitting the name is fine (the best match is taken, logged). -> {text, status, label, duration_s, fail_reason, ...}
@@ -1419,6 +1443,11 @@ class GraspByDescription(Generic, EasyResource):
         d = await self._decision(text, any_match=True)
         if d.get("status"):
             return {"text": text, "status": d["status"], "fail_reason": d["reason"], "via": d.get("via"),
+                    "duration_s": round(time.monotonic() - t0, 1)}
+        matches = self._known_matches(text)
+        if repeat and d["via"] == "search":
+            # Another of a name already picked: only one that is in view or on the map, no search of the whole table
+            return {"text": text, "status": "not_found", "fail_reason": f"no other {text!r} in view or on the map",
                     "duration_s": round(time.monotonic() - t0, 1)}
         kw = {"decide_ms": d.get("decide_ms"), "skip_current": d.get("seen_miss", False)}
         if d["via"] == "frame":
@@ -1435,31 +1464,62 @@ class GraspByDescription(Generic, EasyResource):
             self._seen_raw = None  # however young, that frame is from before this item: the next one looks again
         return {"text": text, "status": s.get("status"), "label": s.get("label"), "colour": s.get("colour"),
                 "score": s.get("score"), "duration_s": s.get("duration_s"), "via": s.get("via"), "_id": s.get("_id"),
-                "fail_reason": s.get("fail_reason") or s.get("error"), "tries": len(s.get("attempts") or []) or None}
+                "fail_reason": s.get("fail_reason") or s.get("error"), "tries": len(s.get("attempts") or []) or None,
+                "matches": matches}
 
     async def _run_many(self, text: str, items: list) -> dict:
-        """The grasp_many job: item by item, back at the observe pose between them; never raises."""
-        t0, n, stop = time.monotonic(), len(items), None
+        """
+        The grasp_many job: item by item, back at the observe pose between them; never raises.
+        A name that fits several objects on the table (_known_matches, after its first pick went in) is tried again
+        right after, once per other object ("of": "2/2"); a repeat that finds no other stops that name's repeats.
+        {USER 2026-10-30 "AND IF WE HAVE TWO THEN GRASP ALL IN SEUQENCE INSTEDA OF RANDOM"}
+        [CONFIDENCE: CONFIRMED 90% — user's instruction; tests/test_grasp_many.py section 14]
+        """
+        t0, stop = time.monotonic(), None
+        rows = [{"text": t, "of": None} for t in items]  # grows when a name fits several objects
         results = [{"text": t, "status": "pending"} for t in items]
-        for k, item in enumerate(items, 1):
+        k = 0
+        while k < len(rows):
+            row, item = rows[k], rows[k]["text"]
+            k += 1
+            n = len(rows)
+            of = {"of": row["of"]} if row["of"] else {}
             if stop:
-                results[k - 1] = {"text": item, "status": "skipped", "fail_reason": f"not tried: {stop}"}
+                results[k - 1] = {"text": item, **of, "status": "skipped", "fail_reason": f"not tried: {stop}"}
                 continue
-            results[k - 1] = {"text": item, "status": "running"}
+            results[k - 1] = {"text": item, **of, "status": "running"}
             for key in ("search", "sweep", "attempt", "attempts_max"):
                 self.job_info.pop(key, None)
-            self.job_info.update(item={"k": k, "n": n, "text": item}, progress=f"item {k}/{n}: {item}",
+            label = f"{item} ({row['of']})" if row["of"] else item
+            self.job_info.update(item={"k": k, "n": n, "text": item, **of}, progress=f"item {k}/{n}: {label}",
                                  items=[dict(r) for r in results])
             try:
-                res = await self._list_item(item)
+                res = await self._list_item(item, repeat=bool(row["of"]))
             except Exception as e:  # e.g. the camera handle gone while deciding: the arm's state is not known
                 LOGGER.error(f"list item {item!r} failed: {type(e).__name__}: {e}")
                 res = {"text": item, "status": "error", "fail_reason": f"{type(e).__name__}: {e}"[:300]}
+            res = {**res, **of}
+            if row["of"] and res.get("status") == "not_found":
+                # No other one: this repeat and the name's later ones leave the list (it is not a failed item)
+                LOGGER.info(f"list item {item!r} ({row['of']}): {res.get('fail_reason')}; no more of it")
+                k -= 1
+                del rows[k], results[k]
+                while k < len(rows) and rows[k]["text"] == item and rows[k]["of"]:
+                    del rows[k], results[k]
+                self.job_info["items"] = [dict(r) for r in results]
+                continue
             results[k - 1] = res
+            if not row["of"] and res.get("status") == "done" and int(res.get("matches") or 1) > 1:
+                m = int(res["matches"])
+                results[k - 1]["of"] = f"1/{m}"
+                LOGGER.info(f"list item {item!r}: {m} objects fit the name, the other {m - 1} go in next")
+                rows[k:k] = [{"text": item, "of": f"{i}/{m}"} for i in range(2, m + 1)]
+                results[k:k] = [{"text": item, "of": f"{i}/{m}", "status": "pending"} for i in range(2, m + 1)]
             self.job_info["items"] = [dict(r) for r in results]
             stop = grasp_policy.list_stop(res)
             if stop:
-                LOGGER.error(f"list stopped at item {k}/{n} {item!r}: {stop}")
+                LOGGER.error(f"list stopped at item {k}/{len(rows)} {item!r}: {stop}")
+        n = len(results)
         self._between_items = False
         ok = [r for r in results if r["status"] in grasp_policy.ITEM_SATISFIED]
         status = "done" if len(ok) == n else "partial" if ok else "failed"
