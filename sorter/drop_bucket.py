@@ -211,6 +211,13 @@ async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict,
         raise ppa.SquareNotFound(f"bucket kept moving ({looks} mm between looks); still holding, nothing let go")
     times["carry"] = round(time.monotonic() - t, 1)
     times["at"] = "place"
+    # Nothing on the jaws: no release and no delivery reported; the job's retry looks again
+    # {VIAM CENTERAL 2026-10-30 "在桶口上方松手前，如果 ... 爪子是空的，就不松手，报 OBJECTLOST，走重试"}
+    if getattr(rig, "grip_mode", "external") == "external" and hasattr(rig, "jaw_mm"):
+        jaw = await rig.jaw_mm()
+        if jaw is not None and jaw < ppa.EMPTY_JAW_MM:
+            rig.picked_at = None
+            raise ppa.ObjectLost(f"over the bucket the jaws are closed to {jaw:.1f} mm: nothing held, not let go")
     print(f"4/5 release over the bucket (confirmed within {looks[-1]:.0f} mm)")
     await ppa.release_jaws(rig)
     ppa.save_state(False)

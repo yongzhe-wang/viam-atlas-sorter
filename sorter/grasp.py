@@ -414,6 +414,12 @@ async def pick_flat(rig, times: dict, slipped=None, height: float = 7.0) -> tupl
     rig.picked_at = (q.x, q.y, rig.theta)
     stopped = await rig.close_soft(FLAT_TORQUE_PCT)
     print(f"  closed gently: jaws stopped at {stopped} mm")
+    if stopped is not None and stopped < ppa.EMPTY_JAW_MM:
+        # Closed on air: open where it lies, the caller's retry looks again
+        rig.picked_at = None
+        await rig.open()
+        await rig.lift()
+        raise ppa.ObjectLost(f"the jaws closed to {stopped:.1f} mm on the flat object: nothing between them")
     await rig.goto(q.x, q.y, min(q.z + 30.0, ppa.ALIGN_Z), settle=False)
     await rig.goto(q.x, q.y, ppa.ALIGN_Z)
     ppa.mark(times, "grab", t)

@@ -565,6 +565,7 @@ ESTOP_STATUS = "E-STOP pressed — release it, then press Reset on the dashboard
 EXPAND_WAIT_S = 6.0  # Rig.expand: longest wait for the jaws to stop against the wall
 EXPAND_SPEED = 1000  # of 1-5000: slower than the module's default 2000, it arrives at the wall gently
 EXPAND_TORQUE_PCT = 40  # of 0-100: below the G2's default grip force 50%; the force on the wall comes only from this
+EMPTY_JAW_MM = 2.0  # jaws closed this far are holding nothing: the thinnest object picked (a bag) is wider
 READ_CALLS = ("get pose", "get images", "holding", "frame system", "geometries")
 
 
@@ -724,6 +725,19 @@ class Rig:
 
     async def holding(self) -> bool:
         return (await self.call("holding", lambda: self.gripper.is_holding_something())).is_holding_something
+
+    async def jaw_mm(self):
+        """
+        The jaws' opening in mm by the gripper's own position reading, or None if it cannot be read (never fails).
+        Closed on nothing it reads ~0: unlike holding(), which the G2 got wrong both ways.
+        {VIAM-UFACTORY-XARM README "GET: TRUE ... RESP["POS"] (0-850)"} [CONFIDENCE: SINGLE-SRC 70% — not read on the arm yet]
+        """
+        try:
+            got = await self.call("holding", lambda: self.gripper.do_command({"get": True}))
+            return float(got["pos"]) / 10.0
+        except Exception as e:
+            print(f"  jaw position not read ({type(e).__name__}: {e})")
+            return None
 
     async def set_arm_speed(self, slow: bool) -> None:
         """
@@ -1463,6 +1477,7 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
             # The picture decides when there is one: the G2's holding() is wrong both ways (True with the knife
             # gone, False with the blue block still held, which then dropped back into the square when opened)
             held = await rig.holding()
+            jaw = await rig.jaw_mm() if hasattr(rig, "jaw_mm") else None
             if slipped is not None:
                 q = await rig.pose()
                 rgb, depth = await rig.frame()
@@ -1470,6 +1485,9 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
                 print(f"  after the lift: holding() {held}; picture: {why}")
             else:
                 gone, why = not held, "the gripper reports nothing held"
+            # Closed on air: the red lollipop was pushed 40 mm, the picture missed it and a delivery was reported
+            if not gone and jaw is not None and jaw < EMPTY_JAW_MM:
+                gone, why = True, f"the jaws closed to {jaw:.1f} mm: nothing between them"
             if gone:
                 rig.picked_at = None
                 await rig.open()
