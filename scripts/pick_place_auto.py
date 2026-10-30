@@ -44,6 +44,7 @@ from viam.proto.common import Pose
 from viam.robot.client import RobotClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for `sorter` helpers
+from sorter import smooth  # noqa: E402  SORTER_SMOOTH hooks in Rig.goto / Rig.frame / travel
 
 CAM_T = (-83.0, 14.0, 18.0)  # camera origin in the flange frame (mm)
 TIP_BELOW_CAM = 155.0 - CAM_T[2]  # fingertips are this far past the camera along the tool axis (mm)
@@ -839,17 +840,21 @@ class Rig:
                                f"({x:.0f},{y:.0f},{z:.0f})")
         if theta is not None:
             self.theta = theta
-        target = Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=-1, theta=self.theta)
-        await self.call("move", lambda: self.arm.move_to_position(target))
+        # SORTER_SMOOTH: an air move to a pose stood at before goes as one smooth joint path (sorter/smooth.py)
+        if not await smooth.joint_move(self, p, x, y, z):
+            target = Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=-1, theta=self.theta)
+            await self.call("move", lambda: self.arm.move_to_position(target))
         self.at = {"x": x, "y": y, "z": z, "theta": self.theta}
+        await smooth.arrived(self, x, y, z)
         # get_images() right after a move returns a stale frame; servo on stale frames diverged (68->142->297 px)
         # {LAGTEST 2026-10-29 "T+0S: BLOCK=(107, 475, 34)" "T+0.5S: BLOCK=(107, 496, 34)"}
         # [CONFIDENCE: CONFIRMED 90% — measured on sfhack4; 1 s gives margin over the observed ~0.5 s]
+        # SORTER_SMOOTH: no sleep; frame() waits for a picture captured after this move instead
         if settle:
-            await asyncio.sleep(SETTLE_S)
+            await smooth.settle(self, SETTLE_S)
 
     async def frame(self) -> tuple:
-        res = await self.call("get images", lambda: self.cam.get_images())
+        res = await smooth.fresh_images(self, lambda: self.call("get images", lambda: self.cam.get_images()), SETTLE_S)
         rgb, depth = decode(res[0] if isinstance(res, tuple) else res)
         self.last_depth = depth
         if self.on_map_frame is not None and depth is not None and self.at is not None:
@@ -2024,6 +2029,11 @@ async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = A
         cur = z
         await rig.goto(p.x, p.y, cur, settle=False)
     rise = z > cur + 1
+    # SORTER_SMOOTH: a target stood at before, from the air: one move, which goto makes a smooth joint path
+    if smooth.enabled() and cur >= smooth.AIR_Z and smooth.MEMORY.lookup((x, y, z, rig.theta if theta is None else theta)) \
+            and line_clear(p.x, p.y, x, y):
+        await rig.goto(x, y, z, theta=theta, settle=settle, long_ok=True)
+        return
     if fast("one_move") and line_clear(p.x, p.y, x, y):
         print(f"  one move: ({p.x:.0f},{p.y:.0f}) -> ({x:.0f},{y:.0f}), {math.hypot(x - p.x, y - p.y):.0f} mm")
         await rig.goto(x, y, cur, theta=theta, settle=settle and not rise, long_ok=True)

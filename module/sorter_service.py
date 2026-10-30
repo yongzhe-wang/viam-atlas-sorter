@@ -81,7 +81,7 @@ from viam.utils import ValueTypes, struct_to_dict
 
 from module import dashboard_view, grasp_policy
 from module.live_map import LiveMap
-from sorter import teach
+from sorter import smooth, teach
 
 NAMESPACE = "sorter-team"  # must match "module_id" in meta.json; change both to your registry namespace
 LOGGER = getLogger(__name__)
@@ -94,7 +94,8 @@ BUILD_INFO_PATH = Path(__file__).resolve().parent.parent / "BUILD_INFO.json"
 # find_path / square_path (AGENT1 0d3c817): how the executor really found the object and the square, for status.last
 SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "duration_s", "fail_phase", "fail_reason",
                 "find_path", "find_views", "square_path", "objects", "check", "learned", "alias_of", "views_added",
-                "views_skipped", "frames", "searchable_s", "top_score", "target_xy", "primitive", "attempt_primitives")
+                "views_skipped", "frames", "searchable_s", "top_score", "target_xy", "primitive", "attempt_primitives",
+                "image_wait_s", "frames_dropped", "smooth_moves", "settles")
 # A grasp that fails by accident (slipped, closed on air) is tried this many times in all, each from a fresh
 # search {USER 2026-10-29 "I ALSO WANT RETRY WHEN FAIL"} [CONFIDENCE: SINGLE-SRC 90% — 3 is my pick: a 4th
 # try past ~45 s of retries loses the demo minute anyway]
@@ -1100,7 +1101,9 @@ class GraspByDescription(Generic, EasyResource):
                 if excluded and "excluded" in params:
                     kwargs["excluded"] = excluded
                 rig.picked_obj = None
+                waits = dict(smooth.STATS)
                 doc = await rt.executor.execute(rig, text, self.store, mode="demo", **kwargs)
+                doc.update(smooth.since(waits))  # how long the arm stood waiting for pictures in this attempt (sorter/smooth.py)
                 if teach.enabled():
                     doc["learned"] = await self._learn(rt, doc, rig.picked_obj, text)
             elif kind == "teach":
