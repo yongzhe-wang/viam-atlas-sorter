@@ -61,6 +61,13 @@ CASES = [
     ("red and blue and tape", ["red", "blue", "tape"]),
     ("red and tape", ["red", "tape"]),
     ("red and blue then tape", ["red", "blue", "tape"]),
+    # "&" and "+" inside a word belong to its name (robot test: preview "M&M" -> "'m' is not in view")
+    ("M&M", ["m&m"]),
+    ("M&M's", ["m&m's"]),
+    ("the m&m bag and tape", ["m&m bag", "tape"]),
+    ("tape & mouse", ["tape", "mouse"]),
+    ("tape &mouse", ["tape", "mouse"]),
+    ("tape& mouse", ["tape", "mouse"]),
 ]
 bad = 0
 for text, want in CASES:

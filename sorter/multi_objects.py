@@ -17,7 +17,8 @@ LEAD = re.compile(r"^(please|pls|hey|ok|okay|now|also|and|then|can you|could you
 ARTICLE = re.compile(r"^(the|a|an|some|my|that|this)\s+")
 # The destination is always the blue square, and the politeness adds nothing to the object's name
 TAIL = re.compile(r"\s+((in|into|to|onto|inside)\s+(the\s+)?(blue\s+)?(square|box)|please|for me|thanks|thank you)$")
-SEPARATOR = re.compile(r"\s*(?:[,;&+]|\band\s+then\b|\band\b|\bthen\b)\s*")
+# "&" and "+" cut only with a space on a side: inside a word they are part of its name ("M&M", "M&M's")
+SEPARATOR = re.compile(r"\s*(?:[,;]|(?<!\w)[&+]|[&+](?!\w)|\band\s+then\b|\band\b|\bthen\b)\s*")
 _TOKEN = "\x00{}\x00"  # stands in for a library name with a separator in it while the text is cut
 # Colour words: the query's (clip_embed.COLOURS) plus those only the library's names use
 _COLOUR = "|".join(sorted(COLOURS | {"silver", "teal", "gray"}))
