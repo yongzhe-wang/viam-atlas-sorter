@@ -100,6 +100,35 @@ def test_moved_and_turned():
     assert close(turned["xy"], C, 1.0), turned["xy"]
 
 
+def scene(top: int = 120):
+    """1280x720 frame: wood table at 380 mm, blue tape ring (60 px) around white paper, interior from v=top."""
+    rgb = np.zeros((720, 1280, 3), np.uint8)
+    rgb[:] = (150, 110, 70)
+    rgb[max(top - 60, 0):top + 500, 300:800] = (0, 64, 116)  # tape as it reads on sfhack4 (PIL hue ~147)
+    rgb[max(top, 0):top + 440, 360:740] = (225, 230, 235)
+    return rgb, np.full((720, 1280), 380, np.uint16)
+
+
+def test_objects_on_and_across_the_tape():
+    # A blue-ish object lying in the square (the silver knife reads 52-69 % "tape") must not split the interior, and
+    # one lying across the tape must not join the interior to the table: depth says both are objects, not tape
+    from sorter import perception as P
+
+    rgb, d = scene()
+    clean = P.find_drop_square(rgb, d)
+    assert clean and not clean.get("partial"), clean
+    knife = (rgb.copy(), d.copy())
+    knife[0][320:360, 380:720], knife[1][320:360, 380:720] = (0, 64, 116), 362
+    hit = P.find_drop_square(*knife)
+    assert hit and hit["bbox"] == clean["bbox"], (hit and hit["bbox"], clean["bbox"])
+    across = (rgb.copy(), d.copy())
+    across[0][520:680, 520:580], across[1][520:680, 520:580] = (230, 200, 30), 350
+    hit = P.find_drop_square(*across)
+    assert hit and hit["bbox"] == clean["bbox"], (hit and hit["bbox"], clean["bbox"])
+    cut = P.find_drop_square(*scene(top=-60))  # interior runs off the top of the frame
+    assert cut and cut.get("partial") and cut["cut"] == ["top"], cut and cut.get("cut")
+
+
 def test_legacy_entry():
     old = {"xy": [369.9, 84.0], "size_mm": [114.0, 175.0], "partial": False, "seen_ts": 5.0}
     s = D.from_legacy(old)

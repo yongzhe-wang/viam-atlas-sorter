@@ -476,6 +476,26 @@ def rebuild_map(observations, since_ts: float = None) -> dict:
     return fold_observations([r for r in observations if since_ts is None or r["ts"] >= since_ts])
 
 
+def _current(objs: list) -> list:
+    """
+    The map's entries minus stale duplicates: of the dynamic-map entries (with seen_ts) sharing a label, only the
+    most recently seen one. One of each object is on the table (the MOVE rule), so the other is where it used to be.
+
+    WHY: the silver knife delivered into the square left its old entry behind (its old spot was not looked at
+    again), so "silver box cutter" picked that empty spot instead of answering "already in the square".
+    {LIVE TABLE_MAP 2026-10-29 "UTILITY KNIFE XY=[270.4, 257.6] … N=6.0" AND "UTILITY KNIFE XY=[385.3, 74.4] … IN_SQ=TRUE"}
+    [CONFIDENCE: CONFIRMED 85% — tests/test_table_map.py::test_stale_duplicate; survey maps (no seen_ts) untouched]
+    """
+    latest = {}
+    for m in objs:
+        if m.get("label") and m.get("seen_ts") is not None and m.get("xy") is not None:
+            key = (float(m["seen_ts"]), int(m.get("n_seen") or 0))
+            if m["label"] not in latest or key > latest[m["label"]][0]:
+                latest[m["label"]] = (key, id(m))
+    return [m for m in objs if m.get("xy") is not None
+            and (m.get("label") not in latest or m.get("seen_ts") is None or latest[m["label"]][1] == id(m))]
+
+
 def best_on_map(table_map: dict, text: str, store=None) -> dict:
     """
     clip_embed.best() on the map's objects; adds "xy" and "map_obj" so the executor can go there.
@@ -485,7 +505,8 @@ def best_on_map(table_map: dict, text: str, store=None) -> dict:
     a refusal with reason "... is already in the square" and already_in_square=True.
     """
     # Read-only and tolerant of maps made elsewhere (missing fields get _ensure_map's defaults, the map is not changed)
-    cands = [m for m in table_map.get("objects") or [] if m.get("xy") is not None and not m.get("in_square")]
+    live = _current(table_map.get("objects") or [])
+    cands = [m for m in live if not m.get("in_square")]
     recs = []
     for k, m in enumerate(cands):
         size = m.get("size_mm") or [0.0, 0.0]
@@ -500,7 +521,7 @@ def best_on_map(table_map: dict, text: str, store=None) -> dict:
     pick = cands[b["obj"].id] if b["obj"] is not None else None
     done = None
     if pick is None:
-        done = next((m for m in table_map.get("objects") or [] if m.get("in_square") and m.get("label")
+        done = next((m for m in live if m.get("in_square") and m.get("label")
                      and clip_embed.name_matches(text, [m["label"], *(m.get("names") or [])])), None)
         if done is not None:
             b = {**b, "reason": f"{done['label']!r} is already in the square", "searchable": False}

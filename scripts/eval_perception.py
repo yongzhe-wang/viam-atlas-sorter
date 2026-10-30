@@ -109,7 +109,10 @@ DEMO = [("grasp green square", "green cube", ["033", "034", "035"]),
         # Knives (frames 077-088); 088 (z 580) has both, so "utility knife" / "box cutter" must not pick the red one
         ("grab the utility knife", "utility knife", ["081", "083", "088"]),
         ("box cutter", "utility knife", ["082", "088"]),
-        ("pick up the red knife", "red knife", ["085", "087", "088"])]
+        ("pick up the red knife", "red knife", ["085", "087", "088"]),
+        # The user's own wording in the live test; "red box cutter" must not drift to the silver one's "box cutter"
+        ("silver box cutter", "utility knife", ["081", "083", "088"]),
+        ("red box cutter", "red knife", ["085", "087", "088"])]
 
 
 def demo() -> None:

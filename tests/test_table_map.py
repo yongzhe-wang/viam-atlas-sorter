@@ -99,6 +99,18 @@ def test_light_record_refused():
         raise AssertionError("a record without depth_valid must be refused")
 
 
+def test_stale_duplicate():
+    # The knife delivered into the square left its old entry behind; only the latest sighting of a label counts
+    # {LIVE TABLE_MAP 2026-10-29: "utility knife" at (270.4, 257.6) n=6 and at (385.3, 74.4) in_square}
+    old = {"id": 1, "label": "utility knife", "xy": [270.4, 257.6], "seen_ts": 100.0, "n_seen": 6}
+    new = {"id": 9, "label": "utility knife", "xy": [385.3, 74.4], "seen_ts": 200.0, "n_seen": 23, "in_square": True}
+    other = {"id": 2, "label": "green cube", "xy": [141.6, 106.0], "seen_ts": 50.0}
+    unknown = {"id": 3, "label": None, "xy": [516.0, -295.0], "seen_ts": 10.0}
+    assert TM._current([old, new, other, unknown]) == [new, other, unknown]
+    survey = [dict(old, seen_ts=None), dict(new, seen_ts=None)]  # map_from_frames: no seen_ts, keep both
+    assert TM._current(survey) == survey
+
+
 def test_best_on_minimal_maps():
     # Queries must not crash on maps made elsewhere either (no objects key, entries without embeddings)
     assert TM.best_on_map({}, "green cube")["map_obj"] is None

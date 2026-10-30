@@ -502,6 +502,15 @@ def find_drop_square(rgb: np.ndarray, depth: np.ndarray, plane: tuple = None) ->
     # Closing on an edge-padded mask: plain binary_closing erodes 3 px off the image border (border_value 0), which
     # opened the tape where it runs off the frame and joined a border-cut hole to the whole table (080)
     masks = [ndimage.binary_closing(np.pad(m, 4, mode="edge"), iterations=3)[4:-4, 4:-4] for m in masks]
+    # Objects are never tape. The silver knife reads 52-69 % "tape" by colour, so lying in the square it cut the
+    # interior in two and only the part above it was found (live observe frame, 16 mm off). First every raised
+    # pixel is "not tape" (an object on the paper joins the interior); if that finds nothing, raised pixels are
+    # walls instead (an object lying across the tape would otherwise join the interior to the table).
+    # {KNIFE TAPE SHARE 081 "STRICT 0.69 LOOSE 0.84", 083 "0.61 / 0.83"; LIVE SNAPSHOT "HIT BBOX (336, 16, 742, 199)"}
+    # [CONFIDENCE: CONFIRMED 80% — synthetic objects on 076 in tests/test_drop_square.py; no real frame of it yet]
+    vv, uu = np.mgrid[0:H, 0:W]
+    raised = (d > 0) & (a * uu + b * vv + c - d > MIN_HEIGHT_MM)
+    masks = [m & ~raised for m in masks] + [m | raised for m in masks]
     for blue in masks:
         hit = _enclosed_white_hole(hsv, blue, min_area, (a, b, c))
         if hit:
@@ -512,8 +521,12 @@ def find_drop_square(rgb: np.ndarray, depth: np.ndarray, plane: tuple = None) ->
     # {SQ_76_80 "080: WHITE INTERIOR V 0-270 (TOUCHES THE TOP EDGE)" VS 076 "V 30-360"}
     # [CONFIDENCE: CONFIRMED 85% — seen on 080/082/084; partial rim check mirrors AGENT1's find_square ring test]
     # Strict tape mask only: with the loose one, transparent cups (bluish reflections, paper-like brightness) came
-    # back as border-cut squares on 000/016/032/056
-    return _enclosed_white_hole(hsv, masks[0], min_area * SQUARE_PARTIAL_AREA_FRAC, (a, b, c), border_cut=True)
+    # back as border-cut squares on 000/016/032/056 (masks[0]: strict, objects not tape; masks[2]: strict, objects walls)
+    for blue in (masks[0], masks[2]):
+        hit = _enclosed_white_hole(hsv, blue, min_area * SQUARE_PARTIAL_AREA_FRAC, (a, b, c), border_cut=True)
+        if hit:
+            return hit
+    return None
 
 
 # Paper reads light blue to this camera: PIL saturation median 52-60 (010-076), 66 (080), 103 (082), so the old
