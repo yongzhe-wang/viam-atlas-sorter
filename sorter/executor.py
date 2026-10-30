@@ -134,8 +134,13 @@ async def back_to_observe(rig) -> None:
     WHY: the module's idle loop takes its frames there (within +-15 mm / +-1 deg), so the next command's photo
     is current. Never raises: a failed return is reported by the next command, not by this one.
     """
+    if ppa.ESTOP["on"]:
+        print(f"  not returning to the observe pose: {ppa.ESTOP_STATUS}")
+        return
     try:
         await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
+        return
+    except ppa.EStop:
         return
     except Exception as e:
         print(f"  could not return to the observe pose: {e}; clearing the arm's error and rising first")
@@ -237,7 +242,11 @@ def ring_world(o, pose: dict, k: dict):
     return (float(c[0]), float(c[1])), math.sqrt(filled.sum() / math.pi) * mm, r_mid * mm
 
 
-REACH_MARGIN_MM = 15.0  # a grasp point is moved to at least MIN_GRASP_R_MM + this from the base when possible
+# A grasp point is moved to at least MIN_GRASP_R_MM + this from the base when possible, and approach refuses one
+# closer: near the base the arm's pose looked unsafe to the people at the table (the E-stop was pressed at r ~220)
+# {VIAM CENTERAL 2026-10-29 "DEMO 期间把 MIN_GRASP_R_MM + 15 改成 + 40（=245），宁可报 TOO_CLOSE"}
+REACH_MARGIN_MM = 40.0
+GRASP_END_MARGIN_MM = 15.0  # a grasp point moved along an object stays this far from its end
 
 
 def grasp_px(o, pose: dict = None, k: dict = None, wall_mm: float = None) -> tuple:
@@ -249,7 +258,7 @@ def grasp_px(o, pose: dict = None, k: dict = None, wall_mm: float = None) -> tup
     {VIAM CENTERAL 2026-10-29 "FOR ELONGATED OBJECTS, CHOOSE THE GRASP POINT AT THE HANDLE/THICKEST SECTION"}
     [CONFIDENCE: INFERRED 75% — perception.Obj.top_centroid_px is the top band within TOP_BAND_MM]
     Too close to the base there (< ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM): moved outward along the long axis, at
-    most to REACH_MARGIN_MM from the object's end.
+    most to GRASP_END_MARGIN_MM from the object's end.
     Ring (ring_geometry: the black tape roll, whose top centroid is in its hole and whose outside is wider than
     the jaws): on the middle of its wall, the point nearest the base among those at least MIN_GRASP_R_MM +
     REACH_MARGIN_MM from it (the far side when the near one is out of reach); yaw = the wall's tangent there, so
@@ -280,7 +289,7 @@ def grasp_px(o, pose: dict = None, k: dict = None, wall_mm: float = None) -> tup
         if axis @ g < 0:
             axis = -axis
         half = o.length_px * d / k["fx"] / 2.0
-        step = min(max(0.0, half - REACH_MARGIN_MM), max(0.0, want - float(np.hypot(*g))))
+        step = min(max(0.0, half - GRASP_END_MARGIN_MM), max(0.0, want - float(np.hypot(*g))))
         for s in np.arange(0.0, step + 0.1, 2.0):
             if np.hypot(*(g + s * axis)) >= want:
                 step = s
@@ -1096,6 +1105,8 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
             try:
                 await ppa.travel(rig, x, y, theta=0.0, z=z)
             except ppa.MoveRefused as e:
+                if isinstance(e, ppa.EStop):
+                    raise  # an emergency stop ends the task, never skipped like a refused pose
                 print(f"  search: skipping ({x:.0f},{y:.0f},{z:.0f}): {e}")
                 continue
         found = await look_here(rig, text, store, source="look" if path == "hint" else "demo")
@@ -1161,8 +1172,8 @@ async def approach(rig, found: dict, tracker) -> None:
     obj, k = found["obj"], intr(rig)
     u, v, yaw = grasp_px(obj, pose, k)
     xy = perception.world_xy(pose, k, u, v, obj.top_depth_mm)
-    # The jaws cannot reach down this close to the base: refuse before any servo time is spent
-    if math.hypot(*xy) < ppa.MIN_GRASP_R_MM:
+    # Too close to the base to grasp (reach and the people's comfort, REACH_MARGIN_MM): refuse before moving
+    if math.hypot(*xy) < ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM:
         raise ppa.TooClose(ppa.too_close_msg(*xy))
     top = obj.top_depth_mm - (pose["z"] - ppa.ALIGN_Z)  # camera height above it shrinks by the z change
     theta = wrist_for(pose, k, u, v, yaw, obj.top_depth_mm)
@@ -1257,6 +1268,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
     start_recording(rig, store, doc)
     t0 = time.monotonic()
     try:
+        if ppa.ESTOP["on"]:
+            raise ppa.EStop(ppa.ESTOP_STATUS)
         times["at"] = "find"
         found = None
         if target is not None and target.get("obj") is not None and abs(float((target.get("pose") or {}).get("theta", 99.0))) <= 1.0:
@@ -1336,6 +1349,9 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         doc["check"] = why
         if not right:
             doc.update(fail_phase="check", fail_reason=why)
+    except ppa.EStop:
+        # A person pressed the emergency stop: no recover, no retries, no move back
+        doc.update(status="estop", fail_phase=times.get("at", "start"), fail_reason=ppa.ESTOP_STATUS)
     except ppa.SquareFull as e:
         # Nothing free in the square: put it back where it came from and say so
         doc.update(status="square_full", fail_phase="place", fail_reason=str(e))
@@ -1351,7 +1367,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         times.pop("at", None)
         doc["phase_times"], doc["duration_s"] = times, round(time.monotonic() - t0, 1)
         finish(rig, store, doc)
-        STATE.update(times=None, error=doc["fail_reason"] if doc["status"] == "failed" else None)
+        STATE.update(times=None, error=doc["fail_reason"] if doc["status"] in ("failed", "estop") else None)
         await back_to_observe(rig)
     return doc
 
@@ -1364,6 +1380,9 @@ async def recover(rig, doc: dict) -> None:
     last refused spot, half on the square's tape. The pick spot is the one place known to fit this object, so
     the gripper opens only there (lowered to the measured table); with no pick spot known it keeps holding.
     """
+    if ppa.ESTOP["on"]:
+        doc["fail_reason"] = ppa.ESTOP_STATUS  # nothing is sent to the arm until a person resets
+        return
     try:
         await rig.lift()
         if await rig.holding():
@@ -1613,6 +1632,8 @@ async def drop_at(rig, height: float, grip: float, spots: list) -> tuple:
         try:
             await ppa.travel(rig, fx, fy, theta=theta)
         except ppa.MoveRefused as e:
+            if isinstance(e, ppa.EStop):
+                raise  # an emergency stop ends the task, never skipped like a refused pose
             print(f"  drop: ({xy[0]:.0f},{xy[1]:.0f}) refused: {e}")
             continue
         rgb, depth = await rig.frame()
@@ -1668,6 +1689,8 @@ async def go_over_square(rig) -> tuple:
             try:
                 await rig.goto(fx, fy, ppa.ALIGN_Z, theta=dt)
             except ppa.MoveRefused as e:
+                if isinstance(e, ppa.EStop):
+                    raise  # an emergency stop ends the task, never skipped like a refused pose
                 print(f"  square: wrist {dt:+.0f} view refused: {e}")
                 continue
             since = sq.get("since_ts")
@@ -1690,6 +1713,8 @@ async def go_over_square(rig) -> tuple:
                 try:
                     await ppa.travel(rig, fx, fy, theta=0.0)
                 except ppa.MoveRefused as e:
+                    if isinstance(e, ppa.EStop):
+                        raise  # an emergency stop ends the task, never skipped like a refused pose
                     print(f"  square: look pose refused: {e}")
                     return None
             sq, q = await look()
@@ -1723,6 +1748,8 @@ async def go_over_square(rig) -> tuple:
         try:
             await ppa.travel(rig, x, y, theta=0.0, z=z)
         except ppa.MoveRefused as e:
+            if isinstance(e, ppa.EStop):
+                raise  # an emergency stop ends the task, never skipped like a refused pose
             print(f"  square search: skipping ({x:.0f},{y:.0f},{z:.0f}): {e}")
             continue
         sq, _ = await look()
@@ -1758,6 +1785,11 @@ async def clear_square(rig, store) -> dict:
     start_recording(rig, store, doc)
     k = intr(rig)
     dropped, unreachable = [], []
+    if ppa.ESTOP["on"]:
+        # Reset pressed after the emergency stop was released: unlatch, clear the arm's error once
+        print(f"reset: clearing the emergency stop latch ({ppa.ESTOP['why']})")
+        ppa.ESTOP.update(on=False, why="")
+        await rig.clear_error()
     try:
         # The view the reset starts from (normally the observe pose, empty gripper): more table to drop on
         rgb0, depth0 = await rig.frame()
@@ -1806,6 +1838,8 @@ async def clear_square(rig, store) -> dict:
                         await approach(rig, {"obj": obj, "rgb": rgb, "depth": depth, "pose": q}, tracker)
                         height, grip = await ppa.pick(rig, None, tracker, align=False,
                                                       slipped=lambda c, d, p, t=tracker: still_on_table(rig, t, c, d, p))
+                    except ppa.EStop:
+                        raise
                     except ppa.TooClose as e:
                         # Lying by the base out of reach: a note, not a failed reset (the square itself is clear of it)
                         unreachable.append(footprint(rig, obj, q)["xy"])
@@ -1850,6 +1884,8 @@ async def clear_square(rig, store) -> dict:
         if not doc["success"]:
             doc.update(fail_phase="verify", fail_reason="objects still in the square")
         doc["img_after"] = jpeg((await rig.frame())[0])
+    except ppa.EStop:
+        doc.update(status="estop", fail_phase="reset", fail_reason=ppa.ESTOP_STATUS)
     except SquareNotCleared as e:
         # e.g. "red object: slipped 3x — clear by hand" (dashboard shows the fail_reason)
         doc.update(status="not_cleared", fail_phase="reset", fail_reason=str(e))
@@ -1871,6 +1907,8 @@ async def resume(rig, store):
     WHY: the SDK can abort the process mid-carry; the supervisor restarts it with the object still held.
     Height/grip come from data/arm_state.json (pick_place_auto.save_state); defaults fit the yellow block.
     """
+    if ppa.ESTOP["on"]:
+        return None  # nothing moves until a person resets after the emergency stop
     st = ppa.load_state()
     if not await rig.holding():
         if st.get("holding"):

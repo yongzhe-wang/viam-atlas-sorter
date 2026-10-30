@@ -505,6 +505,18 @@ class MoveRefused(RuntimeError):
     """The arm refused a call (planner, IK, collision, limits): the arm did not move; retrying will not help."""
 
 
+class EStop(MoveRefused):
+    """The xArm's emergency stop is pressed: no arm command until a person releases it and resets."""
+
+
+# Set when the arm reports its emergency stop; every later arm command (not reads) is refused here, without
+# reaching the arm, and clear_error is never sent, until Reset (executor.clear_square) clears it.
+# {VIAM CENTERAL 2026-10-29 "FAIL_REASON 里出现 'EMERGENCY STOP' 时，立刻停止所有重试和 RECOVER ... 不做 CLEAR_ERROR"}
+ESTOP = {"on": False, "why": ""}
+ESTOP_STATUS = "E-STOP pressed — release it, then press Reset on the dashboard"
+READ_CALLS = ("get pose", "get images", "holding", "frame system", "geometries")
+
+
 class Rig:
     """
     Holds the connection and wraps motion with the safety limits.
@@ -595,6 +607,8 @@ class Rig:
 
     async def call(self, what: str, fn):
         """Run `fn()` (a zero-arg coroutine factory using self.arm/cam/gripper), reconnecting on a dropped link."""
+        if ESTOP["on"] and what not in READ_CALLS:
+            raise EStop(f"{what} not sent: {ESTOP_STATUS}")
         last = None
         for wait in (0.0,) + RETRY_BACKOFF_S:
             if wait:
@@ -615,6 +629,11 @@ class Rig:
                 if not retryable(e):
                     if isinstance(e, GRPCError):
                         msg = str(e.message or e.status.name)
+                        if "emergency stop" in msg.lower():
+                            # A person stopped the arm: nothing more is sent, not even clear_error
+                            ESTOP.update(on=True, why=msg)
+                            print(f"  EMERGENCY STOP: {msg}; no arm commands until Reset")
+                            raise EStop(f"{what}: {msg}") from e
                         # A collision stop leaves the xArm in an error state that refuses every later move (the
                         # recovery lift too): clear it, so recover() can lift and put the object back
                         # {VIAM CENTERAL 2026-10-29 "RECOVER 前先对 ARM 发 {'CLEAR_ERROR': TRUE}"}
@@ -755,6 +774,9 @@ class Rig:
 
     async def clear_error(self) -> None:
         """Clear the xArm's error state (after a collision/overcurrent stop) so the next move is accepted; never fails."""
+        if ESTOP["on"]:
+            print("  clear_error not sent: the emergency stop is pressed")
+            return
         try:
             res = await asyncio.wait_for(self.arm.do_command({"clear_error": True}), 10.0)
             print(f"  arm error cleared: {res}")
@@ -1054,6 +1076,8 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
         try:
             await rig.descend(z_grasp, settle=False)  # the grab follows, no frame
+        except EStop:
+            raise
         except MoveRefused as e:
             # The planner refused the straight descent (the arm did not move): say why instead of retrying
             q = await rig.pose()
