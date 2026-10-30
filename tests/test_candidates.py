@@ -62,6 +62,13 @@ def test_category_word_prefers_the_graspable_one():
     assert "too flat" in c[1]["graspable_why"]
 
 
+def test_mm_bag_is_dark():
+    from types import SimpleNamespace as N
+    kind = N(recognised=None, recognised_conf=0.0, open_gate={"wrong_colour": "cyan", "food_gap": 0.05, "food_name": "kind bar"})
+    bag = N(recognised=None, recognised_conf=0.0, open_gate={"food_gap": 0.05, "food_name": "kind bar"})
+    assert "dark" in C._open_veto(kind) and C._open_veto(bag) == ""
+
+
 def test_explicit_name_is_not_overruled_by_graspability():
     kind = rec(crop(snack=0.20, mm=0.21, object=0.24), "granola bar", ["granola bar"], h=20.0)
     mm = rec(crop(snack=0.28, mm=0.29, object=0.21), h=7.0)

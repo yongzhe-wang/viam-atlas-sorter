@@ -96,6 +96,11 @@ OPEN_LIB_DELTA = 0.07
 # {JOB 21:36 KIND CROPS "M&M'S" - "KIND BAR": -0.029 -0.002 -0.092 -0.071; M&M CROPS +0.045 +0.038 +0.049 +0.055 +0.025}
 # [CONFIDENCE: INFERRED 75% — 4 KIND and 5 M&M crops, real embeddings; the margin is midway between the two groups]
 FOOD_SIBLING_MARGIN = 0.01
+# The M&M's bag is not in the library and CLIP's gap to the KIND bar is a few hundredths, too little on the arm: it reads dark,
+# the KIND bar cyan and the Sour Patch bag yellow. {USER 2026-10-30 "IT ALSO RECOGNIZE HTE MA DN MAS T HE KIND SNACK"}
+# {REPLAY 21:34:00 "BLACK NONE (467,-17)"; 21:36:29 "NONE CONF 0.00 CYAN"; 21:34:27 "YELLOW NONE (626,-143)"}
+# [CONFIDENCE: INFERRED 75% — colours from those stored detections; red is allowed because the bag's print is red]
+MM_BAG_COLOURS = ("black", "brown", "red")
 FOOD_WORDS = {"snack", "snacks", "candy", "candies", "chocolate", "treat", "treats", "food"}
 FOOD_NAME_WORDS = FOOD_WORDS | {"granola", "breakfast"}  # a library entry with one of these in a name is a food
 MM_FORMS = re.compile(r"\bm\s*(?:&|\+|\band\b|\bn\b)\s*m(?:'?s)?\b|\bmnms?\b|\bmms\b", re.I)
@@ -413,6 +418,8 @@ def rank(objs: list, text: str, store=None, recognised: list = None, known: bool
                 if food_labels:
                     sib = max(food_labels, key=lambda n: float(emb @ _name_emb(n)))
                     o.open_gate.update(food_gap=float(emb @ _name_emb(food_q)) - float(emb @ _name_emb(sib)), food_name=sib)
+                    if getattr(o, "colour", None) not in MM_BAG_COLOURS:
+                        o.open_gate.update(wrong_colour=getattr(o, "colour", None))
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
 
@@ -556,6 +563,8 @@ def _open_veto(o) -> str:
         return f"best candidate is recognised as {o.recognised!r} ({o.recognised_conf:.2f}): a known object is never another name"
     if g.get("x_gap") is not None and g["x_gap"] > OPEN_SET_DELTA:
         return f"best candidate is recognised as {o.recognised!r}"
+    if g.get("wrong_colour"):
+        return f"best candidate is {g['wrong_colour']}, the M&M's bag is dark"
     if g.get("food_gap") is not None and g["food_gap"] < FOOD_SIBLING_MARGIN:
         return f"best candidate looks more like {g['food_name']!r}"
     if o.recognised is None and g.get("lib_gap") is not None and g["lib_gap"] > OPEN_LIB_DELTA:
