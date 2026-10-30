@@ -18,6 +18,9 @@ DoCommand:
   {"grasp": "green square"}          decide + start in the background -> {"ok": true, "accepted": true, "job": id,
                                      "decide_ms": ..., "target": {...}} or {"ok": false, "reason": "no ... on the table"}
   {"grasp": "...", "wait": true}     same, but block until done -> the attempt summary
+  {"grasp": "screwdriver, snack and tape"}  several objects (up to 5): one job, item by item, each through the same
+                                     decision and retries; running.progress "item 2/3: snack"; result status done /
+                                     partial / failed with items: [{text, status, label, duration_s, fail_reason}]
   {"preview": "green square"}        the same decision without moving: what would be picked, or why not
   {"reset": true}                    clear the square (pick-out, wipe fallback, verify empty)
   {"scan_table": true}               scan the whole table into the live map (only on request: a grasp never scans
@@ -53,6 +56,7 @@ import inspect
 import io
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -105,6 +109,7 @@ MAP_PERSIST_S = 2.0  # live map -> Store.put_table_map at most this often (VIAM 
 MAP_TASK_EVERY_S = 1.0  # during a task, at most one executor frame per second goes to the live map (servo keeps CPU)
 IDLE_SIG_PX = 12  # idle pictures differ when a box centre moved this many pixels (or labels / intruders changed)
 IDLE_MAP_KEEPALIVE_S = 20.0  # ... else one idle picture this often still goes into the map and the log
+ITEM_SATISFIED = ("done", "already_in_square")  # a list item that needs nothing more: it is in the drop square
 OBS_PAGE_LIMIT = 200  # {"observations"}: records per page without images ...
 OBS_PAGE_IMAGES_LIMIT = 40  # ... and with them (a JPEG + depth PNG is ~60 KB on top of a ~11 KB record)
 OBS_PAGE_BYTES = 3_000_000  # a page stays under this much JSON: a DoCommand answer goes through one gRPC message
@@ -252,6 +257,7 @@ class GraspByDescription(Generic, EasyResource):
         self._sweeping = False  # while a sweep runs, every frame goes to the live map (none dropped)
         self._task_map_at = 0.0  # when the last other executor frame went to the live map
         self._thinned_at = 0.0  # when the observation log last checked free disk space
+        self._between_items = False  # a grasp_many job is deciding its next item, the arm parked at the observe pose
         self._idle_sig, self._idle_fed_at = None, 0.0  # last idle picture fed to the live map: what it showed, when
         self._no_target_warned = False
         self.timelapse_dir = (Path(module_data) if module_data else self.store.data) / "timelapse"
@@ -453,6 +459,10 @@ class GraspByDescription(Generic, EasyResource):
     def _busy(self) -> bool:
         return self.job is not None and not self.job.done()
 
+    def _arm_in_use(self) -> bool:
+        """A job is moving the arm. Not between the items of a list: it is parked at the observe pose then."""
+        return self._busy() and not self._between_items
+
     def _warm_sync(self) -> None:
         """
         Everything the first command would otherwise pay for: imports, CLIP in eval mode on every CPU thread,
@@ -580,7 +590,7 @@ class GraspByDescription(Generic, EasyResource):
         ms = {"frame": frame_ms, **ms, "total": _ms(t_all)}
         self.watch_period = SLOW_WATCH_PERIOD_S if ms["total"] > SLOW_LOOP_MS else WATCH_PERIOD_S
         pose2, still = await self._pose(rt)
-        if self._busy() or not still or max(abs(pose2[k] - pose[k]) for k in ("x", "y", "z")) > 2.0:
+        if self._arm_in_use() or not still or max(abs(pose2[k] - pose[k]) for k in ("x", "y", "z")) > 2.0:
             return  # arm moved meanwhile: this frame says nothing reliable about where things are now
         self._seen_raw = {"ts": t_cap, "recs": recs, "objs": [r["obj"] for r in recs], "rgb": rgb, "depth": depth,
                           "pose": pose}
@@ -612,7 +622,7 @@ class GraspByDescription(Generic, EasyResource):
         """Idle perception, every watch_period, once warm and while no job runs."""
         while True:
             await asyncio.sleep(self.watch_period)
-            if not self.warm or self._busy():
+            if not self.warm or self._arm_in_use():
                 continue
             try:
                 async with self._look_lock:
@@ -728,7 +738,7 @@ class GraspByDescription(Generic, EasyResource):
         """
         async with self._look_lock:  # the idle loop mid-look: wait for it and use its frame
             raw = self._seen_raw
-            if self._busy() or (raw is not None and time.time() - raw["ts"] <= SEEN_FRESH_S):
+            if self._arm_in_use() or (raw is not None and time.time() - raw["ts"] <= SEEN_FRESH_S):
                 return
             try:
                 await self._look()
@@ -770,7 +780,7 @@ class GraspByDescription(Generic, EasyResource):
         return {"id": int(o.id), "label": pick.get("recognised"), "colour": getattr(o, "colour", None),
                 "score": round(float(pick.get("score", 0.0)), 3), "bbox": _box(o.bbox)}
 
-    async def _from_map(self, text: str) -> Optional[dict]:
+    async def _from_map(self, text: str, any_match: bool = False) -> Optional[dict]:
         """
         The live map as a hint, never as an extra step (user: "just search, and if found just start grasp; do NOT
         have an initial step"). best_on_map() names an object -> {"found": True, "xy", "label", "seen_s_ago",
@@ -786,7 +796,7 @@ class GraspByDescription(Generic, EasyResource):
         b = await asyncio.to_thread(_runtime().table_map.best_on_map, m, text, self.store)
         out = {"decide_ms": _ms(t0), "map_age_s": round(now - float(m.get("ts") or 0.0), 1)}
         o = b.get("map_obj")
-        if o is not None and not b.get("ambiguous"):
+        if o is not None and (any_match or not b.get("ambiguous")):
             seen_ago = now - float(o.get("seen_ts") or m.get("ts") or 0.0)
             return {**out, "found": True, "xy": [round(float(v), 1) for v in b["xy"]], "label": o.get("label"),
                     "colour": o.get("colour"), "score": round(float(b.get("score") or 0.0), 3),
@@ -808,6 +818,64 @@ class GraspByDescription(Generic, EasyResource):
             return f"last seen at ({x:.0f}, {y:.0f}) {when}{edge}"
         return f"remembered at ({x:.0f}, {y:.0f}) on the table map, seen {when}{edge}"
 
+    async def _decision(self, text: str, any_match: bool = False) -> dict:
+        """
+        The one decision behind a grasp, a preview and each item of a list; moves nothing. One of:
+        {"via": "frame", "pick", "raw", "decide_ms"}: in the cached idle frame, go at once.
+        {"via": "map", "found", "seen_miss"}: the live map knows it, look there first.
+        {"via": "search", "pick", "seen_miss"}: search the table. seen_miss: the fresh frame was decided on and does
+        not show it, and the arm has not moved since (only jobs move it), so no second look from here.
+        {"status", "reason", "decide_ms", ...}: answer now: two equal matches, or already in the drop square.
+        any_match (a list item): several objects fitting the name is fine, the best match is taken and logged.
+        """
+        await self._fresh_look()
+        if self._between_items:  # what the last item changed must be on the map before deciding from it
+            t0 = time.monotonic()
+            while self.live is not None and self.live.busy() and time.monotonic() - t0 < 1.0:
+                await asyncio.sleep(0.02)
+        pick, decide_ms, raw = await self._decide(text)
+        if any_match and pick is not None and pick.get("obj") is not None and pick.get("ambiguous"):
+            LOGGER.info(f"list item {text!r}: several objects match, taking the best: {pick.get('recognised')!r} "
+                        f"({float(pick.get('score') or 0.0):.2f})")
+            pick = {**pick, "ambiguous": False}
+        refusal = self._refusal(pick, text) if pick is not None else None
+        if pick is not None and not refusal:
+            return {"via": "frame", "pick": pick, "raw": raw, "decide_ms": decide_ms}
+        if refusal and refusal[0] == "ambiguous":
+            return {"status": "ambiguous", "reason": refusal[1], "decide_ms": decide_ms, "decided_from_cache": True}
+        seen_miss = pick is not None and pick.get("obj") is None
+        found = await self._from_map(text, any_match)
+        if found is not None and not found["found"]:  # already in the drop square
+            return {"status": found["status"], "reason": found["reason"], "decide_ms": found["decide_ms"], "via": "map"}
+        if found is not None:
+            return {"via": "map", "found": found, "seen_miss": seen_miss}
+        return {"via": "search", "pick": pick, "seen_miss": seen_miss}
+
+    @staticmethod
+    def _frame_target(d: dict) -> dict:
+        """What the executor needs to pick from the cached frame (a frame decision of _decision)."""
+        raw = d["raw"]
+        return {**d["pick"], "rgb": raw["rgb"], "depth": raw["depth"], "pose": raw["pose"], "ts": raw["ts"]}
+
+    def _preview_reply(self, text: str, d: dict) -> dict:
+        """A decision as a preview's answer."""
+        if d.get("status"):
+            cached = {"decided_from_cache": True} if d.get("decided_from_cache") else {}
+            return {"ok": False, "status": d["status"], "reason": d["reason"], "decide_ms": d["decide_ms"], **cached}
+        if d["via"] == "frame":
+            return {"ok": True, "via": "frame", "target": self._target_summary(d["pick"]), "decide_ms": d["decide_ms"],
+                    "decided_from_cache": True, "frame_ts": d["raw"]["ts"]}
+        if d["via"] == "map":
+            found = d["found"]
+            return {"ok": True, "via": "map", "target_xy": found["xy"], "label": found["label"],
+                    "decide_ms": found["decide_ms"], "map_age_s": found["map_age_s"], "seen_s_ago": found["seen_s_ago"],
+                    "look_first": found["look_first"], "stale": found["stale"],
+                    "message": self._map_message(found) + ": a grasp would look there first"
+                               + (", then search the table" if found["stale"] else "")}
+        return {"ok": False, "via": "search", "status": "would_search",
+                "reason": f"{text!r} is not in view: a grasp would search the table and pick it at the first "
+                          f"view that shows it"}
+
     async def _preview(self, text: str) -> Dict[str, ValueTypes]:
         """
         What a grasp for `text` would do, without moving (dashboard Preview): pick from the cached frame, else
@@ -816,27 +884,7 @@ class GraspByDescription(Generic, EasyResource):
         busy_or_cold = self._not_ready()
         if busy_or_cold:
             return busy_or_cold
-        await self._fresh_look()  # same frame a grasp right now would decide from
-        pick, decide_ms, raw = await self._decide(text)
-        refusal = self._refusal(pick, text) if pick is not None else None
-        if pick is not None and not refusal:
-            return {"ok": True, "via": "frame", "target": self._target_summary(pick), "decide_ms": decide_ms,
-                    "decided_from_cache": True, "frame_ts": raw["ts"]}
-        if refusal and refusal[0] == "ambiguous":
-            return {"ok": False, "status": "ambiguous", "reason": refusal[1], "decide_ms": decide_ms,
-                    "decided_from_cache": True}
-        found = await self._from_map(text)
-        if found is None:
-            return {"ok": False, "via": "search", "status": "would_search",
-                    "reason": f"{text!r} is not in view: a grasp would search the table and pick it at the first "
-                              f"view that shows it"}
-        if found["found"]:
-            return {"ok": True, "via": "map", "target_xy": found["xy"], "label": found["label"],
-                    "decide_ms": found["decide_ms"], "map_age_s": found["map_age_s"], "seen_s_ago": found["seen_s_ago"],
-                    "look_first": found["look_first"], "stale": found["stale"],
-                    "message": self._map_message(found) + ": a grasp would look there first"
-                               + (", then search the table" if found["stale"] else "")}
-        return {"ok": False, "status": found["status"], "reason": found["reason"], "decide_ms": found["decide_ms"]}
+        return self._preview_reply(text, await self._decision(text))
 
     @staticmethod
     def _done_future():
@@ -861,6 +909,8 @@ class GraspByDescription(Generic, EasyResource):
     def _job_label(self) -> str:
         """What the running job is, for heartbeat, timelapse and seen_image captions."""
         kind = self.job_info.get("kind")
+        if self.job_info.get("progress"):
+            return f"grasp list: {self.job_info['progress']}"
         what = {"reset": "square", "scan": "table"}.get(kind) or self.job_info.get("text") or ""
         return f"{kind}: {what}"
 
@@ -885,6 +935,15 @@ class GraspByDescription(Generic, EasyResource):
     async def _run(self, kind: str, text: Optional[str], target: Optional[dict] = None,
                    decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
                    chosen: Optional[dict] = None, skip_current: bool = False) -> dict:
+        """A job of one grasp, reset or table scan: its attempts, then its result in `last`; never raises."""
+        summary = await self._attempts(kind, text, target, decide_ms, target_xy, chosen, skip_current)
+        # job id lets a DoCommand caller (the dashboard in module mode) match this result to its request
+        self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
+        return summary
+
+    async def _attempts(self, kind: str, text: Optional[str], target: Optional[dict] = None,
+                        decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
+                        chosen: Optional[dict] = None, skip_current: bool = False, any_match: bool = False) -> dict:
         """
         Run one grasp, reset or table scan to completion and return its summary; never raises.
 
@@ -898,6 +957,7 @@ class GraspByDescription(Generic, EasyResource):
         own "label" falls back to the colour (VIAM CENTERAL: a blue screwdriver came back as "label": "black").
         Retries (_retryable): up to GRASP_ATTEMPTS in all, each later one searching afresh; job_info["attempt"]
         says which try is running, and the summary's "attempts" lists every try when there was more than one.
+        any_match: a list item, so several objects fitting the name is fine (execute(accept_ambiguous=True)).
         """
         if target is not None:
             chosen = {"label": target.get("recognised"), "colour": getattr(target.get("obj"), "colour", None)}
@@ -906,7 +966,7 @@ class GraspByDescription(Generic, EasyResource):
         for n in range(1, tries + 1):
             self.job_info.update(attempt=n, attempts_max=tries)
             # skip_current only for the first try: a failed try moved the arm, so a retry looks from where it is
-            summary, run_via = await self._once(kind, text, target, target_xy, skip_current and n == 1)
+            summary, run_via = await self._once(kind, text, target, target_xy, skip_current and n == 1, any_match)
             # The first attempt's path names the job (frame / map / search); retries always search
             via = run_via if n == 1 else via
             if n == tries or not self._retryable(kind, summary):
@@ -925,8 +985,6 @@ class GraspByDescription(Generic, EasyResource):
             if summary.get("label") is not None and chosen:
                 summary.update(label=chosen.get("label") or summary["label"],
                                colour=summary.get("colour") or chosen.get("colour"))
-        # job id lets a DoCommand caller (the dashboard in module mode) match this result to its request
-        self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
         return summary
 
     @staticmethod
@@ -950,7 +1008,7 @@ class GraspByDescription(Generic, EasyResource):
                                              "SquareNotFound"))
 
     async def _once(self, kind: str, text: Optional[str], target: Optional[dict],
-                    target_xy: Optional[list], skip_current: bool = False) -> tuple:
+                    target_xy: Optional[list], skip_current: bool = False, any_match: bool = False) -> tuple:
         """One grasp attempt, reset or table scan -> (summary, via); never raises (an exception becomes "error")."""
         via = "scan" if kind == "scan" else "search"
         try:
@@ -972,6 +1030,8 @@ class GraspByDescription(Generic, EasyResource):
                     self._no_target_warned = True
                 if skip_current and target is None and "skip_current" in params:
                     kwargs["skip_current"] = True
+                if any_match and "accept_ambiguous" in params:
+                    kwargs["accept_ambiguous"] = True
                 doc = await rt.executor.execute(rig, text, self.store, mode="demo", **kwargs)
             elif kind == "scan":
                 doc = await self._scan(rt, rig)
@@ -1023,47 +1083,179 @@ class GraspByDescription(Generic, EasyResource):
         if cold:
             return cold
         rt = _runtime()
-        await self._fresh_look()
-        pick, decide_ms, raw = await self._decide(text)
-        refusal = self._refusal(pick, text) if pick is not None else None
-        if pick is not None and not refusal:
-            target = {**pick, "rgb": raw["rgb"], "depth": raw["depth"], "pose": raw["pose"], "ts": raw["ts"]}
+        d = await self._decision(text)
+        if d.get("status"):
+            cached = {"decided_from_cache": True} if d.get("decided_from_cache") else {}
+            self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": d["status"],
+                         "fail_phase": "find", "fail_reason": d["reason"], "decide_ms": d["decide_ms"], **cached}
+            via = {"via": d["via"]} if d.get("via") else {}
+            return {"ok": False, "accepted": False, "status": d["status"], "reason": d["reason"],
+                    "decide_ms": d["decide_ms"], **cached, **via}
+        if d["via"] == "frame":
             # fast_path: the executor will skip its own first observe (needs AGENT1's execute(..., target=...))
             fast = "target" in inspect.signature(rt.executor.execute).parameters
-            res = await self._start("grasp", text, wait, target=target, decide_ms=decide_ms)
+            res = await self._start("grasp", text, wait, target=self._frame_target(d), decide_ms=d["decide_ms"])
             if not res.get("accepted"):
                 return {**res, "ok": False}  # became busy while deciding
             return {**res, "ok": True, "via": "frame", "decided_from_cache": True, "fast_path": fast,
-                    "decide_ms": decide_ms, "target": self._target_summary(pick)}
-        if refusal and refusal[0] == "ambiguous":
-            self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": "ambiguous",
-                         "fail_phase": "find", "fail_reason": refusal[1], "decide_ms": decide_ms, "decided_from_cache": True}
-            return {"ok": False, "accepted": False, "status": "ambiguous", "reason": refusal[1], "decide_ms": decide_ms,
-                    "decided_from_cache": True}
-        # The fresh idle frame was decided on and does not show it; the arm has not moved since (only jobs move
-        # it): the search need not look from here again
-        seen_miss = pick is not None and pick.get("obj") is None
-        found = await self._from_map(text)
-        if found is not None and not found["found"]:  # already in the drop square
-            self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": found["status"],
-                         "fail_phase": "find", "fail_reason": found["reason"], "decide_ms": found["decide_ms"]}
-            return {"ok": False, "accepted": False, "status": found["status"], "reason": found["reason"],
-                    "decide_ms": found["decide_ms"], "via": "map"}
-        if found is not None:
+                    "decide_ms": d["decide_ms"], "target": self._target_summary(d["pick"])}
+        if d["via"] == "map":
+            found = d["found"]
             res = await self._start("grasp", text, wait, target_xy=found["xy"], decide_ms=found["decide_ms"],
                                     chosen={"label": found["label"], "colour": found.get("colour")},
-                                    skip_current=seen_miss)
+                                    skip_current=d["seen_miss"])
             return {**res, "ok": bool(res.get("accepted")), "via": "map", "status_text": "searching",
                     "message": self._map_message(found) + " · looking there first"
                                + (", then searching" if found["stale"] else ""), "stale": found["stale"],
                     "target_xy": found["xy"], "label": found["label"], "map_age_s": found["map_age_s"],
                     "seen_s_ago": found["seen_s_ago"], "look_first": found["look_first"],
                     "decide_ms": found["decide_ms"]}
-        res = await self._start("grasp", text, wait, skip_current=seen_miss)
+        res = await self._start("grasp", text, wait, skip_current=d["seen_miss"])
         return {**res, "ok": bool(res.get("accepted")), "via": "search", "status_text": "searching",
                 "message": "searching the table… (grasps at the first view that shows it)",
-                "why": "not in the cached frame" if pick is not None
+                "why": "not in the cached frame" if d["pick"] is not None
                 else f"no fresh frame from the observe pose ({self.seen.get('reason') or self.seen.get('error') or 'no look yet'})"}
+
+    # ---- a list of objects: one job, each item through the single-object decision ----------------------
+
+    def _parse(self, raw: str) -> tuple:
+        """(objects named by a command, those over MAX_OBJECTS, the text for the single-object path)."""
+        from sorter.multi_objects import MAX_OBJECTS, split_objects
+
+        try:
+            names = [n for row in self.store.list_labels() for n in row]
+        except Exception as e:
+            LOGGER.warning(f"no library names for the command text: {type(e).__name__}: {e}")
+            names = []
+        items = split_objects(raw, names, limit=None)
+        old = _runtime().clean(raw)
+        # One object: exactly today's text, unless the parser really changed it ("i want tape", "screw driver")
+        bare = re.sub(r"^(the|a|an)\s+", "", old.strip().lower())
+        single = old if not items or bare == items[0].lower() else items[0]
+        return items[:MAX_OBJECTS], items[MAX_OBJECTS:], single
+
+    async def _grasp_command(self, raw: str, wait: bool) -> Dict[str, ValueTypes]:
+        """A grasp as commanded: several objects -> one grasp_many job; one -> the single path, unchanged."""
+        items, extra, single = self._parse(raw)
+        if len(items) > 1:
+            return await self._grasp_many(items, extra, wait)
+        return await self._grasp(single, wait)
+
+    async def _preview_command(self, raw: str) -> Dict[str, ValueTypes]:
+        """A preview as commanded: several objects -> what each would pick, in order, without moving."""
+        items, extra, single = self._parse(raw)
+        if len(items) <= 1:
+            return await self._preview(single)
+        cold = self._not_ready()
+        if cold:
+            return cold
+        out = []
+        for item in items:
+            r = self._preview_reply(item, await self._decision(item, any_match=True))
+            out.append({"text": item, **r})
+        return {"ok": True, "via": "list", "items": out, "ignored": extra}
+
+    async def _grasp_many(self, items: list, extra: list, wait: bool) -> Dict[str, ValueTypes]:
+        """Start the grasp_many job: {"grasp": "screwdriver, snack and tape"} (VIAM CENTERAL)."""
+        if self._busy():
+            return {"ok": False, "accepted": False, "error": "busy", "running": dict(self.job_info)}
+        cold = self._not_ready()
+        if cold:
+            return cold
+        job_id, text = uuid.uuid4().hex[:12], ", ".join(items)
+        pending = [{"text": t, "status": "pending"} for t in items]
+        self.job_info = {"job": job_id, "kind": "grasp_many", "text": text, "started": time.time(), "via": "list",
+                         "fast_path": False, "items": pending}
+        self.job = asyncio.get_event_loop().create_task(self._run_many(text, items))
+        reply = {"ok": True, "accepted": True, "job": job_id, "via": "list", "items": pending, "ignored": extra,
+                 "message": f"{len(items)} objects, one after the other: {text}"}
+        return {**reply, **(await self.job)} if wait else reply
+
+    async def _list_item(self, text: str) -> dict:
+        """
+        One object of a list: the same decision and the same retries as a single grasp, except that several objects
+        fitting the name is fine (the best match is taken, logged). -> {text, status, label, duration_s, fail_reason, ...}
+        """
+        t0 = time.monotonic()
+        self._between_items = True  # the arm is parked at the observe pose: the idle look and the map may run
+        d = await self._decision(text, any_match=True)
+        if d.get("status"):
+            return {"text": text, "status": d["status"], "fail_reason": d["reason"], "via": d.get("via"),
+                    "duration_s": round(time.monotonic() - t0, 1)}
+        kw = {"decide_ms": d.get("decide_ms"), "skip_current": d.get("seen_miss", False)}
+        if d["via"] == "frame":
+            kw["target"] = self._frame_target(d)
+        elif d["via"] == "map":
+            found = d["found"]
+            kw.update(target_xy=found["xy"], decide_ms=found["decide_ms"],
+                      chosen={"label": found["label"], "colour": found.get("colour")})
+        self._between_items = False
+        try:
+            s = await self._attempts("grasp", text, any_match=True, **kw)
+        finally:
+            self._between_items = True
+            self._seen_raw = None  # however young, that frame is from before this item: the next one looks again
+        return {"text": text, "status": s.get("status"), "label": s.get("label"), "colour": s.get("colour"),
+                "score": s.get("score"), "duration_s": s.get("duration_s"), "via": s.get("via"), "_id": s.get("_id"),
+                "fail_reason": s.get("fail_reason") or s.get("error"), "tries": len(s.get("attempts") or []) or None}
+
+    @staticmethod
+    def _list_stop(item: dict) -> Optional[str]:
+        """
+        Why the rest of a list must not be tried, else None (VIAM CENTERAL): the E-stop, a dead link, an arm stopped
+        by overcurrent, something still in the gripper, or an error that leaves the arm's state unknown. Everything
+        else (not found, ambiguous, too close, too wide, square full, an ordinary failure) moves on to the next item.
+        """
+        status, why = item.get("status"), str(item.get("fail_reason") or "")
+        low = why.lower()
+        if status == "estop":
+            return "E-stop"
+        if status == "error":
+            return f"unexpected error: {why}"
+        if "link still down" in low or "could not connect" in low:
+            return f"robot link down: {why}"
+        if "overcurrent" in low:
+            return f"arm stopped on overcurrent: {why}"
+        if "still holding" in low or "recovery failed" in low:
+            return f"may still be holding something: {why}"
+        return None
+
+    async def _run_many(self, text: str, items: list) -> dict:
+        """The grasp_many job: item by item, back at the observe pose between them; never raises."""
+        t0, n, stop = time.monotonic(), len(items), None
+        results = [{"text": t, "status": "pending"} for t in items]
+        for k, item in enumerate(items, 1):
+            if stop:
+                results[k - 1] = {"text": item, "status": "skipped", "fail_reason": f"not tried: {stop}"}
+                continue
+            results[k - 1] = {"text": item, "status": "running"}
+            for key in ("search", "sweep", "attempt", "attempts_max"):
+                self.job_info.pop(key, None)
+            self.job_info.update(item={"k": k, "n": n, "text": item}, progress=f"item {k}/{n}: {item}",
+                                 items=[dict(r) for r in results])
+            try:
+                res = await self._list_item(item)
+            except Exception as e:  # e.g. the camera handle gone while deciding: the arm's state is not known
+                LOGGER.error(f"list item {item!r} failed: {type(e).__name__}: {e}")
+                res = {"text": item, "status": "error", "fail_reason": f"{type(e).__name__}: {e}"[:300]}
+            results[k - 1] = res
+            self.job_info["items"] = [dict(r) for r in results]
+            stop = self._list_stop(res)
+            if stop:
+                LOGGER.error(f"list stopped at item {k}/{n} {item!r}: {stop}")
+        self._between_items = False
+        ok = [r for r in results if r["status"] in ITEM_SATISFIED]
+        status = "done" if len(ok) == n else "partial" if ok else "failed"
+        summary = {"status": status, "items": results, "done": len(ok), "total": n, "via": "list",
+                   "duration_s": round(time.monotonic() - t0, 1),
+                   "label": ", ".join(r.get("label") or r["text"] for r in ok) or None}
+        if stop:
+            summary["stopped_by"] = stop
+        if status != "done":
+            summary["fail_reason"] = stop or "; ".join(f"{r['text']}: {r['status']}" for r in results
+                                                       if r["status"] not in ITEM_SATISFIED)
+        self.last = {"kind": "grasp_many", "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
+        return summary
 
     def _status(self) -> Dict[str, ValueTypes]:
         seen = dict(self.seen)
@@ -1121,10 +1313,11 @@ class GraspByDescription(Generic, EasyResource):
                     "now": time.time()}  # robot clock, so the dashboard can age objects without clock skew
         for key in ("grasp", "preview"):
             if key in command:
-                text = _runtime().clean(str(command.get(key) or ""))
-                if not text:
+                raw = str(command.get(key) or "")
+                if not _runtime().clean(raw):
                     return {"ok": False, "accepted": False, "error": f"say what to {key}, e.g. {{\"{key}\": \"green square\"}}"}
-                return await (self._grasp(text, bool(command.get("wait"))) if key == "grasp" else self._preview(text))
+                return await (self._grasp_command(raw, bool(command.get("wait"))) if key == "grasp"
+                              else self._preview_command(raw))
         if command.get("reset"):
             return await self._start("reset", None, bool(command.get("wait")))
         return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"preview\": \"<description>\"}, "
@@ -1162,7 +1355,7 @@ class GraspByDescription(Generic, EasyResource):
                         if text == "__reset__":
                             res = await self._start("reset", None, wait=True)
                         else:
-                            res = await self._grasp(_runtime().clean(text), wait=True)
+                            res = await self._grasp_command(text, wait=True)
                         status = res.get("status") or ("failed" if not res.get("accepted") else "done")
                         self.store.finish_command(cmd["_id"], status, res.get("_id"), res.get("label"))
                         continue

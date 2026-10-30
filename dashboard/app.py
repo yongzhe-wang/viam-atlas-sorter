@@ -261,7 +261,8 @@ def _module_worker() -> dict:
     running, last = s.get("running") or {}, s.get("last") or {}
     online = bool(st.get("ok")) and st["age_s"] is not None and st["age_s"] <= MODULE_STALE_S
     if s.get("busy"):
-        phase = f"{running.get('kind')}: {running.get('text') or 'square'}"
+        phase = (f"list {running['progress']}" if running.get("progress")
+                 else f"{running.get('kind')}: {running.get('text') or 'square'}")
     elif s.get("warm") is False:
         phase = "warming up"
     else:
@@ -287,13 +288,17 @@ def _sync_module_cmds() -> None:
         if c["status"] != "running":
             continue
         if s.get("busy") and running.get("job") == c.get("job"):
+            if running.get("items"):  # a list of objects: how far it is, and how each item went so far
+                c.update(progress=running.get("progress"), items=running["items"])
             continue
         same = last.get("job") == c.get("job") if last.get("job") else (last.get("finished") or 0) >= c["ts"]
         if last and same:
             c.update(status=last.get("status") or "done", finished=last.get("finished"), attempt_id=last.get("_id"),
                      fail_reason=last.get("fail_reason") or last.get("error"), duration_s=last.get("duration_s"),
+                     items=last.get("items"), stopped_by=last.get("stopped_by"), progress=None,
+                     # A list reports per item instead of one pick
                      chosen={"label": last.get("label"), "colour": last.get("colour"), "score": last.get("score")}
-                     if last.get("label") or last.get("colour") else None)
+                     if (last.get("label") or last.get("colour")) and not last.get("items") else None)
 
 
 async def module_call(command: dict) -> dict:
@@ -370,7 +375,7 @@ async def add_command(body: TextIn):
     _set_map_highlight(res, text)
     if res.get("accepted"):
         target = res.get("target") or {}
-        entry.update(status="running", job=res.get("job"),
+        entry.update(status="running", job=res.get("job"), items=res.get("items"), ignored=res.get("ignored"),
                      chosen={"label": target.get("label"), "colour": target.get("colour"), "score": target.get("score")}
                      if target else None)
     elif res.get("status") in ("not_found", "ambiguous", "already_in_square"):
@@ -460,7 +465,9 @@ def table_map():
         sightings = d.get("sightings") or []
         running = ((_module_state().get("status") or {}).get("running") or {})
         sweep = running.get("sweep") or None
-        search = {**running["search"], "text": running.get("text")} if running.get("search") else None
+        item = running.get("item") or {}  # a list of objects: the one being searched for, and which of how many
+        search = ({**running["search"], "text": item.get("text") or running.get("text"), "item": item or None}
+                  if running.get("search") else None)
         n_obs, live = d.get("observations"), d.get("live")
     else:
         m, sightings, robot_now = store.get_table_map(with_emb=False), store.list_sightings(), time.time()

@@ -49,7 +49,7 @@
            color: var(--ink); font-size: 14px; cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button:disabled { opacity: .5; cursor: default; }
-  #msg { min-height: 20px; color: var(--muted); font-size: 12px; margin-top: 6px; }
+  #msg { min-height: 20px; color: var(--muted); font-size: 12px; margin-top: 6px; white-space: pre-line; }
   #workers { margin-bottom: 12px; }
   .worker { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 10px;
             background: var(--bg); border-radius: 8px; margin-bottom: 6px; font-size: 13px; }
@@ -62,12 +62,15 @@
              font-size: 13px; font-weight: 600; }
   ul.cmds { list-style: none; margin: 10px 0 0; padding: 0; }
   ul.cmds li { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--chip); white-space: nowrap; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--chip); white-space: nowrap; align-self: flex-start; }
   .badge.pending { color: var(--warn); } .badge.running { color: var(--accent); }
   .badge.done { color: var(--ok); } .badge.failed, .badge.not_found, .badge.error { color: var(--bad); }
-  .badge.busy, .badge.rejected, .badge.ambiguous, .badge.too_wide, .badge.too_close, .badge.square_full { color: var(--warn); }
+  .badge.busy, .badge.rejected, .badge.ambiguous, .badge.too_wide, .badge.too_close, .badge.square_full, .badge.partial { color: var(--warn); }
+  .badge.estop, .badge.unsafe_grasp { color: var(--bad); }
   .badge.sending { color: var(--accent); } .badge.already_in_square { color: var(--ok); }
   .cmdfail { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
+  .cmditem { font-size: 12px; overflow-wrap: anywhere; }
+  .cmditem.bad { color: var(--bad); } .cmditem.wait { color: var(--muted); }
   #known { margin-top: 8px; font-size: 12px; line-height: 2; }
   .chip { display: inline-block; padding: 1px 9px; margin: 0 4px 0 0; border-radius: 999px; background: var(--chip);
           border: 1px solid var(--line); cursor: pointer; font-size: 12px; color: var(--ink); }
@@ -277,6 +280,20 @@ function renderWorkers(list) {
   }
 }
 
+// One item of a list: ✅ / ❌ with what was picked or why not; the ones not reached yet are plain
+const ITEM_OK = ["done", "already_in_square"];
+function itemRow(i) {
+  const wait = {pending: "·", running: "▶", skipped: "⏭"}[i.status];
+  const icon = wait || (ITEM_OK.includes(i.status) ? "✅" : "❌");
+  const what = i.status === "already_in_square" ? "already in the square"
+    : i.status === "done" ? (i.label && i.label !== i.text ? `→ ${i.label}` : "") : i.fail_reason || (wait ? "" : (i.status || "").replace(/_/g, " "));
+  const took = i.status === "done" && i.duration_s != null ? `${Number(i.duration_s).toFixed(0)} s` : "";
+  const row = el("div", `${icon} ${i.text}` + (what.startsWith("→") ? ` ${what}` : what ? ` · ${what}` : "") + (took ? ` · ${took}` : ""), "cmditem");
+  if (!wait && !ITEM_OK.includes(i.status)) row.classList.add("bad");
+  if (wait && i.status !== "running") row.classList.add("wait");
+  return row;
+}
+
 async function refreshCommands() {
   const list = await api("/api/commands?limit=12");
   const ul = $("cmds"); ul.replaceChildren();
@@ -292,7 +309,12 @@ async function refreshCommands() {
     left.appendChild(el("div", [hhmm(c.ts), chosen, decided, took].filter(Boolean).join(" · "), "muted"));
     // Last result straight from the module (or the worker): why it failed, so the demo needs no Atlas
     // square_full (AGENT1): the object went back where it was; the way on is to clear the square
-    if (c.fail_reason) left.appendChild(el("div", c.fail_reason + (c.status === "square_full" ? " · press Clear square" : ""), "cmdfail"));
+    if (c.fail_reason && !c.items) left.appendChild(el("div", c.fail_reason + (c.status === "square_full" ? " · press Clear square" : ""), "cmdfail"));
+    // A list of objects: where it is now, then every item with its result
+    if (c.progress) left.appendChild(el("div", c.progress, "muted"));
+    for (const i of c.items || []) left.appendChild(itemRow(i));
+    if (c.stopped_by) left.appendChild(el("div", `stopped: ${c.stopped_by}`, "cmdfail"));
+    if ((c.ignored || []).length) left.appendChild(el("div", `only 5 at a time, ignored: ${c.ignored.join(", ")}`, "muted"));
     li.appendChild(left);
     li.appendChild(el("span", (c.status || "").replace(/_/g, " "), "badge " + c.status));  // "already in square"
     ul.appendChild(li);
@@ -396,6 +418,7 @@ let commandPath = "queue";
 function sentMsg(r, what) {
   if (!r.module) return `queued: ${what}`;
   const ms = r.module.decide_ms != null ? ` (decided in ${r.module.decide_ms} ms)` : "";
+  if (r.module.items) return r.module.message + ((r.module.ignored || []).length ? ` (only 5 at a time, ignored: ${r.module.ignored.join(", ")})` : "");
   if (r.module.accepted) return `module started: ${what}${ms}`;
   if (r.module.reason) return `${r.module.reason}${ms}`;
   return r.module.error === "busy" ? `module is busy with "${r.module.running?.text || "a job"}", try again when it is idle` : `module refused: ${r.module.error}`;
@@ -408,6 +431,9 @@ $("b-prev").addEventListener("click", async () => {
     if (r.module) {
       // Module mode: the robot's own decision from its cached frame; the target is boxed green in the picture
       const m = r.module, ms = m.decide_ms != null ? ` (decided in ${m.decide_ms} ms)` : "";
+      // A list: what each item would do, one line each
+      const pv = (x) => x.target ? `would pick ${x.target.label || "#" + x.target.id} · ${Number(x.target.score).toFixed(2)}` : x.message || x.reason;
+      if (m.items) { $("msg").textContent = m.items.map((x) => `${x.text}: ${pv(x)}`).join("\n"); refreshCam(); return; }
       // frame path: a target; map path: a message (no target); otherwise why not / what a grasp would do
       $("msg").textContent = m.ok && m.target ? `would pick ${m.target.label || "#" + m.target.id} · ${Number(m.target.score).toFixed(2)}${ms}`
         : `${m.message || m.reason}${ms}`;
@@ -605,7 +631,8 @@ async function refreshMap() {
   placeLabels(svg, mk, marks, labels, fixed, frames);
   // A grasp's search (AGENT1's search_and_find): stops at the first view that shows the object and grasps
   const srch = d.search;
-  const head = srch && srch.n ? (srch.found ? `found ${srch.text ? `"${srch.text}" ` : ""}at view ${srch.k}, grasping`
+  const nth = srch && srch.item ? `item ${srch.item.k}/${srch.item.n} · ` : "";
+  const head = srch && srch.n ? nth + (srch.found ? `found ${srch.text ? `"${srch.text}" ` : ""}at view ${srch.k}, grasping`
                                             : `searching${srch.text ? ` for "${srch.text}"` : ""}… view ${srch.k}/${srch.n}`)
     : d.sweep && d.sweep.n ? `scanning table… pose ${d.sweep.k}/${d.sweep.n}`
     : m && m.cleared_s_ago != null && !(m.objects || []).length ? `map cleared ${agoText(m.cleared_s_ago)} · 0 objects`

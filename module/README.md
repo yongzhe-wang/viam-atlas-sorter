@@ -128,6 +128,19 @@ await sorter.do_command({"reset": True})                    # empty the square (
   (progress `pose k/N`). The idle loop also records each recognised object's last-seen table position
   (`Store.log_sighting`). `{"table_map": true}` returns the live map (each object with `seen_ts`), the sightings
   and the scan / search progress for the dashboard.
+- **Several objects in one command:** `{"grasp": "i want screw driver, and snack, and tape"}` becomes one job of up to
+  5 objects, in order (`sorter/multi_objects.py` cuts at `,` `and` `&` `then` `+`, drops the spoken lead-in, ignores
+  spaces when comparing with library names, and keeps a name like "blue and black screwdriver" whole). Each item goes
+  through the same decision and retries as a single grasp, with a fresh look from the observe pose before it, so what
+  was just delivered counts. If several objects fit an item's name, the best match is taken and logged instead of
+  answering `ambiguous`. `running.progress` reads `item 2/3: snack`, and the result is `done` / `partial` / `failed`
+  with `items: [{text, status, label, duration_s, fail_reason}]`. An item already in the square counts as done.
+  - Moves on to the next item: `not_found`, `ambiguous`, `too_close`, `too_wide`, `square_full`, `unsafe_grasp`,
+    `failed`.
+  - Stops, the rest `skipped`, `stopped_by` says why: the E-stop, a dead link, overcurrent, something possibly still
+    held, an unexpected error.
+
+  `{"preview": "..."}` answers item by item without moving. One object takes the single path, as before.
 - One job at a time. A request while busy returns `{"accepted": false, "error": "busy", "running": {...}}`.
 - Summaries contain `status` (`done`, `failed`, `not_found`, `ambiguous` = two objects match about equally,
   `already_in_square` = the named object is only in the drop square (answered at once, no sweep), `too_wide`,
