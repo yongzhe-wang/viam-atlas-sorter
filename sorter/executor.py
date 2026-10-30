@@ -193,7 +193,7 @@ async def find_target(rig, text: str, store) -> dict:
         objs = [o for o in seg.objects if not o.touches_edge and (hole is None or (o.mask & hole).sum() < 0.5 * o.mask.sum())]
         if not objs:
             continue
-        pick = clip_embed.best(objs, text, store)
+        pick = clip_embed.best(objs, text, store, rgb=rgb)
         pick["rgb"] = rgb
         if pick.get("obj") is not None:
             return pick
@@ -219,8 +219,13 @@ async def execute(rig, text: str, store, mode: str = "demo") -> dict:
         times["at"] = "find"
         found = await find_target(rig, text, store)
         obj = found.get("obj")
+        doc["decided_by"] = found.get("decided_by", "clip")  # "llm" when the LLM fallback made the choice
+        if found.get("llm"):
+            doc["llm"] = found["llm"]
         if obj is None:
-            doc.update(status="not_found", fail_phase="find", fail_reason=found.get("reason"))
+            # obj None + ambiguous: the LLM saw several matches (sorter/llm_choose.py) and named none
+            doc.update(status="ambiguous" if found.get("ambiguous") else "not_found", fail_phase="find",
+                       fail_reason=found.get("reason"))
             return doc
         doc.update(label=obj.colour or "object", score=round(float(found.get("score", 0.0)), 3),
                    margin=round(float(found.get("margin", 0.0)), 3), img_before=jpeg(found["rgb"]))

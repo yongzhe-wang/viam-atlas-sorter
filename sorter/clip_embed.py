@@ -280,7 +280,7 @@ def rank(objs: list, text: str, store=None, recognised: list = None) -> list:
     return sorted(out, key=lambda t: -t[1])
 
 
-def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
+def best(objs: list, text: str, store=None, recognised: list = None, rgb: np.ndarray = None) -> dict:
     """
     The object to pick for `text`, or a reason not to pick anything.
 
@@ -288,6 +288,10 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
     laptop key, and with only the green cylinder in view it would grab the cylinder. Refuses when the colour
     is wrong, when the library recognises the best candidate as a different object, or when the match is weak.
     `recognised`: recognise_all() output; then objs may be None and no crop is embedded again.
+    `rgb`: the frame the objects were found in. With it, and SORTER_LLM enabled, a vision-language model is
+    asked which numbered object was meant (sorter/llm_choose.py): only when this decision refuses or is
+    ambiguous (fallback), or every time (always). Its answer replaces the CLIP decision; "decided_by" says
+    which one decided ("clip" or "llm"), "llm" holds the model's verdict. Without rgb nothing changes.
     Returns {"obj", "score", "margin", "ambiguous", "reason", "recognised", "searchable"}; obj is None when
     refusing. searchable = refused, but the library knows what was named: it is just not in this view, so the
     caller should look where the library last saw it (where_is). Use the flag, not the reason text: "no green
@@ -320,4 +324,27 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
     else:
         out.update(obj=o, ambiguous=margin < AMBIGUOUS_MARGIN)
     out["searchable"] = out["obj"] is None and known
+    out["decided_by"] = "clip"
+    return _llm_override(out, objs, text, rgb)
+
+
+def _llm_override(out: dict, objs: list, text: str, rgb) -> dict:
+    """Let the LLM decide when enabled and CLIP refused / was unsure (or always). Keeps `out` on any failure."""
+    from sorter import llm_choose
+
+    m = llm_choose.mode()
+    if rgb is None or not objs or m == "off" or (m == "fallback" and out["obj"] is not None and not out["ambiguous"]):
+        return out
+    v = llm_choose.choose(rgb, objs, clean_query(text) or text)
+    if v is None:  # disabled, no key, offline, timeout or unusable answer: CLIP's decision stands
+        return out
+    out["llm"] = {"status": v["status"], "reason": v["reason"], "ms": v["ms"], "clip_reason": out["reason"]}
+    out["decided_by"] = "llm"
+    if v["status"] == "ok":
+        o = objs[v["index"]]
+        out.update(obj=o, ambiguous=False, reason="", recognised=getattr(o, "recognised", None), searchable=False)
+    elif v["status"] == "ambiguous":
+        out.update(obj=None, ambiguous=True, reason=v["reason"] or "several objects match", searchable=False)
+    else:  # none: refuse, but stay searchable if the library knows the name (it may be out of view)
+        out.update(obj=None, ambiguous=False, reason=v["reason"] or "nothing matches")
     return out
