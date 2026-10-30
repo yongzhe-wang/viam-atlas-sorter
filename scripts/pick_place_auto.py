@@ -1082,11 +1082,16 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
             # Held at the grab, gone after the lift: the red box cutter (16 mm, gripped by its top 3-4 mm) slipped
             # and the reset went on to "place" an empty gripper. The caller's retry looks again.
             # {VIAM CENTERAL 2026-10-29 "滑落检查改用画面 ... HOLDING() 只作为辅助"}
-            gone, why = not await rig.holding(), "the gripper reports nothing held"
-            if not gone and slipped is not None:
+            # The picture decides when there is one: the G2's holding() is wrong both ways (True with the knife
+            # gone, False with the blue block still held, which then dropped back into the square when opened)
+            held = await rig.holding()
+            if slipped is not None:
                 q = await rig.pose()
                 rgb, depth = await rig.frame()
                 gone, why = slipped(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
+                print(f"  after the lift: holding() {held}; picture: {why}")
+            else:
+                gone, why = not held, "the gripper reports nothing held"
             if gone:
                 rig.picked_at = None
                 await rig.open()
