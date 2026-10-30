@@ -139,18 +139,28 @@ def _sync_command(s: dict) -> Optional[dict]:
     The newest command, updated from the module's status: running while its job is the module's current job (a list
     with its progress and items so far), then the module's last result once that names the same job.
     """
+    running, last = s.get("running") or {}, s.get("last") or {}
+    # A job the module's queue started has no entry here yet: it gets one, so it shows like a typed command
+    if s.get("busy") and running.get("job") and not any(e.get("job") == running.get("job") for e in module_cmds):
+        module_cmds.appendleft({"_id": uuid.uuid4().hex, "text": running.get("text") or "", "ts": time.time(),
+                                "status": "running", "job": running.get("job")})
     if not module_cmds:
         return None
-    c = module_cmds[0]
-    running, last = s.get("running") or {}, s.get("last") or {}
-    if c["status"] == "running":
+    # Finished jobs by id (last + the module's recent list): a queued job can start and end between two polls
+    done = {r.get("job"): r for r in [last, *(s.get("recent") or [])] if r.get("job")}
+    for c in module_cmds:
+        if c["status"] != "running":
+            continue
         if s.get("busy") and running.get("job") == c.get("job"):
             c.update(progress=running.get("progress"), items=running.get("items") or c.get("items"))
-        elif last.get("job") and last.get("job") == c.get("job"):
-            c.update(status=last.get("status") or "done", fail_reason=last.get("fail_reason") or last.get("error"),
-                     duration_s=last.get("duration_s"), items=last.get("items"), stopped_by=last.get("stopped_by"),
-                     progress=None, label=None if last.get("items") else last.get("label"))
-    return c
+        elif c.get("job") in done:
+            r = done[c["job"]]
+            c.update(status=r.get("status") or "done", fail_reason=r.get("fail_reason") or r.get("error"),
+                     duration_s=r.get("duration_s"), items=r.get("items"), stopped_by=r.get("stopped_by"),
+                     progress=None, label=None if r.get("items") else r.get("label"))
+    # Shown: the running job, else the newest command (queued ones wait in the queue chips)
+    return next((c for c in module_cmds if c["status"] == "running"),
+                next((c for c in module_cmds if c["status"] != "queued"), module_cmds[0]))
 
 
 def _slim_map(d: dict) -> Optional[dict]:
@@ -196,6 +206,7 @@ def live():
         "seen": {"objects": len(seen.get("objects") or []), "intruders": len(seen.get("intruders") or []),
                  "at_observe": seen.get("at_observe")},
         "command": _sync_command(s),
+        "queue": list(s.get("queue") or []),  # objects waiting for the arm, in order (module FIFO)
         "library": {"store": s.get("store"), "views": (s.get("atlas") or {}).get("views") or lib.get("views")},
         "teach": bool((s.get("teach") or {}).get("enabled")),
         "map": _slim_map(mp), "search": mp.get("search") or None, "sweep": mp.get("sweep") or None,
@@ -252,7 +263,9 @@ def _new_command(text: str) -> dict:
 
 def _answered(entry: dict, res: dict) -> None:
     """What the module said at once: a job started, nothing to do (and why), busy, or refused."""
-    if res.get("accepted"):
+    if res.get("queued"):
+        entry.update(status="queued", progress=f"#{res.get('position')} in the queue")
+    elif res.get("accepted"):
         entry.update(status="running", job=res.get("job"), items=res.get("items"), ignored=res.get("ignored"))
     elif res.get("status"):
         entry.update(status=res["status"], fail_reason=res.get("reason") or res.get("error"))

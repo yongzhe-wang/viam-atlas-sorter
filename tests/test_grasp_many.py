@@ -221,8 +221,12 @@ async def main():
     L0 = LOOKS[0]
     r = await s.do_command({"grasp": "tape, snack, mouse"})
     assert r["accepted"] and r["via"] == "list" and [i["text"] for i in r["items"]] == ["tape", "snack", "mouse"], r
-    assert (await s.do_command({"grasp": "x and y"}))["error"] == "busy"
-    assert (await s.do_command({"reset": True}))["error"] == "busy"
+    # busy: each object joins the queue, in order {USER 2026-10-30 "CAN WE MAKE A QUEUE HERE"}
+    q = await s.do_command({"grasp": "x and y"})
+    assert q["accepted"] and q["queued"] and q["queue"] == ["x", "y"] and q["position"] == 1, q
+    q = await s.do_command({"grasp": "z"})
+    assert q["queued"] and q["position"] == 3 and (await s.do_command({"status": True}))["queue"] == ["x", "y", "z"], q
+    assert (await s.do_command({"reset": True}))["error"] == "busy" and s.queue == []  # a reset empties the queue
     assert await wait_for(lambda: len(calls) == 2)
     status = await s.do_command({"status": True})
     run = status["running"]
@@ -233,8 +237,21 @@ async def main():
     await s.job
     HOLD[0] = 0.05
     assert LOOKS[0] - L0 >= 3 and s._between_items is False and s.last["job"] == r["job"], (LOOKS[0] - L0, s.last)
-    print(f"8. running: {run['progress']!r}, items {[i['status'] for i in run['items']]}; busy refused; {LOOKS[0] - L0} looks "
+    print(f"8. running: {run['progress']!r}, items {[i['status'] for i in run['items']]}; busy queues; {LOOKS[0] - L0} looks "
           f"from the observe pose (one before each item); last only at the end")
+
+    # The queue runs by itself: what was asked for while busy starts, one by one, once the arm is free
+    HOLD[0] = 0.3
+    calls.clear()
+    r = await s.do_command({"grasp": "tape"})
+    q = await s.do_command({"grasp": "snack, mouse"})
+    assert r["accepted"] and not r.get("queued") and q["queued"] and q["queue"] == ["snack", "mouse"], (r, q)
+    assert await wait_for(lambda: [c["text"] for c in calls] == ["tape", "snack", "mouse"] and not s.queue
+                          and not s._busy()), ([c["text"] for c in calls], s.queue)
+    assert [j.get("text") for j in s.recent][:3] == ["mouse", "snack", "tape"], list(s.recent)
+    assert (await s.do_command({"clear_queue": True}))["cleared"] == 0
+    HOLD[0] = 0.05
+    print("8b. busy -> queued (a comma list one entry per object); started in order once free; recent jobs kept by id")
 
     calls.clear()
     MAP["remembered"] = {"label": "blue block", "xy": [410.0, 40.0], "colour": "blue", "seen_ts": time.time()}

@@ -38,7 +38,9 @@ DoCommand:
   {"rebuild_map": {"since": ts}}     rebuild the live map from the observation log (every frame folded in is
                                      logged) since ts, default the current epoch; needs AGENT3's fold_observations
 The map also starts empty at every module start: the table may have changed while the module was down.
-One job at a time; a second request while busy returns {"accepted": false, "error": "busy"}.
+One job at a time; a grasp while busy (or while others wait) joins a FIFO queue: {"accepted": true, "queued": true,
+"queue": [...], "position": n}, each object of a comma list its own entry, started one by one as single grasps when
+the arm is free (not while the E-stop is latched). {"reset": true} and {"clear_queue": true} empty the queue.
 
 Config attributes (all optional except where the defaults don't match your machine):
   arm, gripper, camera            resource names, default "arm", "gripper", "cam"; declared as dependencies
@@ -53,6 +55,7 @@ AGENT3's (sorter/perception.py, sorter/clip_embed.py); this file only adapts the
 """
 import asyncio
 import base64
+import collections
 import difflib
 import hashlib
 import inspect
@@ -113,6 +116,8 @@ TIMELAPSE_EVERY_S = 5.0  # rolling timelapse for a backup demo video: one frame 
 TIMELAPSE_KEEP_S = 2 * 3600.0  # ... kept for the last 2 hours
 MAP_FRESH_S = 60.0  # a live-map object seen this recently is gone to directly; a sweep this recent covers the table
 MAP_PERSIST_S = 2.0  # live map -> Store.put_table_map at most this often (VIAM CENTERAL)
+QUEUE_POLL_S = 0.2  # how soon the next queued object starts once the arm is free
+RECENT_JOBS = 12  # finished jobs kept for {"status"}["recent"]: the dashboard matches queue-started jobs by id
 MAP_TASK_EVERY_S = 1.0  # during a task, at most one executor frame per second goes to the live map (servo keeps CPU)
 IDLE_SIG_PX = 12  # idle pictures differ when a box centre moved this many pixels (or labels / intruders changed)
 IDLE_MAP_KEEPALIVE_S = 20.0  # ... else one idle picture this often still goes into the map and the log
@@ -253,6 +258,10 @@ class GraspByDescription(Generic, EasyResource):
         self.job: Optional[asyncio.Task] = None
         self.job_info: Dict[str, Any] = {}
         self.last: Dict[str, Any] = {}
+        # Objects asked for while the arm was busy, in order (user: "can we make a queue here" / "and common separate is
+        # also accomdate to the queue"); _queue_loop starts each as a single grasp once the arm is free
+        self.queue: list = []
+        self.recent: collections.deque = collections.deque(maxlen=RECENT_JOBS)  # newest first, see _remember
         self.warm, self.warm_ms, self.warm_error = False, None, None
         self.watch_period = WATCH_PERIOD_S
         self.seen: Dict[str, Any] = {}  # summary of the latest idle look, for status / dashboard
@@ -276,7 +285,8 @@ class GraspByDescription(Generic, EasyResource):
         # Start from an empty table: the saved map and sightings go to history before anything can find from them
         self._forgotten = loop.create_task(self._forget_table("module start"))
         self.tasks = [loop.create_task(self._heartbeat_loop()), loop.create_task(self._warmup()),
-                      loop.create_task(self._watch_loop()), loop.create_task(self._timelapse_loop())]
+                      loop.create_task(self._watch_loop()), loop.create_task(self._timelapse_loop()),
+                      loop.create_task(self._queue_loop())]
         if attrs.get("consume_dashboard_commands", False):
             self.tasks.append(loop.create_task(self._command_loop()))
         LOGGER.info(f"{config.name}: store {'Atlas' if self.store.online else 'local JSONL'}, "
@@ -960,6 +970,7 @@ class GraspByDescription(Generic, EasyResource):
         summary = await self._attempts(kind, text, target, decide_ms, target_xy, chosen, skip_current, any_match)
         # job id lets a DoCommand caller (the dashboard in module mode) match this result to its request
         self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
+        self._remember()
         return summary
 
     async def _attempts(self, kind: str, text: Optional[str], target: Optional[dict] = None,
@@ -1233,6 +1244,7 @@ class GraspByDescription(Generic, EasyResource):
             cached = {"decided_from_cache": True} if d.get("decided_from_cache") else {}
             self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": d["status"],
                          "fail_phase": "find", "fail_reason": d["reason"], "decide_ms": d["decide_ms"], **cached}
+            self._remember()
             via = {"via": d["via"]} if d.get("via") else {}
             return {"ok": False, "accepted": False, "status": d["status"], "reason": d["reason"],
                     "decide_ms": d["decide_ms"], **cached, **via}
@@ -1308,6 +1320,14 @@ class GraspByDescription(Generic, EasyResource):
     async def _grasp_command(self, raw: str, wait: bool) -> Dict[str, ValueTypes]:
         """A grasp as commanded: several objects -> one grasp_many job; one -> the single path, unchanged."""
         items, extra, single = self._parse(raw)
+        # Busy, or others already waiting (first come, first served): each object joins the queue, nothing is refused
+        # {USER 2026-10-30 "CAN WE MAKE A QUEUE HERE" / "AND COMMON SEPARATE IS ALSO ACCOMDATE TO THE QUEUE"}
+        if not wait and (self._busy() or self.queue):
+            add = (items + extra) or [single]
+            self.queue.extend(add)
+            LOGGER.info(f"queued {add} (queue now {self.queue})")
+            return {"ok": True, "accepted": True, "queued": True, "queue": list(self.queue),
+                    "position": len(self.queue) - len(add) + 1, "items": [{"text": t, "status": "queued"} for t in add]}
         if len(items) > 1:
             return await self._grasp_many(items, extra, wait)
         return await self._grasp(single, wait)
@@ -1405,6 +1425,7 @@ class GraspByDescription(Generic, EasyResource):
             summary["fail_reason"] = stop or "; ".join(f"{r['text']}: {r['status']}" for r in results
                                                        if r["status"] not in grasp_policy.ITEM_SATISFIED)
         self.last = {"kind": "grasp_many", "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
+        self._remember()
         return summary
 
     def _status(self) -> Dict[str, ValueTypes]:
@@ -1412,6 +1433,7 @@ class GraspByDescription(Generic, EasyResource):
         if seen.get("ts"):
             seen["age_s"] = round(time.time() - seen["ts"], 1)
         return {"busy": self._busy(), "running": dict(self.job_info) if self._busy() else {}, "last": dict(self.last),
+                "queue": list(self.queue), "recent": list(self.recent),
                 "store": "atlas" if self.store.online else "jsonl", "worker_id": self.worker_id,
                 "library": dict(self.library), "warm": self.warm, "warm_ms": self.warm_ms,
                 "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats(),
@@ -1479,7 +1501,11 @@ class GraspByDescription(Generic, EasyResource):
                               else self._preview_command(raw))
         if "teach" in command:
             return await self._teach_command(command)
+        if command.get("clear_queue"):
+            n, self.queue[:] = len(self.queue), []
+            return {"ok": True, "cleared": n}
         if command.get("reset"):
+            self.queue.clear()  # a reset starts over: nothing asked for before it is still wanted
             return await self._start("reset", None, bool(command.get("wait")))
         return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"preview\": \"<description>\"}, "
                          "{\"reset\": true}, {\"scan_table\": true}, {\"clear_map\": true}, {\"rebuild_map\": {}}, "
@@ -1488,6 +1514,29 @@ class GraspByDescription(Generic, EasyResource):
                          "{\"seen_image\": true} or {\"table_map\": true}"}
 
     # ---- background loops --------------------------------------------------------------------------
+
+    def _remember(self) -> None:
+        """self.last, slimmed, into self.recent: a queued object's job starts and ends between two dashboard polls."""
+        keep = ("kind", "text", "job", "finished", "status", "fail_reason", "error", "duration_s", "items", "stopped_by",
+                "label")
+        self.recent.appendleft({k: self.last[k] for k in keep if self.last.get(k) is not None})
+
+    async def _queue_loop(self) -> None:
+        """The next queued object as a single grasp whenever the arm is free; held while the E-stop is latched."""
+        while True:
+            await asyncio.sleep(QUEUE_POLL_S)
+            try:
+                if not self.queue or self._busy() or not self.warm or (getattr(_runtime().ppa, "ESTOP", None) or {}).get("on"):
+                    continue
+                text = self.queue.pop(0)
+                res = await self._grasp(text, wait=False)
+                if res.get("error") == "busy":  # another command started first: still the next one
+                    self.queue.insert(0, text)
+                    continue
+                LOGGER.info(f"from the queue: {text!r} -> {res.get('status') or ('started' if res.get('accepted') else res)}"
+                            f" ({len(self.queue)} left)")
+            except Exception as e:
+                LOGGER.warning(f"queue: {type(e).__name__}: {e}")
 
     async def _heartbeat_loop(self) -> None:
         """Dashboard worker panel: what this service is doing, every HEARTBEAT_S."""

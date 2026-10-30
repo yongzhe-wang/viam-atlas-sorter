@@ -46,7 +46,7 @@
   #job { font-size: 13px; }
   #job .top { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
   .badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); }
-  .badge.done, .badge.already_in_bucket, .badge.already_in_square { color: var(--ok); } .badge.running, .badge.sending { color: var(--accent); }
+  .badge.done, .badge.already_in_bucket, .badge.already_in_square { color: var(--ok); } .badge.running, .badge.sending, .badge.queued { color: var(--accent); }
   .badge.failed, .badge.error, .badge.estop, .badge.rejected, .badge.not_found { color: var(--bad); }
   .items { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 2px; }
   .items li { display: flex; flex-wrap: wrap; gap: 0 8px; } .items .why { color: var(--muted); }
@@ -55,6 +55,10 @@
   details { margin-top: 10px; } summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
   #more-msg { font-size: 13px; margin-top: 6px; }
+  #queue { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  #queue:empty { display: none; }
+  #queue .chip { font-size: 13px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line, #444); color: var(--muted); }
+  #queue .chip.now { color: var(--accent); border-color: var(--accent); font-weight: 600; }
   .camwrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; }
   #cam, #boxes { position: absolute; inset: 0; width: 100%; height: 100%; }
   #cam { object-fit: contain; display: block; }
@@ -84,6 +88,7 @@
       <button type="button" id="b-reset" title="Clear the drop target; after an E-stop, release it first">Reset</button>
     </form>
     <div id="state" class="warn"><i>…</i><span>connecting to the robot</span></div>
+    <div id="queue" aria-label="queue: what the arm picks next, in order"></div>
     <div id="job"></div>
     <div id="more-msg"></div>
   </section>
@@ -269,6 +274,17 @@ function renderJob(c) {
   if (c.stopped_by) box.appendChild(el("div", `stopped: ${c.stopped_by}`, "fail"));
 }
 
+// The queue under the state line: what runs now (highlighted), then what waits, in order
+function renderQueue(d) {
+  const box = $("queue");
+  box.replaceChildren();
+  const q = d.queue || [];
+  if (!q.length) return;
+  const r = d.running, now = r && (r.item ? r.item.text : r.kind === "grasp" ? r.text : null);
+  if (now) box.appendChild(el("span", `now: ${now}`, "chip now"));
+  q.forEach((t, i) => box.appendChild(el("span", `#${i + 1} ${t}`, "chip")));
+}
+
 function offline() {
   const p = $("conn");
   p.className = "pill warn"; p.textContent = "reconnecting…";
@@ -285,6 +301,7 @@ function render(d) {
   const [cls, icon, text] = stateLine(d), s = $("state");
   s.className = cls; s.firstElementChild.textContent = icon; s.lastElementChild.textContent = text;
   renderJob(d.command);
+  renderQueue(d);
   const fps = shown.length > 1 ? (shown.length - 1) / ((shown[shown.length - 1] - shown[0]) / 1000) : 0;
   const age = d.frame_age_s;
   $("cam-meta").textContent = age == null ? "" : age > 3 ? `no new picture for ${agoText(age)}${d.busy ? " (arm moving)" : ""}`
