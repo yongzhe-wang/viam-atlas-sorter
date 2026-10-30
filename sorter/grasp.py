@@ -114,7 +114,8 @@ def ring_world(o, pose: dict, k: dict):
 # A grasp point is moved to at least MIN_GRASP_R_MM + this from the base when possible, and approach refuses one
 # closer: near the base the arm's pose looked unsafe to the people at the table (the E-stop was pressed at r ~220)
 # {VIAM CENTERAL 2026-10-29 "DEMO 期间把 MIN_GRASP_R_MM + 15 改成 + 40（=245），宁可报 TOO_CLOSE"}
-REACH_MARGIN_MM = 40.0
+# {VIAM CENTERAL 2026-10-30 "REACH 下限按我之前说的放到 225"}: + 20; a descent the planner refuses is still TooClose
+REACH_MARGIN_MM = 20.0
 GRASP_END_MARGIN_MM = 15.0  # a grasp point moved along an object stays this far from its end
 
 
@@ -367,9 +368,7 @@ async def pick_flat(rig, times: dict, slipped=None, height: float = 7.0) -> tupl
     await rig.wait_clear(ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table))
     z = max(rig.floor_z, ppa.MIN_GRASP_Z_THIN)
     print(f"  table={table:.0f}mm -> flat grasp z={z:.0f} (floor {rig.floor_z:.0f})")
-    why = ppa.finger_obstacle(rig.last_depth, rig.fx, rig.fy, rig.cx, rig.cy, z0 - z + ppa.TIP_BELOW_CAM, table)
-    if why is not None:
-        raise ppa.UnsafeGrasp(f"not descending: {why}")
+    await ppa.clear_landing(rig, z0, z, table, table - height)
     try:
         await rig.descend(z, settle=False)  # the grab follows, no frame
     except ppa.EStop:
@@ -493,9 +492,7 @@ async def pick_inside(rig, times: dict, finder, check=None, slipped=None, inner_
     z = max(z0 - (top + grip - ppa.TIP_BELOW_CAM), rig.floor_z, hard)
     print(f"  table={table:.0f}mm top={top:.0f}mm height={height:.0f}mm hole {inner_mm:.0f}mm -> into the hole, z={z:.0f}")
     # wait_clear's frame, at this pose: the closed fingers' way into the hole must be free
-    why = ppa.finger_obstacle(rig.last_depth, rig.fx, rig.fy, rig.cx, rig.cy, z0 - z + ppa.TIP_BELOW_CAM, table, closed=True)
-    if why is not None:
-        raise ppa.UnsafeGrasp(f"not descending into the ring: {why}")
+    await ppa.clear_landing(rig, z0, z, table, top, closed=True)
     await rig.grab()  # nothing between the jaws yet: closed, they fit the hole
     try:
         await rig.descend(z, settle=False)  # the expansion follows, no frame

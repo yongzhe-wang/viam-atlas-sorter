@@ -1130,11 +1130,15 @@ FINGER_ALONG_MM = 13.0
 FINGER_DEPTH_TOL_MM = 3.0  # table noise: a point only this much nearer than the fingertips does not count
 FINGER_HIGH_FRAC = 0.05  # largest blob of points above the fingertips, as a share of the finger's area
 FINGER_BLIND_FRAC = 0.15  # largest blob without a believable depth, same share
+FINGER_CROP_PX = 240
+TURN_STEP_DEG = 15.0  # jaw angles tried when a finger's landing area is blocked
+MAX_TURNS = 2  # turns before giving up (each is checked again on the frame taken after it)
+JAW_WIDTH_MAX_MM = 68.0  # MAX_OPEN_MM (78) - 10: the object across the turned jaws {VIAM CENTERAL "宽度 <= MAX_OPEN − 10"}
 FALSE_DEEP_MM = 20.0  # farther than the table by this: nothing stands below the table, so a refraction, not a depth
 
 
 def finger_obstacle(depth: np.ndarray, fx: float, fy: float, cx: float, cy: float, tip_depth: float, table: float,
-                    closed: bool = False):
+                    closed: bool = False, angle_deg: float = 0.0):
     """
     Why a finger cannot come down in this frame (taken at the height of the descent's start), or None if both are clear.
 
@@ -1147,13 +1151,17 @@ def finger_obstacle(depth: np.ndarray, fx: float, fy: float, cx: float, cy: floa
     not caught, only its holes and false deep readings are]
     Points above the fingertips (tip_depth: their depth in this frame at the end of the descent) are tested at their own
     depth, so a tall thing is placed right. A blind patch has no depth of its own and is placed at tip_depth.
+    angle_deg: the jaws closing along that image direction instead of image u (jaw_angle() tries them).
     """
     if depth is None:
         return "no depth map to check the fingers' landing areas"
-    h, w = depth.shape
-    vv, uu = np.mgrid[:h, :w]
     across = FINGER_CLOSED_MM if closed else FINGER_ACROSS_MM
     au, av = axis_pixel(fx, fy, cx, cy, tip_depth)
+    # Only the pixels around the jaws: the farthest band edge, seen as near as the sensor reads (~280 mm), is ~180 px out
+    h, w = depth.shape
+    v0, v1, u0, u1 = max(0, int(av) - FINGER_CROP_PX), min(h, int(av) + FINGER_CROP_PX), max(0, int(au) - FINGER_CROP_PX), min(w, int(au) + FINGER_CROP_PX)
+    depth = depth[v0:v1, u0:u1]
+    vv, uu = np.mgrid[v0:v1, u0:u1]
     mm_u, mm_v = tip_depth / fx, tip_depth / fy
     x, y = (uu - au) * mm_u, (vv - av) * mm_v
     area = (across[1] - across[0]) * 2.0 * FINGER_ALONG_MM / (mm_u * mm_v)
@@ -1161,6 +1169,12 @@ def finger_obstacle(depth: np.ndarray, fx: float, fy: float, cx: float, cy: floa
     d = np.where(depth > 0, depth, tip_depth).astype(float)
     aud, avd = axis_pixel(fx, fy, cx, cy, d)
     xd, yd = (uu - aud) * d / fx, (vv - avd) * d / fy
+    if angle_deg:
+        # The bands turned with the jaws: along (cos a, sin a) in the image's (u, v)
+        a = math.radians(angle_deg)
+        c, s_ = math.cos(a), math.sin(a)
+        x, y = x * c + y * s_, -x * s_ + y * c
+        xd, yd = xd * c + yd * s_, -xd * s_ + yd * c
     high = (depth > 0) & (depth < tip_depth - FINGER_DEPTH_TOL_MM)
     blind = (depth == 0) | (depth > table + FALSE_DEEP_MM)
     for side, name in ((-1.0, "left"), (1.0, "right")):
@@ -1173,6 +1187,125 @@ def finger_obstacle(depth: np.ndarray, fx: float, fy: float, cx: float, cy: floa
             if big >= frac * area:
                 return f"{big / area:.0%} of the {name} finger's landing area {what}"
     return None
+
+
+def width_across(depth: np.ndarray, fx: float, fy: float, cx: float, cy: float, table: float, angle_deg: float) -> float:
+    """
+    mm of raised surface the jaws, closing along image angle `angle_deg` through the jaw axis, would span: outward from the
+    axis while it continues (gaps up to 4 mm), within FINGER_ALONG_MM of the closing line.
+    """
+    if depth is None:
+        return 0.0
+    au, av = axis_pixel(fx, fy, cx, cy, table)
+    h, w = depth.shape
+    v0, v1, u0, u1 = max(0, int(av) - FINGER_CROP_PX), min(h, int(av) + FINGER_CROP_PX), max(0, int(au) - FINGER_CROP_PX), min(w, int(au) + FINGER_CROP_PX)
+    sub_d = depth[v0:v1, u0:u1].astype(float)
+    vv, uu = np.mgrid[v0:v1, u0:u1]
+    high = (sub_d > 0) & (sub_d < table - 8.0)
+    if not high.any():
+        return 0.0
+    d = sub_d[high]
+    aud, avd = axis_pixel(fx, fy, cx, cy, d)
+    xd, yd = (uu[high] - aud) * d / fx, (vv[high] - avd) * d / fy
+    a = math.radians(angle_deg)
+    xr = xd * math.cos(a) + yd * math.sin(a)
+    yr = -xd * math.sin(a) + yd * math.cos(a)
+    span = 0.0
+    for side in (-1.0, 1.0):
+        vals = np.sort(side * xr[(np.abs(yr) <= FINGER_ALONG_MM) & (side * xr >= 0)])
+        reach = 0.0
+        for val in vals:
+            if val - reach > 4.0:
+                break
+            reach = float(val)
+        span += reach
+    return span
+
+
+def image_turn_per_deg(fx: float, fy: float, cx: float, cy: float, depth: float) -> float:
+    """How many degrees the scene turns in the image per degree of wrist theta (sign included), from the camera model."""
+    from sorter import perception
+
+    k = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
+    au, av = axis_pixel(fx, fy, cx, cy, depth)
+    p0 = {"x": 0.0, "y": 0.0, "z": ALIGN_Z, "theta": 0.0}
+    a = perception.world_xy(p0, k, au - 40.0, av, depth)
+    b = perception.world_xy(p0, k, au + 40.0, av, depth)
+    p1 = dict(p0, theta=10.0)
+    (ua, va), (ub, vb) = perception.project_xy(p1, k, a, depth), perception.project_xy(p1, k, b, depth)
+    return math.degrees(math.atan2(vb - va, ub - ua)) / 10.0
+
+
+def jaw_angle(depth: np.ndarray, fx: float, fy: float, cx: float, cy: float, tip_depth: float, table: float) -> tuple:
+    """
+    ((image angle, wrist turn in deg) of the jaw angle nearest the present one whose landing areas are clear and across which
+    the object is at most JAW_WIDTH_MAX_MM, or None; [what each angle tried gave]).
+    {USER 2026-10-30 "WE SHOULDNT REJECT, IF IT IS CLOSE YOU CAN JUST ROTATE THE GRIPPER TO MAKE THAT WORK"}
+    {VIAM CENTERAL 2026-10-30 "在 0–180° 里每 15° 试一个 JAW 角度 ... 选离原角度最近的那个"}
+    [CONFIDENCE: INFERRED 75% — the turn's sign comes from the camera model (checked offline by re-projecting the scene)]
+    """
+    psi = image_turn_per_deg(fx, fy, cx, cy, tip_depth)
+    options = []
+    for alpha in np.arange(TURN_STEP_DEG, 180.0, TURN_STEP_DEG):
+        turn = ((-alpha / psi) + 90.0) % 180.0 - 90.0  # the jaw line repeats every 180 deg: the smaller turn
+        options.append((abs(turn), float(alpha), float(turn)))
+    tried = []
+    for _, alpha, turn in sorted(options):
+        why = finger_obstacle(depth, fx, fy, cx, cy, tip_depth, table, angle_deg=alpha)
+        if why is not None:
+            tried.append(f"{turn:+.0f}: blocked")
+            continue
+        width = width_across(depth, fx, fy, cx, cy, table, alpha)
+        if width > JAW_WIDTH_MAX_MM:
+            tried.append(f"{turn:+.0f}: {width:.0f} mm wide")
+            continue
+        tried.append(f"{turn:+.0f}: clear, {width:.0f} mm across")
+        return (alpha, turn), tried
+    return None, tried
+
+
+async def turn_jaws(rig, turn: float, top: float) -> bool:
+    """Turn the wrist by `turn` deg at this height, the jaw axis staying over the same point (at depth `top`); then a frame."""
+    from sorter import perception
+
+    k = {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}
+    p = await rig.pose()
+    au, av = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top)
+    jx, jy = perception.world_xy({"x": p.x, "y": p.y, "z": p.z, "theta": p.theta}, k, au, av, top)
+    theta = p.theta + turn
+    ox, oy = perception.world_xy({"x": 0.0, "y": 0.0, "z": p.z, "theta": theta}, k, au, av, top)
+    fx, fy = jx - ox, jy - oy
+    if not allowed(fx, fy) or not 120.0 <= math.hypot(fx, fy) <= 650.0:
+        print(f"  jaw turn {turn:+.0f}: flange ({fx:.0f},{fy:.0f}) out of reach")
+        return False
+    await rig.goto(fx, fy, p.z, theta=theta)
+    await rig.frame()  # the depth the next check reads (rig.last_depth)
+    return True
+
+
+async def clear_landing(rig, z0: float, z_grasp: float, table: float, top: float, closed: bool = False) -> list:
+    """
+    Before a descent to z_grasp: the fingers' landing areas (finger_obstacle) must be clear; if not, the wrist turns to the
+    nearest clear jaw angle (jaw_angle) and the check runs again on the frame from there, up to MAX_TURNS. Returns the turns
+    made (deg); raises UnsafeGrasp when no angle works. Closed fingers (an internal grip's entry) do not turn.
+    """
+    tip = z0 - z_grasp + TIP_BELOW_CAM
+    turns = []
+    why = finger_obstacle(rig.last_depth, rig.fx, rig.fy, rig.cx, rig.cy, tip, table, closed=closed)
+    tried = []
+    while why is not None and not closed and len(turns) < MAX_TURNS:
+        choice, tried = jaw_angle(rig.last_depth, rig.fx, rig.fy, rig.cx, rig.cy, tip, table)
+        print(f"  fingers blocked ({why}); jaw angles: {', '.join(tried)}")
+        if choice is None or not await turn_jaws(rig, choice[1], top):
+            break
+        turns.append(round(choice[1]))
+        print(f"  turned the jaws {choice[1]:+.0f} deg: the nearest clear angle")
+        why = finger_obstacle(rig.last_depth, rig.fx, rig.fy, rig.cx, rig.cy, tip, table)
+    rig.jaw_turns = turns
+    if why is not None:
+        more = f" after turning {turns} deg" if turns else (f"; no clear jaw angle ({', '.join(tried)})" if tried else "")
+        raise UnsafeGrasp(f"not descending: {why}{more}")
+    return turns
 
 
 async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None, align: bool = True,
@@ -1261,10 +1394,8 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
                   f"computed {z_grasp:.0f})")
             z_grasp = hard
         print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
-        # wait_clear's frame, at this pose: both fingers' landing areas must be free, or the arm does not go down
-        why = finger_obstacle(rig.last_depth, rig.fx, rig.fy, rig.cx, rig.cy, z0 - z_grasp + TIP_BELOW_CAM, table)
-        if why is not None:
-            raise UnsafeGrasp(f"not descending: {why}")
+        # wait_clear's frame, at this pose: both fingers' landing areas must be free, turning the wrist if that frees them
+        await clear_landing(rig, z0, z_grasp, table, top)
         try:
             await rig.descend(z_grasp, settle=False)  # the grab follows, no frame
         except EStop:

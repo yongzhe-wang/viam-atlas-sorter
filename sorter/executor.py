@@ -1055,7 +1055,7 @@ def jpeg(rgb: np.ndarray) -> bytes:
 def grip_record(rig, primitive: str, height: float, grip: float) -> dict:
     """What a grasp did, for the attempt doc: the store keeps it with the embedding so a later run can reuse it."""
     return {"primitive": primitive, "height_mm": round(height, 1), "grip_depth": round(grip, 1),
-            "theta": round(float(rig.theta), 1),
+            "theta": round(float(rig.theta), 1), "jaw_turns": getattr(rig, "jaw_turns", None) or None,
             "expand_stop_mm": getattr(rig, "expand_stop_mm", None) if primitive == "ring_inside" else None}
 
 
