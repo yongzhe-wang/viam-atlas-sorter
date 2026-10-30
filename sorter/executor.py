@@ -389,6 +389,11 @@ def footprint(rig, o, pose: dict) -> dict:
 # is 0.21 of the whole, and the slip check read a bottle still lying there as "nothing like it left"
 MERGED_AREA_MIN = 0.1
 SLIP_XY_MM = 40.0  # the picked object counts as still lying there within this of where it was picked
+# A squeezed soft bag changes size and shifts: 32 -> 45 mm high over five grabs, each read as "nothing like it left", each
+# followed by a release of nothing. So: anything of its colour this close, not already standing there when it was found.
+# {VIAM CENTERAL 2026-10-30 "如果原位置附近（放宽到 80 MM）还有同颜色的物体，就算滑落"}
+SLIP_WIDE_MM, SLIP_WIDE_AREA = 80.0, 0.2
+SLIP_SAME_SPOT_MM = 25.0  # a neighbour in the found frame and an object now this close are the same one
 
 
 def still_on_table(rig, tracker, rgb: np.ndarray, depth: np.ndarray, pose: dict) -> tuple:
@@ -410,7 +415,27 @@ def still_on_table(rig, tracker, rgb: np.ndarray, depth: np.ndarray, pose: dict)
         # A piece of a merged object need not have the colour of the whole
         if d <= SLIP_XY_MM and area_like(ref, ratio) and (ref.get("merged") or ref.get("colour") in (None, o.colour)):
             return True, f"a {o.colour} object of the same size still lies {d:.0f} mm from the pick point"
+    for o in list(seg.objects) + [o for o, _ in seg.excluded]:
+        now = footprint(rig, o, pose)
+        d = math.hypot(now["xy"][0] - ref["xy"][0], now["xy"][1] - ref["xy"][1])
+        if (d <= SLIP_WIDE_MM and now["area"] >= SLIP_WIDE_AREA * ref["area"] and ref.get("colour") in (None, o.colour)
+                and not near_any(now["xy"], neighbours_of(rig, tracker), SLIP_SAME_SPOT_MM)):
+            return True, f"a {o.colour} object lies {d:.0f} mm from the pick point, changed shape or moved: not held"
     return False, "nothing like it left at the pick point"
+
+
+def neighbours_of(rig, tracker) -> list:
+    """Table xy of the objects of the target's colour already beside it in the found frame; looked at only when it matters."""
+    ref, found = tracker.ref, getattr(tracker, "found", None)
+    if "neighbours" not in ref:
+        ref["neighbours"] = []
+        if found is not None and found.get("depth") is not None:
+            seg = perception.segment_full(found["rgb"], found["depth"])
+            for o in list(seg.objects) + [o for o, _ in seg.excluded]:
+                now = footprint(rig, o, found["pose"])
+                if ref.get("colour") in (None, o.colour) and math.hypot(now["xy"][0] - ref["xy"][0], now["xy"][1] - ref["xy"][1]) > SLIP_SAME_SPOT_MM:
+                    ref["neighbours"].append(now["xy"])
+    return ref["neighbours"]
 
 
 async def still_target(rig, text: str, store, tracker) -> tuple:
@@ -1028,6 +1053,7 @@ async def grasp_with_primitives(rig, found: dict, esc, times: dict, doc: dict, t
     last = None
     for primitive in esc.order(grasp.choose_primitives(obj, rig.fx, found.get("depth"))):
         tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store, primitive=primitive)
+        tracker.found = found
         if ppa.fast("refine_skip"):
             tracker.servo_tol_mm = grasp.servo_tolerance(primitive, obj, rig.fx)
         esc.attempt(primitive)
@@ -1070,14 +1096,18 @@ def direct_square(rig, found: dict, obj, frame_ts: float):
     [CONFIDENCE: SINGLE-SRC 75% — the 5 s counts up to the start of the pick: the pick itself takes ~10 s, so counted at
     the carry it would never hold. The later limit is SKIP_CONFIRM_TOTAL_S]
     """
-    if found.get("depth") is None or time.time() - frame_ts > SKIP_CONFIRM_FRAME_S:
+    age = time.time() - frame_ts
+    if found.get("depth") is None or age > SKIP_CONFIRM_FRAME_S:
+        print(f"  FAST_ROUTE look pose kept: the found frame is {age:.1f} s old, or has no depth")
         return None
     k, pose = intr(rig), found["pose"]
     sq = frame_square(found["rgb"], found["depth"], pose, k)
     if sq is None or sq.get("partial"):
+        print(f"  FAST_ROUTE look pose kept: the found frame shows {'no' if sq is None else 'part of the'} square")
         return None
     u, v, _ = grasp_px(obj, pose, k)
     if drop_square.contains(sq, perception.world_xy(pose, k, u, v, obj.top_depth_mm), margin=SKIP_NEAR_PAPER_MM):
+        print("  FAST_ROUTE look pose kept: picking this close to the paper may move it")
         return None
     return {"frame": (found["rgb"], found["depth"], pose), "xy": tuple(sq["xy"]), "until": frame_ts + SKIP_CONFIRM_TOTAL_S}
 
@@ -1945,6 +1975,16 @@ class SquareNotCleared(RuntimeError):
     """The reset could not empty the square without risk; a person has to (nothing is held)."""
 
 
+def pick_tries_at(tries: list, xy: tuple, mm: float = 80.0) -> int:
+    """One more pick at about this table spot: how many so far, this one included. `tries` is [[x, y, n], ...], kept by the caller."""
+    for t in tries:
+        if math.hypot(t[0] - xy[0], t[1] - xy[1]) <= mm:
+            t[0], t[1], t[2] = xy[0], xy[1], t[2] + 1
+            return t[2]
+    tries.append([xy[0], xy[1], 1])
+    return 1
+
+
 async def clear_square(rig, store) -> dict:
     """
     Empty the blue square. Returns the logged attempt doc (mode "reset"); success = interior empty by depth.
@@ -1960,7 +2000,7 @@ async def clear_square(rig, store) -> dict:
     STATE.update(times={"at": "reset"}, error=None)
     start_recording(rig, store, doc)
     k = intr(rig)
-    dropped, unreachable = [], []
+    dropped, unreachable, tries_at = [], [], []
     if ppa.ESTOP["on"]:
         # Reset pressed after the emergency stop was released: unlatch, clear the arm's error once
         print(f"reset: clearing the emergency stop latch ({ppa.ESTOP['why']})")
@@ -2010,6 +2050,11 @@ async def clear_square(rig, store) -> dict:
                 # RESET_PICK_TRIES; the black tape's block servo failed once and the reset gave up.
                 # {VIAM CENTERAL 2026-10-29 "RESET 抓取改走 GRASP 那条路径 ... RESET 也要重试 ... 最多 3 次"}
                 for _try in range(RESET_PICK_TRIES):
+                    # Per spot, whatever each try's outcome: a bag "removed" that is still there came back as a new object
+                    # each round and was grabbed until it fell apart. {VIAM CENTERAL 2026-10-30 "按 XY（80 MM 内）算同一个物体，累计最多 3 次"}
+                    if pick_tries_at(tries_at, footprint(rig, obj, q)["xy"]) > RESET_PICK_TRIES:
+                        name = getattr(obj, "recognised", None) or f"{obj.colour} object"
+                        raise SquareNotCleared(f"{name}: picked {RESET_PICK_TRIES}x and still there — clear by hand")
                     try:
                         height, grip, _ = await grasp_with_primitives(
                             rig, {"obj": obj, "rgb": rgb, "depth": depth, "pose": q}, esc, {}, doc, check_target=False)

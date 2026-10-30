@@ -1818,6 +1818,7 @@ async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = A
         await rig.goto(p.x, p.y, cur, settle=False)
     rise = z > cur + 1
     if fast("one_move") and line_clear(p.x, p.y, x, y):
+        print(f"  one move: ({p.x:.0f},{p.y:.0f}) -> ({x:.0f},{y:.0f}), {math.hypot(x - p.x, y - p.y):.0f} mm")
         await rig.goto(x, y, cur, theta=theta, settle=settle and not rise, long_ok=True)
         if rise:
             await rig.goto(x, y, z, theta=theta, settle=settle)
