@@ -565,7 +565,10 @@ class GraspByDescription(Generic, EasyResource):
                     "aliases": [n for n in (r.get("names") or []) if n != r["label"]],
                     "confidence": round(float(r.get("score") or 0.0), 3), "colour": r["obj"].colour,
                     "height_mm": round(float(r["obj"].height_mm), 1), "bbox": _box(r["obj"].bbox)} for r in recs]
-        intruders = [{"bbox": _box(i["bbox"]), "reason": i.get("reason", "")} for i in seg.intruders]
+        # only what is over the table: a chair past its edge is no hand (camera_model.intruders_on_table)
+        from sorter import camera_model
+        over = camera_model.intruders_on_table(seg.intruders, pose, intr, seg.table_depth_mm)
+        intruders = [{"bbox": _box(i["bbox"]), "reason": i.get("reason", "")} for i in over]
         return recs, objects, intruders, ms, seg, all_recs
 
     async def _pose(self, rt) -> tuple:

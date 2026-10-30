@@ -316,7 +316,10 @@ def observe_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = N
             "pose": {k: float(pose[k]) for k in ("x", "y", "z", "o_x", "o_y", "o_z", "theta") if k in pose},  # o_*: tilted wrist
             "intr": {k: float(intr[k]) for k in ("fx", "fy", "cx", "cy")},
             "shape": [int(depth.shape[0]), int(depth.shape[1])], "table_depth_mm": round(float(seg.table_depth_mm), 2),
-            "detections": dets, "square": square, "bucket": bk, "intruders": [[int(c) for c in i["bbox"]] for i in seg.intruders],
+            "detections": dets, "square": square, "bucket": bk,
+            # only what is over the table: a chair past its edge is no hand (camera_model.intruders_on_table)
+            "intruders": [[int(c) for c in i["bbox"]]
+                          for i in camera_model.intruders_on_table(seg.intruders, pose, intr, seg.table_depth_mm)],
             "depth_valid": _valid_grid(depth)}
 
 

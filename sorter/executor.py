@@ -1194,18 +1194,28 @@ BLOCKED_WAIT_S = 15.0  # then go on: views from other wrist angles get around a 
 BLOCKED_STATUS = "camera blocked (cable/hand in front of the lens)"
 
 
-def view_blocked(rgb: np.ndarray, depth: np.ndarray) -> tuple:
-    """(blocked?, why): something right in front of the lens hides a large part of the table."""
+def view_blocked(rgb: np.ndarray, depth: np.ndarray, over_table: np.ndarray = None) -> tuple:
+    """
+    (blocked?, why): something right in front of the lens hides a large part of the table.
+    over_table (camera_model.table_mask): only pixels over the table count; the floor past the table's edge reads no
+    depth and was "camera blocked" for 15 s at every edge view {OBS 14:04:43 POSE (240, 360, 400) "CAMERA BLOCKED"}.
+    """
     if depth is None:
         return False, "no depth"
     band = depth[:440]  # above the held object / fingers
-    near = float(((band == 0) | ((band > 0) & (band < 280))).mean())
+    sel = over_table[:440] if over_table is not None else np.ones(band.shape, bool)
+    if sel.mean() < 0.2:  # the upper view is mostly past the table's edge: nothing there to block
+        sel = np.zeros(band.shape, bool)
+    bad = (band == 0) | ((band > 0) & (band < 280))
+    near = float(bad[sel].sum()) / band.size
     if near > BLOCKED_DEPTH_FRAC:
         return True, f"{near:.0%} of the view unreadable or closer than 280 mm"
     hsv = np.asarray(Image.fromarray(rgb).convert("HSV"))
     dark = hsv[..., 2] < 50
     flat = (depth > 0) & (np.abs(depth - table_plane(depth)) < 4.0)
     m = dark & flat
+    if over_table is not None:
+        m &= over_table
     m[ppa.FINGER_ROW:] = False
     n = int(m.sum())
     if n > BLOCKED_DARK_FLAT_PX:
@@ -1221,7 +1231,13 @@ async def clear_frame(rig) -> tuple:
     t0 = time.monotonic()
     while True:
         rgb, depth = await rig.frame()
-        blocked, why = view_blocked(rgb, depth)
+        over = None
+        if depth is not None and rig.last_pose is not None:
+            from sorter import camera_model  # (imports perception: not at module level)
+            p = pose_dict(rig.last_pose)
+            # the table top is at world z ~0: camera_model.CAM_BELOW_POSE_MM under the pose point
+            over = camera_model.table_mask(p, intr(rig), depth.shape, p["z"] - camera_model.CAM_BELOW_POSE_MM)
+        blocked, why = view_blocked(rgb, depth, over)
         if not blocked or time.monotonic() - t0 > BLOCKED_WAIT_S:
             if rig.status == BLOCKED_STATUS:
                 rig.status = None
