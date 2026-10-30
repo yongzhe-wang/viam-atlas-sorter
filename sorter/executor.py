@@ -1489,7 +1489,12 @@ async def go_over_square(rig) -> tuple:
             except ppa.MoveRefused as e:
                 print(f"  square: wrist {dt:+.0f} view refused: {e}")
                 continue
-            sq, _ = await look(prev=sq)
+            since = sq.get("since_ts")
+            sq, q = await look(prev=sq)
+            if sq.get("since_ts") != since:
+                # drop_square restarted (a side > 20 mm off): at this wrist angle TOOL_AXIS_MM is likely off;
+                # AGENT3 refits it from these poses and frames
+                print(f"  square: merge restarted at wrist {dt:+.0f} (pose {q}): check perception.TOOL_AXIS_MM")
         await rig.goto(fx, fy, ppa.ALIGN_Z, theta=0.0)
         return sq
 
