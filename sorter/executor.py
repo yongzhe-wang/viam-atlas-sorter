@@ -237,6 +237,9 @@ def ring_world(o, pose: dict, k: dict):
     return (float(c[0]), float(c[1])), math.sqrt(filled.sum() / math.pi) * mm, r_mid * mm
 
 
+REACH_MARGIN_MM = 15.0  # a grasp point is moved to at least MIN_GRASP_R_MM + this from the base when possible
+
+
 def grasp_px(o, pose: dict = None, k: dict = None, wall_mm: float = None) -> tuple:
     """
     (u, v, yaw_deg): where the jaws close on `o` in this frame; yaw is the image angle align_wrist turns vertical
@@ -245,25 +248,59 @@ def grasp_px(o, pose: dict = None, k: dict = None, wall_mm: float = None) -> tup
     Default: the top-face centroid (a long object's handle / thickest part) and the object's long axis.
     {VIAM CENTERAL 2026-10-29 "FOR ELONGATED OBJECTS, CHOOSE THE GRASP POINT AT THE HANDLE/THICKEST SECTION"}
     [CONFIDENCE: INFERRED 75% — perception.Obj.top_centroid_px is the top band within TOP_BAND_MM]
+    Too close to the base there (< ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM): moved outward along the long axis, at
+    most to REACH_MARGIN_MM from the object's end.
     Ring (ring_geometry: the black tape roll, whose top centroid is in its hole and whose outside is wider than
-    the jaws): the middle of its wall on the side nearest the arm base, yaw = the wall's tangent there, so the
-    jaws close across the wall. Needs the frame's pose and intrinsics for the base direction.
-    {VIAM CENTERAL 2026-10-29 "FOR RING-LIKE OBJECTS ... GRASP THE WALL: GRASP POINT ON THE RING AT THE SIDE NEAREST THE ARM"}
-    [CONFIDENCE: INFERRED 60% — the ring mask (table visible in the hole) is not yet seen on the arm]
+    the jaws): on the middle of its wall, the point nearest the base among those at least MIN_GRASP_R_MM +
+    REACH_MARGIN_MM from it (the far side when the near one is out of reach); yaw = the wall's tangent there, so
+    the jaws close across the wall. Needs the frame's pose and intrinsics.
+    {VIAM CENTERAL 2026-10-29 "RING 的抓取点在环壁中线上取 R >= MIN_GRASP_R + 15 MM 的点里离 BASE 最近的那个"}
+    [CONFIDENCE: INFERRED 70% — the tape at r 182 mm on its near side was refused; its far side (~250) is reachable]
     """
-    ring = ring_geometry(o, wall_mm) if pose is not None and k is not None else None
-    if ring is None:
+    if pose is None or k is None:
         u, v = o.top_centroid_px or o.centroid_px
         return float(u), float(v), float(o.yaw_deg)
+    ring = ring_geometry(o, wall_mm)
+    d = o.top_depth_mm
+    want = ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM
+
+    def image_yaw(p1, p2) -> float:
+        (u1, v1), (u2, v2) = perception.project_xy(pose, k, p1, d), perception.project_xy(pose, k, p2, d)
+        return math.degrees(math.atan2(-(v2 - v1), u2 - u1)) % 180.0
+
+    if ring is None:
+        u, v = o.top_centroid_px or o.centroid_px
+        g = np.array(perception.world_xy(pose, k, u, v, d))
+        if np.hypot(*g) >= want:
+            return float(u), float(v), float(o.yaw_deg)
+        # Along the long axis, outward (away from the base), as far as needed and the object allows
+        a = math.radians(o.yaw_deg)
+        tip = np.array(perception.world_xy(pose, k, u + 20.0 * math.cos(a), v - 20.0 * math.sin(a), d))
+        axis = (tip - g) / (np.linalg.norm(tip - g) or 1.0)
+        if axis @ g < 0:
+            axis = -axis
+        half = o.length_px * d / k["fx"] / 2.0
+        step = min(max(0.0, half - REACH_MARGIN_MM), max(0.0, want - float(np.hypot(*g))))
+        for s in np.arange(0.0, step + 0.1, 2.0):
+            if np.hypot(*(g + s * axis)) >= want:
+                step = s
+                break
+        p = g + step * axis
+        pu, pv = perception.project_xy(pose, k, tuple(p), d)
+        return float(pu), float(pv), float(o.yaw_deg)
     (cu, cv), r_px = ring
-    # Image direction toward the base: the ring centre and a point 10 mm nearer the base, both projected
-    cx, cy = perception.world_xy(pose, k, cu, cv, o.top_depth_mm)
-    n = math.hypot(cx, cy) or 1.0
-    pu, pv = perception.project_xy(pose, k, (cx - 10.0 * cx / n, cy - 10.0 * cy / n), o.top_depth_mm)
-    du, dv = pu - cu, pv - cv
-    L = math.hypot(du, dv) or 1.0
-    # Tangent = radial turned 90 deg; same angle convention as perception (atan2(-dv, du), [0, 180))
-    return cu + du / L * r_px, cv + dv / L * r_px, math.degrees(math.atan2(-du / L, -dv / L)) % 180.0
+    c = np.array(perception.world_xy(pose, k, cu, cv, d))
+    r_mm = r_px * d / k["fx"]
+    phis = np.radians(np.arange(0.0, 360.0, 5.0))
+    pts = c[None, :] + r_mm * np.stack([np.cos(phis), np.sin(phis)], axis=1)
+    rs = np.hypot(pts[:, 0], pts[:, 1])
+    ok = rs >= want
+    # Nearest the base among the reachable wall points; none reachable: the farthest (approach refuses it)
+    i = int(np.argmin(np.where(ok, rs, np.inf))) if ok.any() else int(np.argmax(rs))
+    p = pts[i]
+    tangent = np.array([-math.sin(phis[i]), math.cos(phis[i])])
+    pu, pv = perception.project_xy(pose, k, tuple(p), d)
+    return float(pu), float(pv), image_yaw(tuple(p - 10.0 * tangent), tuple(p + 10.0 * tangent))
 
 
 class ObjTracker:
