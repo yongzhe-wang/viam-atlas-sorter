@@ -424,6 +424,8 @@ SPLIT_BRIDGE_MM = 14.0  # cable ~10 mm, nearer the camera when lifted; the thinn
 SPLIT_EDGE_MIN_MM = 30.0  # a strip this long reaching the image border is a cable
 SPLIT_LONG_MM = 160.0  # a strip this long is a cable wherever it ends (the longest shaft here is ~130 mm)
 SPLIT_CONTACT_MAX = 0.5  # shared edge with the body / strip length: a wedge shaved off a cut object lies along it
+SPLIT_BODY_MIN_MM = 18.0  # the part kept must be this thick: graspable bodies are 25+, see-through fragments 15-17 (scene2)
+SPLIT_BORDER_MAX = 0.5  # stretch of image border it touches / strip length
 SPLIT_WIDE_MM = 60.0  # a blob this wide cannot be gripped as it is, so it is split even if still cut by the frame
 
 
@@ -473,6 +475,12 @@ def _split_cables(lab: np.ndarray, n: int, px_mm: float) -> tuple:
             u0, u1 = sl[1].start + ss[1].start - 1, sl[1].start + ss[1].stop - 2
             if not ((at_edge(v0, u0, v1, u1) and length >= SPLIT_EDGE_MIN_MM) or length >= SPLIT_LONG_MM):
                 continue
+            # A cable crosses the frame (its own width of contact); an object the frame cuts runs along it, and what
+            # remained would pass for a whole little object (scene2 observe: the handle cut by the right border)
+            uu, vv = us + sl[1].start + ss[1].start - 1, vs + sl[0].start + ss[0].start - 1
+            along = max(len(np.unique(uu[(vv <= e) | (vv >= H - 1 - e)])), len(np.unique(vv[(uu <= e) | (uu >= W - 1 - e)])))
+            if along / px_mm / max(length, 1.0) > SPLIT_BORDER_MAX:
+                continue
             contact = float((ndimage.binary_dilation(one, iterations=2) & body).sum()) / 2.0 / px_mm  # mm of shared edge
             if contact / max(length, 1.0) > SPLIT_CONTACT_MAX:
                 continue
@@ -484,8 +492,8 @@ def _split_cables(lab: np.ndarray, n: int, px_mm: float) -> tuple:
         sizes = ndimage.sum(m, rest, range(1, parts + 1))
         main = rest == 1 + int(np.argmax(sizes))
         vs, us = np.nonzero(main)
-        if 2 * ndimage.distance_transform_edt(main).max() / px_mm < SPLIT_BRIDGE_MM:
-            continue  # nothing thick is left: a thin sliver of something the frame cuts, still useful as a partial sighting
+        if 2 * ndimage.distance_transform_edt(main).max() / px_mm < SPLIT_BODY_MIN_MM:
+            continue  # nothing thick is left: a sliver of something the frame cuts, still useful as a partial sighting
         whole = not at_edge(sl[0].start + vs.min() - 1, sl[1].start + us.min() - 1, sl[0].start + vs.max() - 1, sl[1].start + us.max() - 1)
         if not whole and width_mm(m) <= SPLIT_WIDE_MM:
             continue  # still cut by the frame and not too wide: nothing gained
