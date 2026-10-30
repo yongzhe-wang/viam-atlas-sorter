@@ -140,6 +140,15 @@ def _build_info() -> dict:
         return {"commit": None, "note": "not a built archive (no BUILD_INFO.json)"}
 
 
+def _no_none(x):
+    """x without None values (dict values and list items, recursively), for a DoCommand answer (see do_command)."""
+    if isinstance(x, dict):
+        return {k: _no_none(v) for k, v in x.items() if v is not None}
+    if isinstance(x, (list, tuple)):
+        return [_no_none(v) for v in x if v is not None]
+    return x
+
+
 def _runtime():
     """
     The arm/perception stack, imported on first use so viam-server can start the module and validate config
@@ -341,6 +350,19 @@ class GraspByDescription(Generic, EasyResource):
             tm = _runtime().table_map
             self.live = LiveMap(self.store, tm.update_map, MAP_PERSIST_S, initial=initial, empty_fn=tm.empty_map)
             LOGGER.info(f"{self.name}: live table map on, empty since the module started")
+
+    def _mark_superseded(self, m: Optional[dict]) -> None:
+        """
+        Flag an object's older entries (superseded: True), so the dashboard draws only its latest spot at full
+        strength: AGENT3's table_map._current keeps, per label, the entry seen last (the one map queries use).
+        """
+        current = getattr(_runtime().table_map, "_current", None)
+        if not m or not m.get("objects") or current is None or self.live is None:
+            return
+        keep = {o.get("id") for o in current((self.live.map or {}).get("objects") or [])}
+        for o in m["objects"]:
+            if o.get("label") and o.get("seen_ts") is not None and o.get("id") not in keep:
+                o["superseded"] = True
 
     async def _rebuild_map(self, since: Optional[float]) -> Dict[str, ValueTypes]:
         """
@@ -1005,6 +1027,11 @@ class GraspByDescription(Generic, EasyResource):
 
     async def do_command(self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None,
                          **kwargs) -> Mapping[str, ValueTypes]:
+        # Viam's Struct turns None into 0 on the caller's side ('"label": 0' for an unrecognised object on the
+        # dashboard, AGENT3): leave None out instead, a missing key reads as null there
+        return _no_none(await self._do_command(command))
+
+    async def _do_command(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
         if command.get("status"):
             return self._status()
         if command.get("seen_image"):
@@ -1021,6 +1048,7 @@ class GraspByDescription(Generic, EasyResource):
             # Dashboard top-down view: the live map (no embeddings, each object with its seen_ts; up to
             # MAP_PERSIST_S newer than the saved one) + each object's latest sighting
             m = self.live.light() if self.live is not None else self.store.get_table_map(with_emb=False)
+            self._mark_superseded(m)
             return {"ok": bool(m), "map": m or {}, "sightings": self.store.list_sightings()[:40],
                     "sweep": dict(self.job_info.get("sweep") or {}) if self._busy() else {},
                     "search": dict(self.job_info.get("search") or {}) if self._busy() else {},
