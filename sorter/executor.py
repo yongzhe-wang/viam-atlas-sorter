@@ -569,15 +569,26 @@ def frame_square(rgb: np.ndarray, depth: np.ndarray, pose: dict, k: dict, prev: 
         return prev
 
 
-def square_mask(sq: dict, pose: dict, k: dict, shape: tuple, depth_mm: float) -> np.ndarray:
-    """The square's estimated interior (its four corners projected at table depth) as a bool image mask."""
+TAPE_RING_MM = 55.0  # width of the blue tape around the interior: interior + this = the whole paper square
+
+
+def square_mask(sq: dict, pose: dict, k: dict, shape: tuple, depth_mm: float, grow_mm: float = 0.0) -> np.ndarray:
+    """The square's estimated interior (corners projected at table depth), grown by grow_mm per side, as a mask."""
+    corners = sq["corners"]
+    if grow_mm:
+        t = math.radians(sq["yaw_deg"])
+        ax, bx = np.array([math.cos(t), math.sin(t)]), np.array([-math.sin(t), math.cos(t)])
+        ha, hb = sq["size_mm"][0] / 2 + grow_mm, sq["size_mm"][1] / 2 + grow_mm
+        c = np.array(sq["xy"], float)
+        corners = [c - ha * ax - hb * bx, c + ha * ax - hb * bx, c + ha * ax + hb * bx, c - ha * ax + hb * bx]
     img = Image.new("L", (shape[1], shape[0]), 0)
-    pts = [perception.project_xy(pose, k, c, depth_mm) for c in sq["corners"]]
+    pts = [perception.project_xy(pose, k, c, depth_mm) for c in corners]
     ImageDraw.Draw(img).polygon([(float(u), float(v)) for u, v in pts], fill=1)
     return np.asarray(img, dtype=bool)
 
 
-def objects_in_hole(rgb: np.ndarray, depth: np.ndarray, pose: dict = None, k: dict = None, sq: dict = None) -> tuple:
+def objects_in_hole(rgb: np.ndarray, depth: np.ndarray, pose: dict = None, k: dict = None, sq: dict = None,
+                    grow_mm: float = 0.0) -> tuple:
     """
     (hole visible?, [Obj inside the hole], segmentation, interior mask) from a frame taken above the square at
     z >= 400. Inside = in_hole(). Must be looked at from ALIGN_Z: below ~280 mm depth is blind and a block in
@@ -585,16 +596,20 @@ def objects_in_hole(rgb: np.ndarray, depth: np.ndarray, pose: dict = None, k: di
     With the frame's pose and intrinsics the interior is drop_square's full estimate (frame_square), whatever
     lies in it: a silver knife reads as tape (52-69% of its pixels, AGENT3) and split the colour-based hole, so a
     reset failed with "square: not visible". `sq`: an estimate merged over several views (go_over_square), used
-    when this frame alone sees the square only in part. Without any, the colour-based hole_mask.
+    when this frame alone sees the square only in part. Without any, the colour-based hole_mask. grow_mm widens the
+    region past the interior (TAPE_RING_MM: the whole paper, so the reset also clears an object lying across the
+    tape with half of it outside: the black tape after a dragged grab, reset5.jpg).
     """
     seg = perception.segment_full(rgb, depth) if depth is not None else None
     hole = None
     if pose is not None and k is not None and depth is not None:
         sq = frame_square(rgb, depth, pose, k, prev=sq)
         if sq is not None and not sq.get("partial"):
-            hole = square_mask(sq, pose, k, rgb.shape, float(np.median(table_plane(depth))))
+            hole = square_mask(sq, pose, k, rgb.shape, float(np.median(table_plane(depth))), grow_mm)
     if hole is None:
         hole = hole_mask(rgb, depth)
+        if hole is not None and grow_mm:
+            hole = ndimage.binary_dilation(hole, iterations=int(grow_mm * perception.INTRINSICS["fx"] / 378.0))
     if hole is None or seg is None:
         return False, [], seg, None
     objs = list(seg.objects) + [o for o, _ in seg.excluded]
@@ -1583,6 +1598,9 @@ async def go_over_square(rig) -> tuple:
     raise ppa.SquareNotFound("square: no full view of its interior anywhere on the table")
 
 
+RESET_PICK_TRIES = 3  # pick attempts per object in a reset, each from a fresh look
+
+
 async def clear_square(rig, store) -> dict:
     """
     Empty the blue square. Returns the logged attempt doc (mode "reset"); success = interior empty by depth.
@@ -1608,7 +1626,7 @@ async def clear_square(rig, store) -> dict:
             rgb, depth = await clear_frame(rig)
             q = pose_dict(await rig.pose())
             rig.record("reset", rgb)
-            seen, inside, seg, hole = objects_in_hole(rgb, depth, q, k, sq=sq_est)
+            seen, inside, seg, hole = objects_in_hole(rgb, depth, q, k, sq=sq_est, grow_mm=TAPE_RING_MM)
             if seg is not None:
                 publish_frame(store, rgb, seg, "reset")
             if not seen:
@@ -1630,7 +1648,7 @@ async def clear_square(rig, store) -> dict:
                 continue
             obj = max(inside, key=lambda o: o.height_mm)  # the top of a stack first
             print(f"reset: {len(inside)} object(s) in the square; removing one ({obj.colour}, {obj.height_mm:.0f} mm)")
-            picked = False
+            picked, gone = False, False
             # Where it can go, from views with an empty gripper: this one and the starting view; never where an
             # earlier object of this reset went
             size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
@@ -1641,19 +1659,37 @@ async def clear_square(rig, store) -> dict:
                            key=lambda sp: math.hypot(sp[0][0] - centre[0], sp[0][1] - centre[1]))
             doc.setdefault("drop_spots", []).append([sp[2] for sp in spots[:4]])
             if width_mm(obj, rig.fx) <= MAX_OPEN_MM or ring_geometry(obj) is not None:
-                for _try in range(2):
+                # Picked like a grasp: one move (with the yaw) to the pre-grasp pose from this frame, a ring by its
+                # wall, open-loop descent. A failed pick (no convergence, empty grab) looks again and retries, up to
+                # RESET_PICK_TRIES; the black tape's block servo failed once and the reset gave up.
+                # {VIAM CENTERAL 2026-10-29 "RESET 抓取改走 GRASP 那条路径 ... RESET 也要重试 ... 最多 3 次"}
+                for _try in range(RESET_PICK_TRIES):
                     try:
-                        height, grip = await ppa.pick(rig, None, ObjTracker(rig, obj, rgb))
-                        xy = await drop_at(rig, height, grip, spots[:4])
-                        dropped.append(xy)
-                        doc.setdefault("dropped_at", []).append([round(xy[0], 1), round(xy[1], 1)])
-                        picked = True
-                        doc["removed"] += 1
-                        break
-                    except ppa.PickFailed as e:
-                        print(f"reset: pick failed ({e})")
-                    await rig.lift()
-            if not picked:
+                        tracker = ObjTracker(rig, obj, rgb)
+                        await approach(rig, {"obj": obj, "rgb": rgb, "depth": depth, "pose": q}, tracker)
+                        height, grip = await ppa.pick(rig, None, tracker)
+                    except (ppa.PickFailed, RuntimeError) as e:
+                        if await rig.holding():
+                            raise  # something in the jaws: recover() puts it back, never a silent retry
+                        doc["pick_failures"] = doc.get("pick_failures", 0) + 1
+                        print(f"reset: pick {_try + 1}/{RESET_PICK_TRIES} failed ({e}); looking again")
+                        await rig.lift()
+                        centre, _, sq_est = await go_over_square(rig)
+                        rgb, depth = await clear_frame(rig)
+                        q = pose_dict(await rig.pose())
+                        _, inside, _, _ = objects_in_hole(rgb, depth, q, k, sq=sq_est, grow_mm=TAPE_RING_MM)
+                        if not inside:
+                            gone = True  # pushed off the paper by the failed try: nothing left to wipe
+                            break
+                        obj = max(inside, key=lambda o: o.height_mm)
+                        continue
+                    xy = await drop_at(rig, height, grip, spots[:4])
+                    dropped.append(xy)
+                    doc.setdefault("dropped_at", []).append([round(xy[0], 1), round(xy[1], 1)])
+                    picked = True
+                    doc["removed"] += 1
+                    break
+            if not picked and not gone:
                 if doc["wipes"] >= 2:
                     raise RuntimeError("square still not empty after 2 wipes")
                 await ppa.travel(rig, *centre, theta=0.0)
