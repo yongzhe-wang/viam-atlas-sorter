@@ -40,7 +40,11 @@ from sorter import perception  # noqa: E402
 
 SAMPLES = Path(__file__).resolve().parent.parent / "data" / "fine_calib_samples.jsonl"
 OUT = ppa.FINE_CALIB_FILE
-SPOTS = [(330.0, -120.0), (420.0, 60.0), (480.0, -60.0)]  # near, middle, far; >= 225 mm from the base, inside the reach
+# Three spots well inside the observe and look poses' views, >= 225 mm from the base: (480, -60) was put down and not seen
+# again there on the arm {VIAM CENTERAL 2026-10-30 "第三个点改到 OBSERVE 视野和 LOOK POSE 都稳妥的位置，比如 (380,−40)"}
+SPOTS = [(330.0, -120.0), (420.0, 60.0), (380.0, -40.0)]
+HIGH_Z = 580.0  # a block not found from ALIGN_Z is looked for from here, over the same spot
+FIT_WINDOW_S = 7200.0  # samples this recent are fitted together: a rerun goes on from the last one
 THETAS = [0.0, 45.0, -45.0, 90.0]
 GRIP_MM = 15.0
 NEAR_MM = 225.0
@@ -82,6 +86,24 @@ async def look_at(rig, xy) -> tuple:
     return rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta}
 
 
+async def find_near(rig, colour: str, xy):
+    """
+    The block of `colour` near table point xy: looked at from ALIGN_Z, then from HIGH_Z over the same spot (more table in
+    view). (table xy, Obj, frame pose) or None. {VIAM CENTERAL 2026-10-30 "找不到方块时，先升到 Z580 原地看一眼再判断"}
+    """
+    k = intr(rig)
+    rgb, depth, pose = await look_at(rig, xy)
+    hit = find_block(rgb, depth, pose, k, colour, xy)
+    if hit is None and ppa.reachable(pose["x"], pose["y"], HIGH_Z):
+        print(f"  no {colour} block near ({xy[0]:.0f},{xy[1]:.0f}) from z {pose['z']:.0f}; looking from z {HIGH_Z:.0f}")
+        await rig.rise(HIGH_Z)
+        q = await rig.pose()
+        rgb, depth = await rig.frame()
+        pose = {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta}
+        hit = find_block(rgb, depth, pose, k, colour, xy)
+    return None if hit is None else (hit[0], hit[1], pose)
+
+
 async def grasp_z(rig, height: float) -> tuple:
     """(flange z for the fingertips GRIP_MM below the top, table depth) here; the floors as in ppa.pick."""
     z0, table, _ = await rig.measure()
@@ -96,11 +118,12 @@ async def sample(rig, colour: str, at_xy, to_xy, theta: float) -> dict:
     for xy in (at_xy, to_xy):
         if math.hypot(*xy) < NEAR_MM:
             raise ppa.TooClose(ppa.too_close_msg(*xy))
-    rgb, depth, pose = await look_at(rig, at_xy)
-    hit = find_block(rgb, depth, pose, k, colour, at_xy)
+    hit = await find_near(rig, colour, at_xy)
     if hit is None:
         raise RuntimeError(f"no {colour} block near ({at_xy[0]:.0f},{at_xy[1]:.0f})")
-    c0, o = hit
+    c0, o, pose = hit
+    if pose["z"] > ppa.ALIGN_Z + 1.0:
+        await look_at(rig, c0)  # seen from high up: back down over it, where the grasp is planned from
     top, height = o.top_depth_mm - (pose["z"] - ppa.ALIGN_Z), o.height_mm
     jx, jy = jaw_offset(theta, top, k)
     await ppa.travel(rig, c0[0] - jx, c0[1] - jy, theta=theta)
@@ -121,11 +144,10 @@ async def sample(rig, colour: str, at_xy, to_xy, theta: float) -> dict:
     await rig.descend(z_put, settle=False)
     await rig.open()
     await rig.rise(ppa.ALIGN_Z)
-    rgb, depth, pose = await look_at(rig, to_xy)
-    hit = find_block(rgb, depth, pose, k, colour, to_xy)
+    hit = await find_near(rig, colour, to_xy)
     if hit is None:
-        raise RuntimeError(f"the block put down at ({to_xy[0]:.0f},{to_xy[1]:.0f}) is not seen there")
-    c1, _ = hit
+        raise RuntimeError(f"the block put down at ({to_xy[0]:.0f},{to_xy[1]:.0f}) is not seen there, from z 400 or 580")
+    c1 = hit[0]
     s = {"ts": time.time(), "theta": theta, "release": release, "top_depth_mm": top, "height_mm": height,
          "before": list(c0), "after": list(c1), "intr": k}
     pred = predict(s, (0.0, 0.0), perception.TOOL_AXIS_MM)
@@ -206,27 +228,49 @@ def fit_and_write(samples: list) -> dict:
     return out
 
 
+def recent_samples() -> list:
+    """The samples of this calibration session (FIT_WINDOW_S), oldest first."""
+    if not SAMPLES.exists():
+        return []
+    rows = [json.loads(line) for line in SAMPLES.read_text().splitlines() if line.strip()]
+    return [r for r in rows if time.time() - float(r.get("ts", 0.0)) <= FIT_WINDOW_S]
+
+
 async def run(colour: str, n: int) -> None:
+    """
+    n more samples, then a fit over this session's samples. Starts where the last sample put the block down (a rerun after
+    a stop needs no one to move it), else from the observe view. {VIAM CENTERAL 2026-10-30 "从方块当前位置开始"}
+    """
     rig = ppa.Rig()
     await rig.start()
     try:
-        await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
-        rgb, depth = await rig.frame()
-        q = await rig.pose()
-        hit = find_block(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta}, intr(rig), colour, (q.x + 150.0, q.y))
+        before = recent_samples()
+        at, hit = None, None
+        if before:
+            last = tuple(before[-1]["after"])
+            print(f"resuming: {len(before)} samples so far, the block was last put down at ({last[0]:.0f},{last[1]:.0f})")
+            hit = await find_near(rig, colour, last)
         if hit is None:
-            raise RuntimeError(f"no {colour} block in the observe view")
+            await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
+            q = await rig.pose()
+            rgb, depth = await rig.frame()
+            found = find_block(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta}, intr(rig), colour, (q.x + 150.0, q.y))
+            hit = None if found is None else (*found, None)
+        if hit is None:
+            raise RuntimeError(f"no {colour} block where it was last put down, nor in the observe view")
         at = hit[0]
-        start = len(SAMPLES.read_text().splitlines()) if SAMPLES.exists() else 0
+        k0 = len(before)
         for i in range(n):
-            to = SPOTS[i % len(SPOTS)]
-            theta = THETAS[i % len(THETAS)]
-            print(f"sample {i + 1}/{n}: theta {theta:+.0f}, ({at[0]:.0f},{at[1]:.0f}) -> ({to[0]:.0f},{to[1]:.0f})")
+            j = k0 + i
+            to = SPOTS[j % len(SPOTS)]
+            if math.dist(to, at) < 40.0:
+                to = SPOTS[(j + 1) % len(SPOTS)]  # it already lies there: on to the next spot
+            theta = THETAS[j % len(THETAS)]
+            print(f"sample {j + 1}: theta {theta:+.0f}, ({at[0]:.0f},{at[1]:.0f}) -> ({to[0]:.0f},{to[1]:.0f})")
             at = (await sample(rig, colour, at, to, theta))["xy"]
         await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
-        new = [json.loads(line) for line in SAMPLES.read_text().splitlines()[start:] if line.strip()]
-        fit_and_write(new)
     finally:
+        fit_and_write(recent_samples())
         await rig.close()
 
 
@@ -239,8 +283,7 @@ def main() -> None:
     if a.cmd == "run":
         asyncio.run(run(a.colour, a.n))
     else:
-        samples = [json.loads(line) for line in SAMPLES.read_text().splitlines() if line.strip()] if SAMPLES.exists() else []
-        fit_and_write(samples)
+        fit_and_write(recent_samples())
 
 
 if __name__ == "__main__":
