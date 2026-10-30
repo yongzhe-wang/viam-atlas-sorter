@@ -1074,7 +1074,18 @@ class GraspByDescription(Generic, EasyResource):
                 "library": dict(self.library), "warm": self.warm, "warm_ms": self.warm_ms,
                 "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats(),
                 "map": self.live.summary() if self.live is not None else {"live": False},
-                "observations": self.store.observation_stats(), "build": _build_info()}
+                "observations": self.store.observation_stats(), "build": _build_info(),
+                "llm": self._llm_status()}
+
+    @staticmethod
+    def _llm_status() -> dict:
+        """LLM fallback state for {"status": true}: mode, whether a key is set, last call's outcome."""
+        try:
+            from sorter import llm_choose
+        except Exception as e:
+            return {"mode": "unavailable", "error": str(e)[:100]}
+        return {"mode": llm_choose.mode(), "key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
+                "last": dict(llm_choose.LAST)}
 
     async def do_command(self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None,
                          **kwargs) -> Mapping[str, ValueTypes]:
