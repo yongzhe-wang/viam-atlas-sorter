@@ -198,6 +198,28 @@ def ring_inner_mm(o, fx: float) -> float:
     return 2.0 * math.sqrt(hole.sum() / math.pi) * o.top_depth_mm / fx
 
 
+def section_drop(o, depth: np.ndarray, centre: tuple, line: np.ndarray, side: np.ndarray, half: float):
+    """
+    How far (mm) the object's top falls from its crest to its sides along `line` (image unit vector) through `centre`, over
+    +-half px, sampled at 5 offsets along `side`; None if too little of it has depth.
+    """
+    table = o.top_depth_mm + o.height_mm
+    heights = {}
+    for t in np.arange(-half, half + 1.0):
+        for s in (-10.0, -5.0, 0.0, 5.0, 10.0):
+            u, v = np.array(centre) + t * line + s * side
+            if 0 <= int(v) < depth.shape[0] and 0 <= int(u) < depth.shape[1] and depth[int(v), int(u)] > 0:
+                h = table - float(depth[int(v), int(u)])
+                if 3.0 < h < o.height_mm + 10.0:  # on the object: not the table, not a false reading
+                    heights.setdefault(float(t), []).append(h)
+    crest = [h for t, hs in heights.items() if abs(t) <= 0.2 * half for h in hs]
+    sides = [[h for t, hs in heights.items() if sign * t > 0 and 0.6 * half <= abs(t) <= 0.9 * half for h in hs] for sign in (-1, 1)]
+    sides = [x for x in sides if len(x) >= 10]
+    if len(crest) < 10 or not sides:
+        return None
+    return float(np.median(crest)) - max(float(np.median(x)) for x in sides)
+
+
 def lying_round(o, depth: np.ndarray, fx: float) -> bool:
     """
     Is `o` a round object on its side? Long, about as high as wide, and its depth section across the long axis at the grasp
@@ -211,26 +233,31 @@ def lying_round(o, depth: np.ndarray, fx: float) -> bool:
         return False
     if not LYING_ROUND_H_OVER_W[0] <= o.height_mm / (2.0 * half * mm) <= LYING_ROUND_H_OVER_W[1]:
         return False
-    u0, v0 = o.top_centroid_px or o.centroid_px
     a = math.radians(o.yaw_deg)
     along, across = np.array([math.cos(a), -math.sin(a)]), np.array([math.sin(a), math.cos(a)])
-    table = o.top_depth_mm + o.height_mm
-    ts = np.arange(-half, half + 1.0)
-    heights = {}
-    for t in ts:
-        for s in (-10.0, -5.0, 0.0, 5.0, 10.0):
-            u, v = np.array([u0, v0]) + t * across + s * along
-            if 0 <= int(v) < depth.shape[0] and 0 <= int(u) < depth.shape[1] and depth[int(v), int(u)] > 0:
-                h = table - float(depth[int(v), int(u)])
-                if 3.0 < h < o.height_mm + 10.0:  # on the object: not the table, not a false reading
-                    heights.setdefault(float(t), []).append(h)
-    crest = [h for t, hs in heights.items() if abs(t) <= 0.2 * half for h in hs]
-    sides = [[h for t, hs in heights.items() if sign * t > 0 and 0.6 * half <= abs(t) <= 0.9 * half for h in hs] for sign in (-1, 1)]
-    sides = [x for x in sides if len(x) >= 10]
-    if len(crest) < 10 or not sides:
+    drop = section_drop(o, depth, o.top_centroid_px or o.centroid_px, across, along, half)
+    return drop is not None and drop >= max(ARCH_MIN_MM, ARCH_FRAC * half * mm)
+
+
+def domed(o, depth: np.ndarray, fx: float) -> bool:
+    """
+    A ball or a dome (a lollipop's head): about as long as wide and as high as wide, its top arched both ways. Gripped at
+    half its height like a round object on its side: closed below its equator, it is squeezed up and out.
+    {VIAM CENTERAL 2026-10-30 "球形或圆顶（DEPTH 中间高、四周低，长宽比约 1）要用 LYING_ROUND：指尖在高度一半"}
+    [CONFIDENCE: SINGLE-SRC 65% — the rule is the coordinator's; no ball frame recorded, checked on synthetic ones]
+    """
+    mm = o.top_depth_mm / fx
+    half = o.width_px / 2.0
+    if depth is None or half <= 0.0 or o.length_px / (2.0 * half) > LYING_ASPECT:
         return False
-    drop = float(np.median(crest)) - max(float(np.median(x)) for x in sides)
-    return drop >= max(ARCH_MIN_MM, ARCH_FRAC * half * mm)
+    if not LYING_ROUND_H_OVER_W[0] <= o.height_mm / (2.0 * half * mm) <= LYING_ROUND_H_OVER_W[1]:
+        return False
+    a = math.radians(o.yaw_deg)
+    along, across = np.array([math.cos(a), -math.sin(a)]), np.array([math.sin(a), math.cos(a)])
+    need = max(ARCH_MIN_MM, ARCH_FRAC * half * mm)
+    centre = o.top_centroid_px or o.centroid_px
+    drops = [section_drop(o, depth, centre, across, along, half), section_drop(o, depth, centre, along, across, half)]
+    return all(d is not None and d >= need for d in drops)
 
 
 def is_flat(o) -> bool:
@@ -259,6 +286,8 @@ def choose_primitives(o, fx: float, depth: np.ndarray = None) -> list:
         return ["top"]
     if lying_round(o, depth, fx):
         return ["lying_round"] + (["handle", "centroid"] if length / max(width, 1.0) > LONG_ASPECT else ["top"])
+    if domed(o, depth, fx):
+        return ["lying_round", "top"]
     if o.height_mm > TALL_MM and length < TALL_MAX_FOOTPRINT_MM:
         return ["standing", "top"]
     if length / max(width, 1.0) > LONG_ASPECT:

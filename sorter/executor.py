@@ -1291,10 +1291,16 @@ async def look_here(rig, text: str, store, source: str = "demo", excluded: list 
     def tried(o) -> bool:
         gu, gv, _ = grasp_px(o, pose, k)
         return near_any(perception.world_xy(pose, k, gu, gv, o.top_depth_mm), list(excluded), EXCLUDED_MM)
-    objs = [o for o in seg.objects if not o.touches_edge and not delivered(o) and not tried(o)]
+    # Every object competes, the ones a failed try went for included: best() ranks them against each other, and without the
+    # blue lollipop that slipped, the red one was the best "blue lollipop" left and was grasped (2026-10-30)
+    # {VIAM CENTERAL 2026-10-30 "换候选或重试时，每个新目标都必须重新过 BEST() 确认身份 ... 不能因为排名第二就去抓"}
+    objs = [o for o in seg.objects if not o.touches_edge and not delivered(o)]
     ids = {id(o) for o in objs}
     found = (clip_embed.best(objs, text, store, recognised=[r for r in recs if id(r["obj"]) in ids], rgb=rgb)
              if objs else {"obj": None, "reason": "nothing seen", "searchable": True})
+    if found.get("obj") is not None and tried(found["obj"]):
+        found.update(obj=None, ambiguous=False, searchable=False, retried_same=True,
+                     reason=f"the best match for {text!r} is the object a failed try already went for")
     found.update(rgb=rgb, depth=depth, pose=pose, square=square_from_frame(rgb, depth, pose, intr(rig)))
     if grasp.search_v2() and found.get("obj") is None:
         found["candidates"] = view_candidates(seg, delivered, list(excluded), text, store, recs, pose, k)
