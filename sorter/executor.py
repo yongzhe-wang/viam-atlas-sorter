@@ -738,7 +738,7 @@ SPOT_GRID_MM = 5.0  # candidate release points over the interior
 OCC_MARGIN_MM = 8.0  # kept between the footprint / fingers and anything already standing there
 
 
-def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None, ref_fn=None):
+def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None, ref_fn=None, used: dict = None):
     """
     ppa.place_in_square's choose_spot: (flange xy at theta 0 for the release, why), or (None, why) if no point fits.
 
@@ -758,6 +758,8 @@ def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None, ref_fn=No
         sq, why = resolve_square(rgb, depth, pose, k, ref_fn)
         if sq is None:
             raise ppa.SquareNotFound(f"square at the carry-offset pose: {why}")
+        if used is not None:
+            used["sq"] = sq  # the estimate the release was planned on: placed_ok's fallback
         plane = table_plane(depth)
         h = plane - depth
         standing = ndimage.binary_opening((depth > 0) & (h > perception.MIN_HEIGHT_MM)
@@ -819,7 +821,8 @@ def ring_offset_at(ring: dict, theta: float) -> tuple:
     return perception._rot(r, *ring["offset"])
 
 
-def placed_ok(rig, rgb: np.ndarray, depth: np.ndarray, text: str, store, expect: dict = None) -> tuple:
+def placed_ok(rig, rgb: np.ndarray, depth: np.ndarray, text: str, store, expect: dict = None, ref_fn=None,
+              fallback_sq: dict = None) -> tuple:
     """
     (square seen?, success?, why, segmentation) right after a place, from the retreat pose above the release point.
 
@@ -830,7 +833,10 @@ def placed_ok(rig, rgb: np.ndarray, depth: np.ndarray, text: str, store, expect:
     else the grasp point. A ring is released with the jaws on its wall, ~a radius from its centre, and its fresh
     grasp point may be on the far side: the black tape sat centred in the square and the check said "nothing at
     the release point" (2026-10-29), so for a ring `expect` is its centre and the radius widens the match.
-    In the square: drop_square's estimate from this frame (contains), else the colour hole_mask.
+    In the square: resolve_square() on this frame (its own full estimate, or a partial one matching the trusted
+    full estimate), else the estimate the release was planned on (fallback_sq), else the colour hole_mask. The blue
+    block went in beside the knife, one edge on the tape, and the check said "square not visible" (2026-10-29).
+    {VIAM CENTERAL 2026-10-29 "PLACED_OK 也走 RESOLVE_SQUARE() ... 如果 CHECK 帧连 PARTIAL 都没有，就用 RELEASE 前 CARRY 确认过的那个方框估计"}
     {VIAM CENTERAL 2026-10-29 "SUCCESS WHEN THE TARGET IS IN THE HOLE (BY RECOGNITION PLUS POSITION), REGARDLESS OF OTHER OBJECTS"}
     [CONFIDENCE: SINGLE-SRC 80% — rule from the coordinator; ring case checked on real frames with the tape placed]
     """
@@ -839,7 +845,8 @@ def placed_ok(rig, rgb: np.ndarray, depth: np.ndarray, text: str, store, expect:
         return False, False, "no depth", seg
     pose = pose_dict(rig.last_pose) if rig.last_pose is not None else dict(rig.at)
     k = intr(rig)
-    sq = frame_square(rgb, depth, pose, k)
+    sq, _ = resolve_square(rgb, depth, pose, k, ref_fn)
+    sq = sq if sq is not None else fallback_sq
     hole = None if sq is not None else hole_mask(rgb, depth)
     if sq is None and hole is None:
         return False, False, "square not visible", seg
@@ -1235,10 +1242,11 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         partial = partial_square_xy(found, rig)
         ref_fn = lambda: full_square_ref(rig, found)  # noqa: E731
         ref = ref_fn()
+        used = {}  # the square estimate the release is planned on
         if square_xy is None and ref is not None:
             square_xy, doc["square_path"] = tuple(ref["xy"]), "full estimate"
         centre = await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy,
-                                           choose_spot=square_spot(rig, size, ring, ref_fn),
+                                           choose_spot=square_spot(rig, size, ring, ref_fn, used),
                                            confirm=square_confirm(rig, ref_fn),
                                            more_guesses=([partial] if partial else []) + [xy for xy, _ in sightings],
                                            search_poses=[(*ppa.HOME_XY, ppa.ALIGN_Z)]
@@ -1255,7 +1263,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if ring:
             ox, oy = ring_offset_at(ring, q.theta)
             expect = {"xy": (q.x + ox, q.y + oy), "r": ring["r_out"]}
-        seen, right, why, seg = placed_ok(rig, rgb, depth, text, store, expect)
+        seen, right, why, seg = placed_ok(rig, rgb, depth, text, store, expect, ref_fn, used.get("sq"))
         if seg is not None:
             publish_frame(store, rgb, seg, "place")
         doc["img_after"] = jpeg(rgb)
