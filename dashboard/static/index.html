@@ -531,7 +531,7 @@ async function refreshMap() {
     fill: "var(--chip)", stroke: "var(--line)"}));
   svg.appendChild(mk("rect", {x: bx - 10, y: by - 6, width: 20, height: 10, rx: 2, fill: "var(--muted)"}));
   svg.appendChild(mk("text", {x: bx + 14, y: by - 1}, "arm"));
-  const m = d.map, frames = [];
+  const m = d.map, frames = [], fixed = [{x0: bx - 12, y0: by - 12, x1: bx + 40, y1: by + 6}];  // label-free boxes: the "arm" text, ...
   if (m && m.square && m.square.xy) {
     // AGENT3: size_mm = [along x, along y] of the white inner area; x is up on screen, y is left
     const [sx, sy] = mapXY(...m.square.xy), size = [].concat(m.square.size_mm || [200, 200]);
@@ -547,6 +547,13 @@ async function refreshMap() {
     sq.appendChild(mk("title", {}, (m.square.partial ? "drop square, only partly in view so far" : "drop square") + yaw + conf));
     svg.appendChild(sq);
     const xs = pts ? pts.map((p) => p[0]) : [sx - w / 2, sx + w / 2], ys = pts ? pts.map((p) => p[1]) : [sy - h / 2, sy + h / 2];
+    // Partial: the full rectangle is AGENT3's estimate from the edges seen so far; say how sure, right on the map
+    if (m.square.partial && m.square.confidence != null) {
+      const tx = Math.min(...xs), ty = Math.min(...ys) - 5, txt = `estimated · ${Math.round(100 * m.square.confidence)}%`;
+      const t = mk("text", {x: tx, y: ty, class: "lbl-mute"}, txt);
+      svg.appendChild(t);
+      fixed.push({x0: tx - 1, y0: ty - 10, x1: tx + (t.getComputedTextLength() || txt.length * 6.2) + 1, y1: ty + 3});  // ... and this one
+    }
     frames.push({x0: Math.min(...xs) - 2, y0: Math.min(...ys) - 2, x1: Math.max(...xs) + 2, y1: Math.max(...ys) + 2});
   }
   const pick = (label) => { if (label) { $("t").value = label; $("t").focus(); } };
@@ -593,7 +600,7 @@ async function refreshMap() {
     marks.push({x: px, y: py, r: 9});
     labels.push({g, x: px, y: py, text: `${s.label} · last seen ${agoText(s.age_s)}`, prio: 2, cls: "lbl-mute"});
   }
-  placeLabels(svg, mk, marks, labels, [{x0: bx - 12, y0: by - 12, x1: bx + 40, y1: by + 6}], frames);
+  placeLabels(svg, mk, marks, labels, fixed, frames);
   // A grasp's search (AGENT1's search_and_find): stops at the first view that shows the object and grasps
   const srch = d.search;
   const head = srch && srch.n ? (srch.found ? `found ${srch.text ? `"${srch.text}" ` : ""}at view ${srch.k}, grasping`
@@ -607,7 +614,8 @@ async function refreshMap() {
   // Every frame folded into the map is kept as an observation (the map is rebuilt from them after a crash)
   const nObs = d.observations;
   // The paper may be moved at any time (user): a square seen only in part is a state, never a request to move it
-  const sqNote = m && m.square && m.square.partial ? " · square partial — looking for full view" : "";
+  const sqNote = m && m.square && m.square.partial
+    ? ` · square partial${m.square.confidence != null ? ` (${Math.round(100 * m.square.confidence)}% sure)` : ""} — looking for full view` : "";
   // A dead map must be visible: every update failing (sfhack4: KeyError 'next_id' on every frame)
   const lv = d.live, dead = lv && lv.failing ? `⚠ map not updating (${lv.errors} failed: ${lv.last_error}) · ` : "";
   $("map-head").textContent = dead + head + (nSeen ? ` · ${nSeen} sighting${nSeen === 1 ? "" : "s"}` : "")

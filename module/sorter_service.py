@@ -145,10 +145,10 @@ def _runtime():
     The arm/perception stack, imported on first use so viam-server can start the module and validate config
     quickly (warm-up then loads everything in the background). One place, so tests can swap it for stubs.
     """
-    from sorter import clip_embed, executor, perception, table_map, worker
+    from sorter import clip_embed, drop_square, executor, perception, table_map, worker
 
     return SimpleNamespace(ppa=executor.ppa, executor=executor, clean=worker.clean, perception=perception,
-                           clip_embed=clip_embed, table_map=table_map)
+                           clip_embed=clip_embed, table_map=table_map, drop_square=drop_square)
 
 
 def _check_xy(attrs: dict, key: str) -> None:
@@ -419,7 +419,26 @@ class GraspByDescription(Generic, EasyResource):
                 LOGGER.error(f"{self.name}: warm-up failed, retrying in {WARM_RETRY_S:.0f} s: {self.warm_error}")
                 await asyncio.sleep(WARM_RETRY_S)
 
-    def _perceive(self, rt, rgb, depth) -> tuple:
+    @staticmethod
+    def _delivered(rt, o, hole, pose, intr, square) -> bool:
+        """
+        Already in the drop square, by the executor's look_here rule (AGENT1 bc07e1e): in this frame (in_hole), or
+        its grasp point's table xy inside the live map's estimated full square (AGENT3's drop_square: any rotation,
+        also while only part of the paper is in view). Never fails a look: an error counts as not delivered.
+        """
+        try:
+            if hole is not None and rt.executor.in_hole(o, hole):
+                return True
+            ds = getattr(rt, "drop_square", None)
+            if not square or ds is None or pose is None or intr is None or not hasattr(rt.executor, "grasp_px"):
+                return False
+            gu, gv, _ = rt.executor.grasp_px(o, pose, intr)
+            return bool(ds.contains(square, rt.perception.world_xy(pose, intr, gu, gv, o.top_depth_mm)))
+        except Exception as e:
+            LOGGER.debug(f"in-square test skipped: {type(e).__name__}: {e}")
+            return False
+
+    def _perceive(self, rt, rgb, depth, pose: dict = None, intr: dict = None, square: dict = None) -> tuple:
         """
         Targets in one frame with their library labels:
         (recs, [summaries], [intruders], step timings ms, seg, all_recs).
@@ -449,9 +468,9 @@ class GraspByDescription(Generic, EasyResource):
                 lab, names, conf = rt.clip_embed.recognise(emb, self.store, colour=o.colour, height_mm=o.height_mm)
                 recs.append({"obj": o, "label": lab, "names": names, "score": conf, "emb": emb})
         all_recs = recs
-        # Same rule as the executor's look_here: in the square = footprint mostly on its white interior (in_hole)
+        # Same rule as the executor's look_here: nothing already in the drop square is a candidate (_delivered)
         recs = [r for r in recs if not r.get("partial") and not r["obj"].touches_edge
-                and (hole is None or not rt.executor.in_hole(r["obj"], hole))]
+                and not self._delivered(rt, r["obj"], hole, pose, intr, square)]
         ms["clip"] = _ms(t)
         objects = [{"id": int(r["obj"].id), "label": r["label"],
                     "aliases": [n for n in (r.get("names") or []) if n != r["label"]],
@@ -489,7 +508,9 @@ class GraspByDescription(Generic, EasyResource):
         frame_ms = _ms(t_all)
         if rgb is None or depth is None:
             raise RuntimeError("camera returned no colour + depth frame")
-        recs, objects, intruders, ms, seg, all_recs = await asyncio.to_thread(self._perceive, rt, rgb, depth)
+        square = (self.live.map or {}).get("square") if self.live is not None else None
+        recs, objects, intruders, ms, seg, all_recs = await asyncio.to_thread(
+            self._perceive, rt, rgb, depth, pose, await self._intrinsics(), square)
         ms = {"frame": frame_ms, **ms, "total": _ms(t_all)}
         self.watch_period = SLOW_WATCH_PERIOD_S if ms["total"] > SLOW_LOOP_MS else WATCH_PERIOD_S
         pose2, still = await self._pose(rt)
