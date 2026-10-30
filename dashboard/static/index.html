@@ -79,27 +79,13 @@
 <div class="wrap">
   <section class="card" id="cmd">
     <form id="f">
-      <input id="t" type="text" placeholder="green square — or several: tape, snack and screwdriver" autocomplete="off" maxlength="200" aria-label="what to grasp">
+      <input id="t" type="text" placeholder="red lollipop, green block, tape — each one goes into the bucket" autocomplete="off" maxlength="200" aria-label="what to put into the bucket, comma separated">
       <button class="primary" type="submit">Grasp</button>
       <button type="button" id="b-reset" title="Clear the drop target; after an E-stop, release it first">Reset</button>
     </form>
     <div id="state" class="warn"><i>…</i><span>connecting to the robot</span></div>
     <div id="job"></div>
-    <details id="more">
-      <summary>more</summary>
-      <div class="row">
-        <button type="button" id="b-prev" title="What the arm would pick for the text, without moving">Preview</button>
-        <button type="button" id="b-scan" title="Look over the whole table once (a grasp never needs this first)">Scan table</button>
-        <button type="button" id="b-clearmap" title="Someone rearranged the table: forget the map">Clear map</button>
-      </div>
-      <form id="teach-form" hidden>
-        <input id="teach-name" type="text" placeholder="teach a name: m&amp;m bag" autocomplete="off" maxlength="60" aria-label="name to teach">
-        <input id="teach-alias" type="text" placeholder="same object as… (optional)" autocomplete="off" maxlength="60" aria-label="known object it is another name for">
-        <button type="submit">Teach</button>
-        <span class="muted" id="teach-pick">click the object in the picture, or leave it to the best match</span>
-      </form>
-      <div id="more-msg"></div>
-    </details>
+    <div id="more-msg"></div>
   </section>
   <main>
     <section class="card">
@@ -299,7 +285,6 @@ function render(d) {
   const [cls, icon, text] = stateLine(d), s = $("state");
   s.className = cls; s.firstElementChild.textContent = icon; s.lastElementChild.textContent = text;
   renderJob(d.command);
-  $("teach-form").hidden = !d.teach;
   const fps = shown.length > 1 ? (shown.length - 1) / ((shown[shown.length - 1] - shown[0]) / 1000) : 0;
   const age = d.frame_age_s;
   $("cam-meta").textContent = age == null ? "" : age > 3 ? `no new picture for ${agoText(age)}${d.busy ? " (arm moving)" : ""}`
@@ -413,7 +398,7 @@ function drawMap(d) {
 // ---- commands ------------------------------------------------------------------------------------------
 async function send(text, what) {
   try { await post("/api/commands", { text }); $("more-msg").textContent = ""; }
-  catch (e) { $("more-msg").textContent = `${what}: ${e.message}`; $("more").open = true; }
+  catch (e) { $("more-msg").textContent = `${what}: ${e.message}`; }
   tickLive();
 }
 $("f").addEventListener("submit", (ev) => {
@@ -422,44 +407,7 @@ $("f").addEventListener("submit", (ev) => {
   if (text) { send(text, "grasp"); $("t").value = ""; }
 });
 $("b-reset").onclick = () => send("__reset__", "reset");
-$("b-scan").onclick = () => send("__scan__", "scan");
-$("b-clearmap").onclick = async () => {
-  try { const r = (await post("/api/clear_map", {})).module || {}; $("more-msg").textContent = r.ok ? `map cleared: ${r.cleared_objects ?? 0} objects forgotten` : (r.error || r.reason || "not cleared"); }
-  catch (e) { $("more-msg").textContent = "clear map: " + e.message; }
-};
-$("b-prev").onclick = async () => {
-  const text = $("t").value.trim();
-  if (!text) { $("more-msg").textContent = "type what to preview in the box first"; return; }
-  try {
-    const r = (await post("/api/preview", { text })).module || {};
-    const one = (x) => x.target ? `${x.text ? x.text + " → " : ""}${x.target.label || "#" + x.target.id} (in view)` : x.label ? `${x.text ? x.text + " → " : ""}${x.label} (on the map)` : `${x.text || text}: ${x.reason || x.status || "not found"}`;
-    $("more-msg").textContent = r.items ? r.items.map(one).join(" · ") : one(r);
-  } catch (e) { $("more-msg").textContent = "preview: " + e.message; }
-  tickLive();
-};
-// Teach: a click on the picture says which object (0-1 of the picture)
-let teachPoint = null;
-$("cam").addEventListener("click", (ev) => {
-  if ($("teach-form").hidden || !$("more").open) return;
-  const r = ev.currentTarget.getBoundingClientRect(), m = camMeta || { w: 16, h: 9 };
-  const ar = m.w / m.h, w = Math.min(r.width, r.height * ar), h = w / ar;
-  const u = (ev.clientX - r.left - (r.width - w) / 2) / w, v = (ev.clientY - r.top - (r.height - h) / 2) / h;
-  if (u < 0 || u > 1 || v < 0 || v > 1) return;
-  teachPoint = [u, v];
-  $("teach-pick").textContent = "object picked in the picture";
-});
-$("more").addEventListener("toggle", () => $("cam").classList.toggle("pick", $("more").open && !$("teach-form").hidden));
-$("teach-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const name = $("teach-name").value.trim();
-  if (!name) return;
-  try {
-    const r = (await post("/api/teach", { name, alias_of: $("teach-alias").value.trim() || null, point: teachPoint })).module || {};
-    $("more-msg").textContent = r.accepted ? `teaching “${name}”: the arm looks from above and does not touch it` : (r.reason || r.error || "not accepted");
-    if (r.accepted) { $("teach-name").value = ""; $("teach-alias").value = ""; teachPoint = null; $("teach-pick").textContent = "click the object in the picture, or leave it to the best match"; }
-  } catch (e) { $("more-msg").textContent = "teach: " + e.message; }
-  tickLive();
-});
+// The camera and the map are view only: the box above is the one control (user, 2026-10-30)
 
 tickLive();
 tickCam();
