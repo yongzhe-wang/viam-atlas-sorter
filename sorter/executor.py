@@ -723,9 +723,10 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
     if hint_xy is not None:
         fx, fy = perception.look_flange_xy(tuple(hint_xy))
         # Same reach limits as every other look: keep-outs and the 120 mm base clearance
-        if ppa.allowed(fx, fy) and math.hypot(fx, fy) >= 120.0:
+        if ppa.reachable(fx, fy) and math.hypot(fx, fy) >= 120.0:
             poses.append(("hint", fx, fy, ppa.ALIGN_Z))
-    left = [q for q in SWEEP_XY if ppa.allowed(*q) and 150.0 <= math.hypot(*q) <= 600.0]
+    # Only poses the arm can reach at SWEEP_Z (ppa.reachable): a far corner is skipped, not refused mid-search
+    left = [q for q in SWEEP_XY if ppa.reachable(*q, SWEEP_Z) and math.hypot(*q) >= 150.0]
     p = await rig.pose()
     at = (p.x, p.y) if not poses else poses[0][1:3]
     while left:
@@ -738,7 +739,11 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
     first = [] if skip_current else [("current", None, None, None)]
     for path, x, y, z in first + poses:
         if path != "current":
-            await ppa.travel(rig, x, y, theta=0.0, z=z)
+            try:
+                await ppa.travel(rig, x, y, theta=0.0, z=z)
+            except ppa.MoveRefused as e:
+                print(f"  search: skipping ({x:.0f},{y:.0f},{z:.0f}): {e}")
+                continue
         found = await look_here(rig, text, store, source="look" if path == "hint" else "demo")
         views += 1
         found.update(path=path, views=views)
@@ -847,7 +852,7 @@ async def sweep_table(rig, progress=None) -> list:
     Each frame: {"id", "rgb", "depth" (uint16 mm, aligned), "pose", "intrinsics"} plus "square" when the hole
     is fully in view. progress(k, n) is called after each pose (dashboard: "scanning table... k/n").
     """
-    poses = [q for q in SWEEP_XY if ppa.allowed(*q) and 150.0 <= math.hypot(*q) <= 600.0]
+    poses = [q for q in SWEEP_XY if ppa.reachable(*q, SWEEP_Z) and math.hypot(*q) >= 150.0]
     frames, n = [], len(poses)
     t0 = time.monotonic()
     out = SWEEP_DIR / time.strftime("%Y%m%d-%H%M%S")
@@ -940,10 +945,14 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         height, grip = await ppa.pick(rig, times, tracker, check=lambda: still_target(rig, text, store, tracker))
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
+        # Look first where the found frame saw part of the paper, then the recent sightings; search the observe
+        # pose before any z 580 pose (most squares are in that view)
+        partial = partial_square_xy(found, rig)
         centre = await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy,
                                            choose_spot=square_spot(rig, size),
-                                           more_guesses=[xy for xy, _ in sightings],
-                                           search_poses=[(x, y, SWEEP_Z) for x, y in SWEEP_XY])
+                                           more_guesses=([partial] if partial else []) + [xy for xy, _ in sightings],
+                                           search_poses=[(*ppa.HOME_XY, ppa.ALIGN_Z)]
+                                           + [(x, y, SWEEP_Z) for x, y in SWEEP_XY])
         LAST_SQUARE.update(xy=tuple(centre), ts=time.time())
         q = await rig.pose()
         times["at"] = "check"
@@ -1039,6 +1048,26 @@ def square_sightings(rig) -> list:
         seen.append((float(sq.get("seen_ts") or 0.0), tuple(sq["xy"]), "map-partial" if sq.get("partial") else "map"))
     now = time.time()
     return [(xy, src) for ts, xy, src in sorted(seen, reverse=True) if now - ts <= SQUARE_CACHE_S]
+
+
+def partial_square_xy(found: dict, rig):
+    """
+    Full-centre estimate (AGENT3's drop_square) of a square the found frame shows only cut off, or None; never fails.
+
+    WHY (2026-10-29): after a restart the map had no square and the black tape frame showed the paper only in part,
+    so the carry went straight to the z 580 search (and its far start was out of reach). This is where to look first.
+    """
+    if found.get("square") or found.get("depth") is None:
+        return None
+    try:
+        hit = perception.find_drop_square(found["rgb"], found["depth"])
+        if not hit:
+            return None
+        sq = drop_square.derive(drop_square.update(None, drop_square.observe(hit, found["pose"], intr(rig)), time.time()))
+        return tuple(sq["xy"]) if sq and sq.get("xy") else None
+    except Exception as e:
+        print(f"  partial square estimate failed: {e}")
+        return None
 
 
 def known_square(rig) -> tuple:

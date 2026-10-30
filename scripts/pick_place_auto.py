@@ -49,7 +49,7 @@ TIP_BELOW_CAM = 155.0 - CAM_T[2]  # fingertips are this far past the camera alon
 JAW_TIP_PX = (864.0, 685.0)  # midpoint between the fingertips in the colour image (measured)
 APPROACH_GAP = 70.0  # fingertips this far above the block top for the second, close-range alignment (mm)
 GRIP_DEPTH = 15.0  # how far below the block top the fingertips close (mm)
-TIP_CLEARANCE = 8.0  # fingertips never get closer than this to the measured table (mm)
+TIP_CLEARANCE = 10.0  # fingertips never get closer than this to the table under the jaws (mm)
 PLACE_GAP = 10.0  # block bottom height above the table when released (mm)
 ALIGN_Z = 400.0  # observation height; sees the whole table scene
 SANITY_MIN_Z = 120.0  # absolute flange floor; Viam's own collision check refuses below ~132
@@ -560,8 +560,14 @@ class Rig:
             except Exception as e:
                 if not retryable(e):
                     if isinstance(e, GRPCError):
+                        msg = str(e.message or e.status.name)
+                        # A collision stop leaves the xArm in an error state that refuses every later move (the
+                        # recovery lift too): clear it, so recover() can lift and put the object back
+                        # {VIAM CENTERAL 2026-10-29 "RECOVER 前先对 ARM 发 {'CLEAR_ERROR': TRUE}"}
+                        if "overcurrent" in msg or "clear_error" in msg:
+                            await self.clear_error()
                         # Keep the arm's own words: "move refused: <planner message>"
-                        raise MoveRefused(f"{what} refused: {e.message or e.status.name}") from e
+                        raise MoveRefused(f"{what} refused: {msg}") from e
                     raise
                 last = e
         raise RuntimeError(f"{what}: link still down after {len(RETRY_BACKOFF_S)} reconnects") from last
@@ -669,16 +675,31 @@ class Rig:
         """
         (flange z, table depth, object-top depth) at the current pose, and tighten the floor.
 
-        Floor: fingertips stop TIP_CLEARANCE above the table seen right now. `finder` locates the target
-        in colour so the matching depth blob is used.
+        Floor: fingertips stop TIP_CLEARANCE above the table under the jaws: the fitted table plane at the jaw-axis
+        pixel when that is higher than the frame's table depth (the table tilts ~6 mm across a frame). The silver box
+        cutter (14 mm tall) was grasped at the old floor, 8 mm over the frame's table, and the arm stopped with
+        "collision caused overcurrent". `finder` locates the target in colour so the matching depth blob is used.
         """
+        from sorter.perception import fit_table
+
         p = await self.pose()
         rgb, depth = await self.frame()
         if depth is None:
             raise RuntimeError("no depth map")
         table, top = table_and_near(depth, finder(rgb) if finder else None, shift=self.depth_shift)
-        self.floor_z = p.z - (table - TIP_BELOW_CAM - TIP_CLEARANCE)
+        a, b, c = fit_table(depth.astype(float))
+        au, av = axis_pixel(self.fx, self.fy, self.cx, self.cy, table)
+        under = min(table, float(a * au + b * av + c))  # smaller depth = higher table = higher floor
+        self.floor_z = p.z - (under - TIP_BELOW_CAM - TIP_CLEARANCE)
         return p.z, table, top
+
+    async def clear_error(self) -> None:
+        """Clear the xArm's error state (after a collision/overcurrent stop) so the next move is accepted; never fails."""
+        try:
+            res = await asyncio.wait_for(self.arm.do_command({"clear_error": True}), 10.0)
+            print(f"  arm error cleared: {res}")
+        except Exception as e:
+            print(f"  clear_error failed: {type(e).__name__}: {e}")
 
     async def lift(self, settle: bool = True) -> None:
         """Straight up to ALIGN_Z; the safe response to any failure."""
@@ -956,7 +977,9 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
             # Open down here, where the object stands: if the holding sensor missed a thin object, it stays put
             # instead of falling from ALIGN_Z
             await rig.open()
+        # First 30 mm as a short, slow move (the fingers leave the table without a jerk), then up to ALIGN_Z.
         # Holding: the carry follows (no frame). Missed: the re-servo's frame needs the settle
+        await rig.goto(p.x, p.y, min(p.z + 30.0, ALIGN_Z), settle=False)
         await rig.goto(p.x, p.y, ALIGN_Z, settle=not grabbed)
         t = mark(times, "grab", t)
         if grabbed:
@@ -1050,7 +1073,7 @@ async def locate_square_carrying(rig: Rig, guesses: list = (), search_poses: lis
 
     for xy in guesses:
         lx, ly = carry_look_xy(rig, xy)
-        if not allowed(lx, ly) or not 150.0 <= math.hypot(lx, ly) <= 600.0:
+        if not reachable(lx, ly) or math.hypot(lx, ly) < 150.0:
             continue
         await travel(rig, lx, ly, theta=0.0)
         if find_square((await rig.frame())[0]) is not None:
@@ -1058,11 +1081,12 @@ async def locate_square_carrying(rig: Rig, guesses: list = (), search_poses: lis
             return await confirm()
         print(f"  square: not fully in view at the guess ({xy[0]:.0f},{xy[1]:.0f}); searching")
     poses = list(search_poses or [(x, y, ALIGN_Z) for x, y in SEARCH_XY])
-    poses = [q for q in poses if allowed(q[0], q[1]) and 150.0 <= math.hypot(q[0], q[1]) <= 600.0]
+    poses = [q for q in poses if reachable(*q) and math.hypot(q[0], q[1]) >= 150.0]
     p = await rig.pose()
     at = (p.x, p.y)
     while poses:
-        x, y, z = min(poses, key=lambda q: math.hypot(q[0] - at[0], q[1] - at[1]))
+        # ALIGN_Z looks (the observe pose) before any z 580 one, nearest first within each
+        x, y, z = min(poses, key=lambda q: (q[2] > ALIGN_Z + 1, math.hypot(q[0] - at[0], q[1] - at[1])))
         poses.remove((x, y, z))
         at = (x, y)
         await travel(rig, x, y, theta=0.0, z=z)
@@ -1075,7 +1099,11 @@ async def locate_square_carrying(rig: Rig, guesses: list = (), search_poses: lis
         xy = world_xy({"x": q.x, "y": q.y, "z": q.z, "theta": q.theta},
                       {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}, hit[0], hit[1], table)
         print(f"  square: full view from ({x:.0f},{y:.0f},{z:.0f}) -> centre ({xy[0]:.0f},{xy[1]:.0f})")
-        await travel(rig, *carry_look_xy(rig, xy), theta=0.0)
+        lx, ly = carry_look_xy(rig, xy)
+        if not reachable(lx, ly):
+            print(f"  square: its carry-offset pose ({lx:.0f},{ly:.0f}) is out of reach")
+            continue
+        await travel(rig, lx, ly, theta=0.0)
         if find_square((await rig.frame())[0]) is not None:
             return await confirm()
     raise SquareNotFound("square: no full view of its interior anywhere on the table")
@@ -1295,23 +1323,49 @@ async def search_square(rig: Rig) -> None:
     raise RuntimeError("square: not found anywhere on the table")
 
 
+# Horizontal flange reach by height: the black tape grasp at r ~573 mm could not rise to z 580 ("zero IK solutions"),
+# while (400, +-180, 580) (r 439) and every z 400 pose out to r ~560 were reached. Linear between the two heights.
+# {VIAM CENTERAL 2026-10-29 "GOALPOSE {X:499.9 Y:282.2 Z:580 ...} -> ZERO IK SOLUTIONS PRODUCED"}
+# [CONFIDENCE: INFERRED 65% — one refusal at 574 mm / z 580; the true envelope is not measured]
+REACH_R_MM = ((ALIGN_Z, 600.0), (580.0, 470.0))
+
+
+def reachable(x: float, y: float, z: float = ALIGN_Z) -> bool:
+    """Flange (x, y) within the horizontal reach at height z (REACH_R_MM), outside keep-outs."""
+    (z0, r0), (z1, r1) = REACH_R_MM
+    r_max = r0 if z <= z0 else r1 if z >= z1 else r0 + (r1 - r0) * (z - z0) / (z1 - z0)
+    return allowed(x, y) and math.hypot(x, y) <= r_max
+
+
 async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = ALIGN_Z, settle: bool = True) -> None:
     """
-    Move at height z (default ALIGN_Z) to (x, y) in legs short enough for the MAX_STEP_MM guard.
+    Move to (x, y) at height z (default ALIGN_Z) in legs short enough for the MAX_STEP_MM guard.
 
-    Only the last leg waits SETTLE_S (and only with settle=True): the lift and middle legs are never followed
-    by a frame, and each wait cost 0.6 s.
+    Order of the height change: from below ALIGN_Z straight up first (never sweep low over objects); going DOWN,
+    at the start xy, then across; going UP, across at the current height, then up at the target xy. The black tape
+    carry rose at its grasp xy (r ~573 mm) to z 580 and the planner had no IK solution; the target (a sweep pose)
+    is reachable high, the far grasp xy is not. {VIAM CENTERAL 2026-10-29 "上升时在目标 XY 升；下降时在起点 XY 降"}
+    Only the last move waits SETTLE_S (and only with settle=True): no frame follows the others.
     """
     if not allowed(x, y):
         raise RuntimeError(f"refusing ({x:.0f},{y:.0f}): inside an obstacle keep-out zone")
+    if not reachable(x, y, z):
+        raise MoveRefused(f"refusing ({x:.0f},{y:.0f},{z:.0f}): beyond the arm's reach at that height")
     p = await rig.pose()
-    # Change height first, straight up or down: a leg that also drops z 580 -> 400 is ~270 mm, over MAX_STEP_MM
-    if abs(p.z - z) > 1:
-        await rig.goto(p.x, p.y, z, settle=False)
+    cur = p.z
+    if cur < min(z, ALIGN_Z) - 1:
+        cur = min(z, ALIGN_Z)
+        await rig.goto(p.x, p.y, cur, settle=False)
+    if z < cur - 1:
+        cur = z
+        await rig.goto(p.x, p.y, cur, settle=False)
+    rise = z > cur + 1
     legs = max(1, math.ceil(math.hypot(x - p.x, y - p.y) / 200.0))
     for i in range(1, legs + 1):
-        await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, z, theta=theta,
-                       settle=settle and i == legs)
+        await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, cur, theta=theta,
+                       settle=settle and i == legs and not rise)
+    if rise:
+        await rig.goto(x, y, z, theta=theta, settle=settle)
 
 
 async def place_at(rig: Rig, x: float, y: float, height: float, grip: float, clear_mm: float = None) -> bool:
