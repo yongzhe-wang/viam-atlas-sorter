@@ -22,7 +22,7 @@ DoCommand:
                                      decision and retries; running.progress "item 2/3: snack"; result status done /
                                      partial / failed with items: [{text, status, label, duration_s, fail_reason}]
   {"preview": "green square"}        the same decision without moving: what would be picked, or why not
-  {"reset": true}                    clear the square (pick-out, wipe fallback, verify empty)
+  {"reset": true}                    bucket: let go and back to the observe pose; square: clear it (pick-out, wipe, verify)
   {"scan_table": true}               scan the whole table into the live map (only on request: a grasp never scans
                                      first; it searches and picks at the first view that shows the object)
   {"status": true}                   busy / running / last / warm / seen / library / store mode / live map stats
@@ -1149,6 +1149,14 @@ class GraspByDescription(Generic, EasyResource):
                 self.atlas_panel = await asyncio.to_thread(self._panel)
             elif kind == "scan":
                 doc = await self._scan(rt, rig)
+            elif rt.executor.drop_bucket.enabled():
+                # The bucket has nothing to clear out: a reset lets go and goes back to the observe pose, no square search
+                # {USER 2026-10-30 "WHEN RESET SHOUDLNT SHOW ANY ERROR" (SCREENSHOT: "SQUARENOTFOUND: SQUARE: NO FULL VIEW")}
+                # [CONFIDENCE: CONFIRMED 95% — user's screenshot; clear_square is the paper square's reset]
+                t_r = time.monotonic()
+                await rt.executor.ppa.release_jaws(rig)
+                await rt.executor.back_to_observe(rig)
+                doc = {"status": "done", "label": "ready", "duration_s": round(time.monotonic() - t_r, 1)}
             else:
                 doc = await rt.executor.clear_square(rig, self.store)
             summary = {k: doc.get(k) for k in SUMMARY_KEYS if doc.get(k) is not None}
