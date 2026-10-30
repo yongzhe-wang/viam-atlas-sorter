@@ -161,7 +161,8 @@ def _mark_in_square(tmap: dict) -> None:
 
 
 # ---- dynamic map: every frame the arm takes updates it ------------------------------------------------------
-SKIP_S = 0.5  # a frame this soon after the last one at the same pose adds nothing: skip (saves the CLIP batch)
+SKIP_S = 0.3  # a frame this soon after the last one at the same pose adds nothing: skip (saves the CLIP batch);
+# under the 0.5 s look period, so 2 Hz frames go into the map
 SAME_POSE_MM, SAME_POSE_DEG = 5.0, 2.0
 MOVE_CONF = 0.5  # a confident sighting of a label seen elsewhere moves that object (one of each on the table)
 MISSES_TO_DROP = 2  # expected in view, not detected, this many frames in a row -> removed from the map

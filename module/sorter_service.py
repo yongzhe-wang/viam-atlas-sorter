@@ -104,7 +104,9 @@ SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "durat
 # search {USER 2026-10-29 "I ALSO WANT RETRY WHEN FAIL"} [CONFIDENCE: SINGLE-SRC 90% — 3 is my pick: a 4th
 # try past ~45 s of retries loses the demo minute anyway]
 GRASP_ATTEMPTS = 3
-WATCH_PERIOD_S = 1.0  # idle perception: one frame about every second
+# idle perception: a frame every 0.5 s (the camera is read on the robot itself; a look is ~380 ms)
+# {USER 2026-10-30 "DO MORE FREUYQNECY FOR IMAGES AND REPLANNING, THISIS LOCAL SHOULD WORK"}
+WATCH_PERIOD_S = 0.5
 SLOW_WATCH_PERIOD_S = 2.0  # ... every 2 s when one look takes longer than SLOW_LOOP_MS, so jobs are not starved
 SLOW_LOOP_MS = 800
 SEEN_FRESH_S = 1.5  # a grasp decides from the cached frame only when it is at most this old (VIAM CENTERAL)
@@ -118,7 +120,9 @@ MAP_FRESH_S = 60.0  # a live-map object seen this recently is gone to directly; 
 MAP_PERSIST_S = 2.0  # live map -> Store.put_table_map at most this often (VIAM CENTERAL)
 QUEUE_POLL_S = 0.2  # how soon the next queued object starts once the arm is free
 RECENT_JOBS = 12  # finished jobs kept for {"status"}["recent"]: the dashboard matches queue-started jobs by id
-MAP_TASK_EVERY_S = 1.0  # during a task, at most one executor frame per second goes to the live map (servo keeps CPU)
+# during a task, at most one executor frame per 0.5 s goes to the live map, and none while the last is still being
+# folded in (live.busy()), so the servo keeps its CPU
+MAP_TASK_EVERY_S = 0.5
 IDLE_SIG_PX = 12  # idle pictures differ when a box centre moved this many pixels (or labels / intruders changed)
 IDLE_MAP_KEEPALIVE_S = 20.0  # ... else one idle picture this often still goes into the map and the log
 OBS_PAGE_LIMIT = 200  # {"observations"}: records per page without images ...

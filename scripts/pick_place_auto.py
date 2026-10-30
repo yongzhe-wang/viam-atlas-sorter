@@ -109,6 +109,11 @@ SERVO_MAX_S = 12.0
 SERVO_LOST_FACTOR = 3.0
 SERVO_LOST_MIN_PX = 40.0
 MODEL_STEP_CAP_MM = 200.0  # one model step may cross most of the view; goto() still enforces MAX_STEP_MM
+# A model step that left less than this is at the noise of the pixel finder (8 px ~ 3 mm at the servo depth): the next
+# step is the model's again, not a probe round. 4 of the 7 switches to probing today were 8-9 px left; each probe round
+# cost 2.1-4.7 s and one made it worse. {LOG 20:35:19 "MODEL JACOBIAN STEP LEFT 8PX OF 22PX; PROBING FROM HERE" ->
+# 20:35:23 "ERR=26PX" -> 20:35:28 "ERR=33PX"} [CONFIDENCE: CONFIRMED 85% — sfhack4 module log 2026-10-30, 28 refines]
+PROBE_MIN_PX = 20.0
 
 
 def model_jacobian(fx: float, fy: float, cx: float, cy: float, theta: float, depth: float) -> np.ndarray:
@@ -993,6 +998,7 @@ class Rig:
         """
         J, probing, prev = None, not SERVO_MODEL_J, None  # prev: error before an uncapped model step
         last_err = None  # the previous round's error: a jump past SERVO_LOST_FACTOR of it is a lost target
+        retried = False  # a noise-level miss of the model step has had its second model step
         t_end = time.monotonic() + SERVO_MAX_S
         for it in range(8):
             if time.monotonic() > t_end:
@@ -1026,8 +1032,13 @@ class Rig:
                     print(f"  {label}: {e[0] * mm:.0f},{e[1] * mm:.0f} mm off, within {tol_mm[0]:.0f},{tol_mm[1]:.0f}: no move")
                     return
             if not probing and prev is not None and err > max(TOL_PX, 0.3 * prev):
-                print(f"  {label}: model Jacobian step left {err:.0f}px of {prev:.0f}px; probing from here")
-                probing = True
+                if err > PROBE_MIN_PX or retried:
+                    print(f"  {label}: model Jacobian step left {err:.0f}px of {prev:.0f}px; probing from here")
+                    probing = True
+                else:
+                    # noise-level residual: one more model step first; a second miss probes, as before
+                    print(f"  {label}: model Jacobian step left {err:.0f}px of {prev:.0f}px; one more model step")
+                    retried = True
             if not probing:
                 J = model_jacobian(self.fx, self.fy, self.cx, self.cy, p.theta, plane)
             if err < TOL_PX and (J is not None or not any(offset)):
@@ -1039,16 +1050,19 @@ class Rig:
                 return
             if probing:
                 # Reusing one probed Jacobian made the servo oscillate on the arm (414 -> 476 -> 326 -> 372 ...
-                # px); fresh probes converged in 2-3 iterations. Probe +15 mm along arm x then y.
+                # px); fresh probes converged in 2-3 iterations. Probe +15 mm along arm x, then +15 mm along y from
+                # there: 2 moves and no returns (was 4), each column the image's move over one 15 mm leg; the
+                # correction below is from p either way (goto takes absolute coordinates)
+                # {USER 2026-10-30 "WE NEED TO BE SLIGHTLY FASTER AND DO MORE FREUYQNECY FOR IMAGES AND REPLANNING"}
                 probe = 15.0
-                cols = []
-                for dx, dy in ((probe, 0.0), (0.0, probe)):
+                cols, last = [], hit
+                for dx, dy in ((probe, 0.0), (probe, probe)):
                     await self.goto(p.x + dx, p.y + dy, p.z)
                     h2 = finder((await self.frame())[0])
-                    await self.goto(p.x, p.y, p.z)
                     if h2 is None:
                         break
-                    cols.append([(h2[0] - hit[0]) / probe, (h2[1] - hit[1]) / probe])
+                    cols.append([(h2[0] - last[0]) / probe, (h2[1] - last[1]) / probe])
+                    last = h2
                 if len(cols) == 2:
                     J = np.array(cols).T  # px per mm, columns = arm x, arm y
                 elif J is None:
