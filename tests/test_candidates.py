@@ -69,6 +69,18 @@ def test_mm_bag_is_dark():
     assert "dark" in C._open_veto(kind) and C._open_veto(bag) == ""
 
 
+def test_mm_bag_size():
+    from types import SimpleNamespace as N
+    from sorter import perception
+    fx = perception.INTRINSICS["fx"]
+    px = lambda mm: mm * fx / 557.0
+    obj = lambda colour, length, width: N(recognised=None, colour=colour, top_depth_mm=557.0, length_px=px(length), width_px=px(width))
+    assert C._mm_bag(obj("black", 90, 61))  # the bag
+    assert not C._mm_bag(obj("black", 41, 25))  # the bat toy
+    assert not C._mm_bag(obj("black", 156, 34))  # the screwdriver's handle
+    assert not C._mm_bag(obj("yellow", 84, 78))  # the Sour Patch bag
+
+
 def test_explicit_name_is_not_overruled_by_graspability():
     kind = rec(crop(snack=0.20, mm=0.21, object=0.24), "granola bar", ["granola bar"], h=20.0)
     mm = rec(crop(snack=0.28, mm=0.29, object=0.21), h=7.0)

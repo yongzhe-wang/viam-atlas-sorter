@@ -101,6 +101,7 @@ FOOD_SIBLING_MARGIN = 0.01
 # {REPLAY 21:34:00 "BLACK NONE (467,-17)"; 21:36:29 "NONE CONF 0.00 CYAN"; 21:34:27 "YELLOW NONE (626,-143)"}
 # [CONFIDENCE: INFERRED 75% — colours from those stored detections; red is allowed because the bag's print is red]
 MM_BAG_COLOURS = ("black", "brown", "red")
+MM_BAG_MIN_WIDTH_MM, MM_BAG_MIN_LENGTH_MM = 50.0, 70.0
 FOOD_WORDS = {"snack", "snacks", "candy", "candies", "chocolate", "treat", "treats", "food"}
 FOOD_NAME_WORDS = FOOD_WORDS | {"granola", "breakfast"}  # a library entry with one of these in a name is a food
 MM_FORMS = re.compile(r"\bm\s*(?:&|\+|\band\b|\bn\b)\s*m(?:'?s)?\b|\bmnms?\b|\bmms\b", re.I)
@@ -420,6 +421,7 @@ def rank(objs: list, text: str, store=None, recognised: list = None, known: bool
                     o.open_gate.update(food_gap=float(emb @ _name_emb(food_q)) - float(emb @ _name_emb(sib)), food_name=sib)
                     if getattr(o, "colour", None) not in MM_BAG_COLOURS:
                         o.open_gate.update(wrong_colour=getattr(o, "colour", None))
+                    o.open_gate.update(mm_bag=_mm_bag(o))
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
 
@@ -526,7 +528,7 @@ def _best_open(ranked: list, text: str, qcol: set, out: dict) -> dict:
     cands = []
     for o, s in ranked:
         g = o.open_gate
-        if (not qcol or colour_present(qcol, o)) and not _open_veto(o) and g["neg_gap"] >= OPEN_NEG_MARGIN and s >= MIN_SCORE:
+        if (not qcol or colour_present(qcol, o)) and not _open_veto(o) and (g["neg_gap"] >= OPEN_NEG_MARGIN or g.get("mm_bag")) and s >= MIN_SCORE:
             cands.append((o, s))
     if cands:
         margin = cands[0][1] - cands[1][1] if len(cands) > 1 else 1.0
@@ -549,6 +551,19 @@ def _known_as_other(o, text: str) -> bool:
     """Recognised with HARD_VETO_CONF as something the query does not name: never accepted, by CLIP or by the model."""
     return (getattr(o, "recognised", None) is not None and getattr(o, "recognised_conf", 0.0) >= HARD_VETO_CONF
             and not name_matches(text, getattr(o, "recognised_names", []) or [o.recognised]))
+
+
+def _mm_bag(o) -> bool:
+    """
+    Unknown to the library, dark and bag-sized: the M&M's bag, without CLIP's word for it (the real bag was refused as "nothing
+    here looks like"). {T_MM "BLACK H17 L90 W61"; T_FINAL "BLACK H10 L91 W74"; BAT TOY "BLACK H9 L41 W25"; SCREWDRIVER "BLACK H27 L156 W34"}
+    [CONFIDENCE: INFERRED 75% — four real frames at z 580; the width is what parts them]
+    """
+    if getattr(o, "recognised", None) is not None or getattr(o, "colour", None) not in ("black", "brown"):
+        return False
+    from sorter import perception  # (as segment_full's caller here: not at module level)
+    mm = float(getattr(o, "top_depth_mm", 0.0) or 0.0) / perception.INTRINSICS["fx"]
+    return float(getattr(o, "width_px", 0.0)) * mm >= MM_BAG_MIN_WIDTH_MM and float(getattr(o, "length_px", 0.0)) * mm >= MM_BAG_MIN_LENGTH_MM
 
 
 def _open_veto(o) -> str:
