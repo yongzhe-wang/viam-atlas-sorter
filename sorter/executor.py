@@ -1183,6 +1183,35 @@ def width_mm(obj, fx: float) -> float:
     return grasp.across_mm(obj, fx)
 
 
+LOOK_FAR_R_MM = 580.0  # a look past the reach model is pulled in to this flange radius (z 400 poses out to ~560 were reached)
+LOOK_EDGE_MM = 100.0  # ... while the point stays this close to the image centre (the view spans ~+-150 mm at z 400)
+
+
+def look_poses(xy) -> list:
+    """
+    Flange (x, y) at ALIGN_Z to look at table point xy, in the order to try: the pose that centres it, or, past the reach
+    model (ppa.REACH_R_MM), the same ray pulled in to LOOK_FAR_R_MM first (the point then sits off-centre but in view), then
+    the centring pose. No radius refusal: the planner decides (travel raises MoveRefused); only keep-outs and the 120 mm
+    base clearance rule a pose out here. [] when none is allowed.
+    WHY: the tape at (639,-146) was "out of reach" by the fixed radius (look flange r 617 > 600) and never tried.
+    {USER 2026-10-30 "IT COULDNT FIND THE TAPE" ("A CANDIDATE AT (639,-146) IS OUT OF REACH")}
+    {USER 2026-10-30 "THERE ARE MORE JOINTS IF YOU MOVE ALL IT SHOULD WORK"}
+    [CONFIDENCE: INFERRED 70% — geometry only (pulled-in pose 37 mm off-centre for the tape); not run on the arm]
+    """
+    fx, fy = perception.look_flange_xy(tuple(xy))
+    r = math.hypot(fx, fy)
+    if not ppa.allowed(fx, fy) or r < 120.0:
+        return []
+    if ppa.reachable(fx, fy):
+        return [(fx, fy)]
+    out = []
+    if r - LOOK_FAR_R_MM <= LOOK_EDGE_MM:
+        ix, iy = fx * LOOK_FAR_R_MM / r, fy * LOOK_FAR_R_MM / r
+        if ppa.allowed(ix, iy):
+            out.append((ix, iy))
+    return out + [(fx, fy)]
+
+
 CAND_MERGE_MM = 60.0  # two sightings this close, from different views, are one candidate
 CAND_LOOKS = 3  # close looks at the best candidates, at most
 EXCLUDED_MM = 60.0  # an object this close to where a failed pick was is that object
@@ -1321,10 +1350,8 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
         return await coverage_search(rig, text, store, hint_xy, progress, skip_current, excluded)
     poses = []
     if hint_xy is not None:
-        fx, fy = perception.look_flange_xy(tuple(hint_xy))
-        # Same reach limits as every other look: keep-outs and the 120 mm base clearance
-        if ppa.reachable(fx, fy) and math.hypot(fx, fy) >= 120.0:
-            poses.append(("hint", fx, fy, ppa.ALIGN_Z))
+        # Same looks as every other: keep-outs and the 120 mm base clearance, a far spot from a pulled-in pose
+        poses += [("hint", fx, fy, ppa.ALIGN_Z) for fx, fy in look_poses(hint_xy)[:1]]
     # Only poses the arm can reach at SWEEP_Z (ppa.reachable): a far corner is skipped, not refused mid-search
     left = [q for q in SWEEP_XY if ppa.reachable(*q, SWEEP_Z) and math.hypot(*q) >= 150.0]
     p = await rig.pose()
@@ -1422,9 +1449,8 @@ async def coverage_search(rig, text: str, store, hint_xy, progress, skip_current
     at = (p.x, p.y, p.z)
     plan = []
     if hint_xy is not None:
-        fx, fy = perception.look_flange_xy(tuple(hint_xy))
-        if ppa.reachable(fx, fy) and math.hypot(fx, fy) >= 120.0:
-            plan.append(("hint", (fx, fy, ppa.ALIGN_Z)))
+        # the first pose that sees it (a refused one is skipped below and the search goes on)
+        plan += [("hint", (fx, fy, ppa.ALIGN_Z)) for fx, fy in look_poses(hint_xy)[:1]]
     # Where the map (or the failed try) last saw it comes first, with no look from here before; the current view only
     # without such a spot {USER 2026-10-30 "WHEN YOU DO PLANNING SHOULD FIRST CHECK THE LOCATION ON THE MAP FOR THAT
     # OBJECT IF NOT FOUND THEN MOVE"}
@@ -1503,16 +1529,21 @@ async def close_looks(rig, text: str, store, table: list, look_kw: dict, views: 
         if math.hypot(*c["xy"]) < near:
             notes.append(f"a candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) is too close to the base")
             continue
-        fx, fy = perception.look_flange_xy(c["xy"])
-        if not ppa.reachable(fx, fy) or math.hypot(fx, fy) < 120.0:
-            notes.append(f"a candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) is out of reach")
+        poses, refused = look_poses(c["xy"]), None
+        if not poses:
+            notes.append(f"a candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) is in a keep-out or by the base")
             continue
-        try:
-            await ppa.travel(rig, fx, fy, theta=0.0, z=ppa.ALIGN_Z)
-        except ppa.MoveRefused as e:
-            if isinstance(e, ppa.EStop):
-                raise
-            notes.append(f"a candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) could not be reached: {e}")
+        for fx, fy in poses:
+            try:
+                await ppa.travel(rig, fx, fy, theta=0.0, z=ppa.ALIGN_Z)
+                refused = None
+                break
+            except ppa.MoveRefused as e:
+                if isinstance(e, ppa.EStop):
+                    raise
+                refused = e
+        if refused is not None:  # the planner refused every pose that sees it
+            notes.append(f"a candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) could not be reached: {refused}")
             continue
         looked += 1
         found = await look_here(rig, text, store, source="look", **look_kw)
