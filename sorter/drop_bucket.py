@@ -27,6 +27,8 @@ FRESH_S = 5.0  # a bucket estimate older than this is looked for again: people m
 CONFIRM_MM = 30.0  # the frame over the mouth puts it farther than this from the target: move there
 LOOK_Z = 580.0  # the whole 197 mm bucket fits one view from here
 RELEASE_TRIES = 3  # moves toward a bucket that keeps moving before giving up (still holding)
+HINT_SKIP_MM = 150.0  # a search pose this close to the one over the last-known spot shows the same table: not looked from again
+_LAST: dict = {}  # the last bucket this process saw ({xy, seen_ts}): where the next search looks first, however old
 
 
 class BucketOutOfReach(ppa.SquareNotFound):
@@ -62,19 +64,59 @@ def fresh_bucket(found: dict, live: dict, k: dict, now: float = None):
     return None
 
 
+def remember(b) -> None:
+    """Keep `b`'s centre as the last-known bucket spot (the first look of the next search)."""
+    if b and b.get("xy") is not None:
+        _LAST.update(xy=[float(b["xy"][0]), float(b["xy"][1])], seen_ts=float(b.get("seen_ts") or time.time()))
+
+
+def last_known(live: dict = None):
+    """
+    Where the bucket was last seen, however long ago: the newer of the live map's entry and the last bucket this process
+    saw; None if neither. Old is fine: it is only where the search looks first.
+    {USER 2026-10-30 "IT IS ALWAYS SEARCHING A ENTIRE CIRCLE, IT SHOULD FIRST GO TO THE REGION PREVIOSU FIND THEN IF NOT FOUND"}
+    """
+    cands = [e for e in ((live or {}).get("bucket"), _LAST) if e and e.get("xy") is not None]
+    if not cands:
+        return None
+    xy = max(cands, key=lambda e: float(e.get("seen_ts") or 0.0))["xy"]
+    return float(xy[0]), float(xy[1])
+
+
+def _over(xy):
+    """(x, y, LOOK_Z) over `xy`, pulled toward HOME_XY in 25 mm steps until reachable; None if nothing on the way is."""
+    hx, hy = ppa.HOME_XY
+    x, y = xy
+    for _ in range(40):
+        if ppa.reachable(x, y, LOOK_Z):
+            return x, y, LOOK_Z
+        d = math.hypot(x - hx, y - hy)
+        if d <= 25.0:
+            break
+        x, y = x + (hx - x) * 25.0 / d, y + (hy - y) * 25.0 / d
+    return None
+
+
 async def look(rig, k: dict):
     """The bucket in a frame from where the arm is, or None."""
     q = await rig.pose()
     rgb, depth = await rig.frame()
     b = from_frame(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta}, k)
-    return None if b is None else dict(b, source=f"look ({q.x:.0f},{q.y:.0f},{q.z:.0f})", seen_ts=time.time())
+    if b is None:
+        return None
+    b = dict(b, source=f"look ({q.x:.0f},{q.y:.0f},{q.z:.0f})", seen_ts=time.time())
+    remember(b)
+    return b
 
 
-async def locate(rig, k: dict, poses: list):
+async def locate(rig, k: dict, poses: list, hint=None):
     """
-    Look for the bucket while holding: from here, then from LOOK_Z over here, then from each of `poses` ((x, y, z), nearest
-    first); the first full view wins, else the best partial one; None if no view shows it.
+    Look for the bucket while holding: from here, then from LOOK_Z over `hint` (where it was last seen, last_known()), then
+    from LOOK_Z over here, then from each of `poses` ((x, y, z), nearest first); the first full view wins, else the best
+    partial one; None if no view shows it. With a hint, the rise over here and the poses near the hint's are skipped.
     {VIAM CENTERAL 2026-10-30 "先在当前位置看一眼，看不到就升到 Z580 看全景"}
+    {USER 2026-10-30 "IT SHOULD FIRST GO TO THE REGION PREVIOSU FIND THEN IF NOT FOUND"}
+    [CONFIDENCE: SINGLE-SRC 75% — offline (tests/test_drop_bucket.py); the logs found it at the 3rd-5th pose every time]
     """
     best = await look(rig, k)
     if best is not None and not best["partial"]:
@@ -82,6 +124,18 @@ async def locate(rig, k: dict, poses: list):
     p = await rig.pose()
     first = [(p.x, p.y, LOOK_Z)] if ppa.reachable(p.x, p.y, LOOK_Z) else []
     left = [q for q in poses if ppa.reachable(*q) and math.hypot(q[0], q[1]) >= 150.0]
+    over = _over(hint) if hint is not None else None
+    if over is not None:
+        print(f"  bucket: looking first where it was last seen ({hint[0]:.0f},{hint[1]:.0f})")
+        await ppa.travel(rig, over[0], over[1], theta=0.0, z=over[2])
+        b = await look(rig, k)
+        if b is not None and not b["partial"]:
+            return b
+        if b is not None and (best is None or b["confidence"] > best["confidence"]):
+            best = b
+        p = await rig.pose()
+        first = []  # moved away from "here": its rise would look at the hint's table again
+        left = [q for q in left if math.hypot(q[0] - over[0], q[1] - over[1]) > HINT_SKIP_MM]
     at = (p.x, p.y)
     while first or left:
         if first:
@@ -229,7 +283,7 @@ async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict,
                 await rig.rise(LOOK_Z)
                 seen = await look(rig, k)
             if seen is None:
-                seen = await locate(rig, k, poses)
+                seen = await locate(rig, k, poses, hint=b["xy"])
             if seen is None:
                 raise ppa.SquareNotFound("bucket: not seen again before the release; still holding, nothing let go")
             d = math.dist(seen["xy"], b["xy"])
@@ -265,6 +319,7 @@ async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict,
     print(f"4/5 release over the bucket (confirmed within {looks[-1]:.0f} mm)")
     await ppa.release_jaws(rig)
     ppa.save_state(False)
+    remember(b)  # released over it: the next object's search looks here first
     times["place"] = round(time.monotonic() - t - times["carry"], 1)
     centre = (xy[0] + off[0], xy[1] + off[1])
     return {"xy": xy, "z": z, "off_mm": math.dist(centre, b["xy"]), "looks": looks}

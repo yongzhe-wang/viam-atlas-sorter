@@ -1809,7 +1809,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
             poses = [(*ppa.HOME_XY, drop_bucket.LOOK_Z)] + [(x, y, SWEEP_Z) for x, y in SWEEP_XY]
             if bk is None:
                 times["at"] = "carry"
-                bk = await drop_bucket.locate(rig, intr(rig), poses)
+                # where the bucket was last seen (map or this process), however long ago, is looked at first
+                bk = await drop_bucket.locate(rig, intr(rig), poses, hint=drop_bucket.last_known(live))
             if bk is None:
                 raise ppa.SquareNotFound("no bucket in view from here or from above; still holding")
             # Where the object's centre is from the jaws at theta 0: that is what must be over the mouth
