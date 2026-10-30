@@ -91,7 +91,7 @@ BUILD_INFO_PATH = Path(__file__).resolve().parent.parent / "BUILD_INFO.json"
 # find_path / square_path (AGENT1 0d3c817): how the executor really found the object and the square, for status.last
 SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "duration_s", "fail_phase", "fail_reason",
                 "find_path", "find_views", "square_path", "objects", "check", "learned", "alias_of", "views_added",
-                "views_skipped", "frames", "searchable_s", "top_score")
+                "views_skipped", "frames", "searchable_s", "top_score", "target_xy", "primitive", "attempt_primitives")
 # A grasp that fails by accident (slipped, closed on air) is tried this many times in all, each from a fresh
 # search {USER 2026-10-29 "I ALSO WANT RETRY WHEN FAIL"} [CONFIDENCE: SINGLE-SRC 90% — 3 is my pick: a 4th
 # try past ~45 s of retries loses the demo minute anyway]
@@ -961,27 +961,51 @@ class GraspByDescription(Generic, EasyResource):
         Retries (_retryable): up to GRASP_ATTEMPTS in all, each later one searching afresh; job_info["attempt"]
         says which try is running, and the summary's "attempts" lists every try when there was more than one.
         any_match: a list item, so several objects fitting the name is fine (execute(accept_ambiguous=True)).
+        A retry looks first where the failed try's object was (its target_xy): searching the table afresh, "chocolate" went on
+        to the KIND bar. {VIAM CENTERAL 2026-10-30 "把上一次选中物体的 XY 作为 HINT 传下去"}
+        SEARCH_V2: a failed or refused pick moves on to the next candidate, the object's xy on this job's excluded list; only when
+        none is left does the failure stand. An accident (not a refusal) on a table with nothing else gets one more try at the
+        same objects. {VIAM CENTERAL 2026-10-30 "全部候选都失败才算失败，ATTEMPTS 里记每次的物体和抓法"}
+        [CONFIDENCE: SINGLE-SRC 70% — the second try at the same object is my addition: it is what made the tape work]
         """
         if target is not None:
             chosen = {"label": target.get("recognised"), "colour": getattr(target.get("obj"), "colour", None)}
         tries = GRASP_ATTEMPTS if kind == "grasp" else 1
         attempts: list = []
+        v2 = kind == "grasp" and self._search_v2()
+        excluded: list = []
+        failure, again, listed = None, False, False  # the last failed pick; one more try used; the summary is in attempts
+        keys = ("status", "fail_phase", "fail_reason", "duration_s", "target_xy", "primitive")
         for n in range(1, tries + 1):
             self.job_info.update(attempt=n, attempts_max=tries)
             # skip_current only for the first try: a failed try moved the arm, so a retry looks from where it is
-            summary, run_via = await self._once(kind, text, target, target_xy, skip_current and n == 1, any_match)
+            summary, run_via = await self._once(kind, text, target, target_xy, skip_current and n == 1, any_match, list(excluded))
             # The first attempt's path names the job (frame / map / search); retries always search
             via = run_via if n == 1 else via
-            if n == tries or not self._retryable(kind, summary):
+            if v2 and summary.get("status") == "not_found" and failure is not None:
+                # Nothing left but what already failed: that failure is the answer, unless one more try may fix it
+                attempts.append({k: summary.get(k) for k in keys})
+                if again or failure.get("status") != "failed" or n == tries:
+                    summary, listed = dict(failure), True
+                    break
+                again, excluded = True, []
+                target, target_xy = None, failure.get("target_xy")
+                continue
+            if n == tries or not (self._retryable_v2(summary) if v2 else self._retryable(kind, summary)):
                 break
-            attempts.append({k: summary.get(k) for k in ("status", "fail_phase", "fail_reason", "duration_s")})
+            attempts.append({k: summary.get(k) for k in keys})
             LOGGER.info(f"grasp {text!r} attempt {n}/{tries} failed ({summary.get('fail_reason')}): retrying")
-            # The failed try moved things (a slipped object lands somewhere else): search again from the
-            # observe pose instead of reusing the old frame or map position
+            # The failed try moved things (a slipped object lands somewhere else): a fresh look, not the old frame or map
+            # position; first where its object was, or with that object left out
             target = target_xy = None
+            if v2:
+                failure = summary
+                if summary.get("target_xy"):
+                    excluded.append(summary["target_xy"])
+            else:
+                target_xy = summary.get("target_xy")
         if attempts:
-            summary["attempts"] = attempts + [{k: summary.get(k) for k in ("status", "fail_phase", "fail_reason",
-                                                                           "duration_s")}]
+            summary["attempts"] = attempts + ([] if listed else [{k: summary.get(k) for k in keys}])
         if kind == "grasp":
             summary.update(fast_path=via == "frame", via=via, decide_ms=decide_ms)
             # Something was picked (or found): name it by the decided library label, keep the colour apart
@@ -989,6 +1013,18 @@ class GraspByDescription(Generic, EasyResource):
                 summary.update(label=chosen.get("label") or summary["label"],
                                colour=summary.get("colour") or chosen.get("colour"))
         return summary
+
+    @staticmethod
+    def _search_v2() -> bool:
+        try:
+            return _runtime().executor.grasp.search_v2()
+        except Exception:
+            return False
+
+    @classmethod
+    def _retryable_v2(cls, summary: dict) -> bool:
+        """SEARCH_V2: a refusal names one object, and the next candidate may not have its problem."""
+        return summary.get("status") in ("unsafe_grasp", "too_close", "too_wide") or cls._retryable("grasp", summary)
 
     @staticmethod
     def _retryable(kind: str, summary: dict) -> bool:
@@ -1011,7 +1047,8 @@ class GraspByDescription(Generic, EasyResource):
                                              "SquareNotFound"))
 
     async def _once(self, kind: str, text: Optional[str], target: Optional[dict],
-                    target_xy: Optional[list], skip_current: bool = False, any_match: bool = False) -> tuple:
+                    target_xy: Optional[list], skip_current: bool = False, any_match: bool = False,
+                    excluded: Optional[list] = None) -> tuple:
         """One grasp attempt, reset or table scan -> (summary, via); never raises (an exception becomes "error")."""
         via = "scan" if kind == "scan" else "search"
         try:
@@ -1035,6 +1072,8 @@ class GraspByDescription(Generic, EasyResource):
                     kwargs["skip_current"] = True
                 if any_match and "accept_ambiguous" in params:
                     kwargs["accept_ambiguous"] = True
+                if excluded and "excluded" in params:
+                    kwargs["excluded"] = excluded
                 rig.picked_obj = None
                 doc = await rt.executor.execute(rig, text, self.store, mode="demo", **kwargs)
                 if teach.enabled():

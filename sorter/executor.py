@@ -1216,13 +1216,51 @@ async def clear_frame(rig) -> tuple:
         await asyncio.sleep(1.0)
 
 
-async def look_here(rig, text: str, store, source: str = "demo") -> dict:
+CAND_MERGE_MM = 60.0  # two sightings this close, from different views, are one candidate
+CAND_LOOKS = 3  # close looks at the best candidates, at most
+EXCLUDED_MM = 60.0  # an object this close to where a failed pick was is that object
+
+
+def view_candidates(seg, delivered, excluded: list, text: str, store, recs: list, pose: dict, k: dict) -> list:
+    """
+    Every object of this view that may be what was asked for, best first, with its table xy: clip_embed.candidates() over the
+    objects best() saw and those the image border cuts, which a closer look may show whole. Never fails the search.
+    """
+    pool = [o for o in seg.objects if not delivered(o)] + [o for o, why in seg.excluded if why and "edge" in why and not delivered(o)]
+    ids = {id(o) for o in pool}
+    try:
+        ranked = clip_embed.candidates(pool, text, store, recognised=[r for r in recs if id(r["obj"]) in ids]) if pool else []
+    except Exception as e:
+        print(f"  candidates failed: {e}")
+        return []
+    out = []
+    for c in ranked:
+        u, v, _ = grasp_px(c["obj"], pose, k)
+        xy = perception.world_xy(pose, k, u, v, c["obj"].top_depth_mm)
+        if not near_any(xy, excluded, EXCLUDED_MM):
+            out.append({"xy": (float(xy[0]), float(xy[1])), "score": float(c["score"]), "why": c.get("why")})
+    return out
+
+
+def merge_candidates(table: list, new: list) -> None:
+    """Into the search's table: the same object seen from two views is one entry, with its better score."""
+    for c in new:
+        same = next((t for t in table if math.hypot(t["xy"][0] - c["xy"][0], t["xy"][1] - c["xy"][1]) <= CAND_MERGE_MM), None)
+        if same is None:
+            table.append(dict(c))
+        elif c["score"] > same["score"]:
+            same.update(c)
+
+
+async def look_here(rig, text: str, store, source: str = "demo", excluded: list = ()) -> dict:
     """
     One frame from the current pose -> best match for `text` among objects outside the square.
 
     Returns clip_embed.best()'s dict plus "rgb", "depth", "pose", and "square" (square_from_frame) when the
     hole is in view. Objects cut by the image border or standing in the square are never candidates.
     Waits while the camera is blocked (clear_frame), so a cable in front of the lens is not "not found".
+    excluded: table xy of objects a failed pick of this job already tried: not candidates.
+    SEARCH_V2 with nothing accepted: "candidates" holds view_candidates(), for the search's second stage.
     """
     rgb, depth = await clear_frame(rig)
     pose = pose_dict(await rig.pose())
@@ -1244,11 +1282,17 @@ async def look_here(rig, text: str, store, source: str = "demo") -> dict:
             return False
         gu, gv, _ = grasp_px(o, pose, k)
         return drop_square.contains(sq, perception.world_xy(pose, k, gu, gv, o.top_depth_mm))
-    objs = [o for o in seg.objects if not o.touches_edge and not delivered(o)]
+
+    def tried(o) -> bool:
+        gu, gv, _ = grasp_px(o, pose, k)
+        return near_any(perception.world_xy(pose, k, gu, gv, o.top_depth_mm), list(excluded), EXCLUDED_MM)
+    objs = [o for o in seg.objects if not o.touches_edge and not delivered(o) and not tried(o)]
     ids = {id(o) for o in objs}
     found = (clip_embed.best(objs, text, store, recognised=[r for r in recs if id(r["obj"]) in ids], rgb=rgb)
              if objs else {"obj": None, "reason": "nothing seen", "searchable": True})
     found.update(rgb=rgb, depth=depth, pose=pose, square=square_from_frame(rgb, depth, pose, intr(rig)))
+    if grasp.search_v2() and found.get("obj") is None:
+        found["candidates"] = view_candidates(seg, delivered, list(excluded), text, store, recs, pose, k)
     return found
 
 
@@ -1262,7 +1306,8 @@ def hint_for(text: str, store):
     return tuple(w["xy"]) if w else None
 
 
-async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, skip_current: bool = False) -> dict:
+async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, skip_current: bool = False,
+                          excluded: list = ()) -> dict:
     """
     Look for `text`, stopping at the FIRST frame whose best() accepts an object; no whole-table sweep first.
 
@@ -1279,6 +1324,12 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
     square but an earlier one did, "square" is that one and "square_from" is "search".
     progress(k, n, path, found) after each look (AGENT 2's module status: "searching... pose k/n", "found at
     pose k"); n = 1 + planned poses. Called plainly; an awaitable it returns is awaited.
+    SEARCH_V2, two stages: a view where best() accepts still ends the search at once; the others leave their candidates
+    in a table merged by table xy, and once every pose was seen the best CAND_LOOKS get a close look from ALIGN_Z, where
+    best() decides again, strictly. The tape seen from z 580 was "not found" because no single far frame convinced best().
+    {VIAM CENTERAL 2026-10-30 "第一阶段 ... 累积到一个去重的候选表 ... 第二阶段：按分数从高到低 ... 最多看 3 个候选"}
+    [CONFIDENCE: SINGLE-SRC 75% — offline with stubs; a table without the object costs up to 3 more moves before not_found]
+    excluded: objects a failed pick of this job already tried (the module's retry).
     """
     hint_xy = hint_xy if hint_xy is not None else hint_for(text, store)
     poses = []
@@ -1299,6 +1350,8 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
         at = q
     square, views, last = None, 0, {"obj": None, "reason": "nothing seen"}
     first = [] if skip_current else [("current", None, None, None)]
+    table = []  # SEARCH_V2's candidates
+    look_kw = {"excluded": list(excluded)} if excluded else {}
     for path, x, y, z in first + poses:
         if path != "current":
             try:
@@ -1308,7 +1361,7 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
                     raise  # an emergency stop ends the task, never skipped like a refused pose
                 print(f"  search: skipping ({x:.0f},{y:.0f},{z:.0f}): {e}")
                 continue
-        found = await look_here(rig, text, store, source="look" if path == "hint" else "demo")
+        found = await look_here(rig, text, store, source="look" if path == "hint" else "demo", **look_kw)
         views += 1
         found.update(path=path, views=views)
         square = found.get("square") or square
@@ -1324,8 +1377,39 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
                 found.update(square=square, square_from="search")
             print(f"  search: found at view {views} ({path})")
             return found
+        merge_candidates(table, found.get("candidates") or [])
         last = found
-    last["reason"] = f"no {text!r} on the table after {views} views ({last.get('reason')})"
+    # Second stage: closer, the best first
+    table.sort(key=lambda c: -c["score"])
+    looked = 0
+    for c in table:
+        if looked >= CAND_LOOKS:
+            break
+        fx, fy = perception.look_flange_xy(c["xy"])
+        if not ppa.reachable(fx, fy) or math.hypot(fx, fy) < 120.0:
+            print(f"  search: candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) out of reach for a close look")
+            continue
+        try:
+            await ppa.travel(rig, fx, fy, theta=0.0, z=ppa.ALIGN_Z)
+        except ppa.MoveRefused as e:
+            if isinstance(e, ppa.EStop):
+                raise
+            print(f"  search: skipping candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}): {e}")
+            continue
+        looked += 1
+        found = await look_here(rig, text, store, source="look", **look_kw)
+        views += 1
+        found.update(path="candidate", views=views)
+        square = found.get("square") or square
+        print(f"  search: candidate {looked} at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}), score {c['score']:.2f}: "
+              f"{'accepted' if found.get('obj') is not None else found.get('reason')}")
+        if found.get("obj") is not None:
+            if found.get("square") is None and square is not None:
+                found.update(square=square, square_from="search")
+            return found
+        last = found
+    what = f", {looked} close looks at {len(table)} candidates" if table else ""
+    last["reason"] = f"no {text!r} on the table after {views} views{what} ({last.get('reason')})"
     return last
 
 
@@ -1449,7 +1533,7 @@ async def sweep_table(rig, progress=None) -> list:
 
 
 async def execute(rig, text: str, store, mode: str = "demo", target=None, target_xy=None, progress=None,
-                  skip_current: bool = False, accept_ambiguous: bool = False) -> dict:
+                  skip_current: bool = False, accept_ambiguous: bool = False, excluded: list = ()) -> dict:
     """
     One command: put the object described by `text` into the blue square. Returns the logged attempt doc.
 
@@ -1460,6 +1544,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
     progress(k, n, path, found): passed to search_and_find (module status "searching... pose k/n").
     skip_current: the caller has just looked from the current pose (the module's idle frame): the search starts
       at the hint instead of taking that view again (~3.6 s on the arm).
+    excluded: table xy of objects this job already failed on: the search passes over them. The doc's "target_xy" says which
+      object this try went for, for the next try's list.
     accept_ambiguous: several objects fit `text` and any of them will do (one item of a list, "screwdriver" with a
       red and a blue one on the table): take the best match instead of answering "ambiguous".
     The square comes from the found frame, else any frame of this search, else known_square() (the newer of
@@ -1486,7 +1572,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
                 found["square"] = square_from_frame(found["rgb"], found.get("depth"), tp, intr(rig))
         else:
             found = await search_and_find(rig, text, store, hint_xy=target_xy, progress=progress,
-                                          skip_current=skip_current)
+                                          skip_current=skip_current, **({"excluded": list(excluded)} if excluded else {}))
             doc["find_path"], doc["find_views"] = found.get("path"), found.get("views")
         obj = found.get("obj")
         doc["decided_by"] = found.get("decided_by", "clip")  # "llm" when the LLM fallback made the choice
@@ -1498,6 +1584,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
                        fail_reason=found.get("reason"))
             return doc
         frame_ts = float(found.get("ts") or time.time())  # a search's frame was just taken
+        gu, gv, _ = grasp_px(obj, found["pose"], intr(rig))
+        doc["target_xy"] = [round(float(x), 1) for x in perception.world_xy(found["pose"], intr(rig), gu, gv, obj.top_depth_mm)]
         doc.update(label=found.get("recognised") or found.get("label") or obj.colour or "object", colour=obj.colour,
                    score=round(float(found.get("score", 0.0)), 3),
                    margin=round(float(found.get("margin", 0.0)), 3), img_before=jpeg(found["rgb"]))
