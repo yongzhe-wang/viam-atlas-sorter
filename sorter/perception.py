@@ -453,6 +453,7 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None, pose: dict = No
     cables = []
     if SPLIT_BLOBS:
         lab_d, n, cables = _split_cables(lab_d, n, INTRINSICS["fx"] / table_depth)
+        lab_d, n = _split_touching(lab_d, n, height, INTRINSICS["fx"] / table_depth, MIN_AREA_PX * area_scale(table_depth))
     # No fingertip mask for objects: the fingers are ~140 mm from the camera, inside the depth blind range, so they
     # never become objects; masking them erased a real 30 mm cube that a z=500 sweep saw in that corner
     lab_c = to_colour(lab_d, model)
@@ -726,6 +727,83 @@ def _split_cables(lab: np.ndarray, n: int, px_mm: float) -> tuple:
             n += 1
             lab[sl] = np.where(piece[1:-1, 1:-1], n, lab[sl])
     return lab, n, cables
+
+
+# ---- touching objects: one blob, two height peaks ------------------------------------------------------------
+# The silver knife lay against the blue lollipop: one blob, blue enough for "blue lollipop", recognised as nothing (a mix), and
+# its grasp point on the knife: the arm put the knife in the bucket. A blob is split where it holds two raised parts joined
+# only by something low (the lollipop's stick), or a taller part plus a thick lower one (a bar against a standing cylinder).
+# Thin parts (a screwdriver's shaft, a stick, a wire) never become objects of their own, nor does an object's own lower end
+# (a crumpled bag's flat half, a utility knife's blade end): a lower part must be well below the raised part it touches.
+# {VIAM CENTERAL 2026-10-30 "GRASP BLUE LOLLIPOP 报 DONE，但放进桶的是银色美工刀"; NOW.NPZ "BLUE … BBOX=(676, 236, 944, 396) 133X74MM REC=NONE"}
+# [CONFIDENCE: CONFIRMED 75% — that frame and every change on the 125 real frames checked by eye]
+TOUCH_CORE_FRAC = 0.5  # a raised part: above this share of the blob's top height ...
+TOUCH_CORE_MIN_MM = 10.0  # ... and above this
+TOUCH_PART_MIN_MM = 18.0  # a part must be this thick (distance transform) to be an object
+TOUCH_LOW_MIN_MM = 8.0  # a lower part beside a taller one must stand this high (LOW_OBJECTS: LOW_MIN_MM)
+# A lower part stands at most this share of the raised part it touches: a different, flatter object. The same object's lower
+# end is higher. {CHEESE "H28" BY CYLINDER "H61"; CANDY PACK "H9" BY ERASER "H30"; BAG HALF "H13" BY BAG "H18"; KNIFE BLADE END
+# "H12" BY KNIFE "H21"} [CONFIDENCE: CONFIRMED 70% — 0.26-0.48 for the eight real different-object pairs, 0.57-0.72 for the same]
+TOUCH_REST_FRAC = 0.5
+# A lower part's thickness counts only its pixels above this share of its height: depth smears a 7 mm screwdriver shaft into a
+# 20 mm wide band of low pixels. {T_BL SHAFT "TH 21" ALL PIXELS, "14" ABOVE 0.6; CANDY PACK "47" / "32"}
+# [CONFIDENCE: CONFIRMED 70% — four real shafts 14-15, every real lower object 18+]
+TOUCH_FRINGE_FRAC = 0.6
+
+
+def _split_touching(lab: np.ndarray, n: int, height: np.ndarray, px_mm: float, min_area: float) -> tuple:
+    """(labels, n): blobs with two thick raised parts, or a raised part and a much lower thick one, split between them."""
+    lab = lab.copy()
+    low_min = LOW_MIN_MM if LOW_OBJECTS else TOUCH_LOW_MIN_MM
+    for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+        if sl is None:
+            continue
+        m = lab[sl] == i
+        if m.sum() < 2 * min_area:
+            continue
+        h = np.where(m, height[sl], 0.0)
+        top = float(np.percentile(h[m], 95))
+        if top < 2 * TOUCH_CORE_MIN_MM:
+            continue
+        core = ndimage.binary_opening(m & (h > max(TOUCH_CORE_MIN_MM, TOUCH_CORE_FRAC * top)), iterations=2)
+        parts = []
+        cl, k = ndimage.label(core)
+        for j in range(1, k + 1):
+            c = cl == j
+            if c.sum() >= min_area and 2 * ndimage.distance_transform_edt(c).max() / px_mm >= TOUCH_PART_MIN_MM:
+                parts.append(c)
+        if not parts:
+            continue  # lower parts are only told apart from a raised one beside them
+        tops = [float(np.percentile(h[c], 90)) for c in parts]
+        # A thick lower part beside the raised ones (outside them, by a margin)
+        rest = m & ~ndimage.binary_dilation(core, iterations=6)
+        rl, rk = ndimage.label(ndimage.binary_opening(rest, iterations=2))
+        for j in range(1, rk + 1):
+            c = rl == j
+            if c.sum() < min_area:
+                continue
+            p90 = float(np.percentile(h[c], 90))
+            body = ndimage.binary_opening(c & (h > TOUCH_FRINGE_FRAC * p90))  # without its smeared fringe
+            if p90 < low_min or 2 * ndimage.distance_transform_edt(body).max() / px_mm < TOUCH_PART_MIN_MM:
+                continue
+            near = ndimage.binary_dilation(c, iterations=8)  # the raised parts it touches (they are 6 px away)
+            beside = [t for t, p in zip(tops, parts[:len(tops)]) if (near & p).any()]
+            if beside and p90 <= TOUCH_REST_FRAC * min(beside):
+                parts.append(c)
+        if len(parts) < 2:
+            continue
+        seeds = np.zeros(m.shape, np.int32)
+        for j, c in enumerate(parts, start=1):
+            seeds[c] = j
+        _, (iy, ix) = ndimage.distance_transform_edt(seeds == 0, return_indices=True)
+        owner = np.where(m, seeds[iy, ix], 0)
+        block = lab[sl]
+        block[m] = 0
+        for j in range(1, len(parts) + 1):
+            n += 1
+            block[owner == j] = n
+        lab[sl] = block
+    return lab, n
 
 
 # ---- see-through objects: fragments of one object joined by its depth-less body ---------------------------

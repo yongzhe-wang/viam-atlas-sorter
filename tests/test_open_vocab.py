@@ -43,9 +43,9 @@ class Lib:
         return []
 
 
-def rec(emb, label=None, names=(), colour="blue"):
+def rec(emb, label=None, names=(), colour="blue", conf=0.9):
     obj = NS(colour=colour, colours={colour: 1.0}, length_px=100.0, width_px=60.0, height_mm=30.0, crop=None)
-    return {"obj": obj, "label": label, "names": list(names), "score": 0.9 if label else 0.0, "emb": emb}
+    return {"obj": obj, "label": label, "names": list(names), "score": conf if label else 0.0, "emb": emb}
 
 
 def best(query, recs):
@@ -120,6 +120,27 @@ def test_overlap_only_query():
         assert b["obj"] is None and b["searchable"], b
     finally:
         setup_module()
+
+
+def test_known_object_is_never_another_name():
+    # Recognised this surely, it is that object, even when its crop is more like the unknown query
+    # {VIAM CENTERAL 2026-10-30 "LIBRARY 高置信认出的已知物体，绝不能被当作另一个名字接受，不管那个名字是已知的还是未知的"}
+    # [CONFIDENCE: CONFIRMED 90% — HARD_VETO_CONF chosen on openvocab; the same crop at 0.9 is the first test's pick]
+    r = rec(crop(mug=0.40, blue_cylinder=0.30, object=0.30), "blue cylinder", ["blue cylinder"], conf=C.HARD_VETO_CONF)
+    b = best("mug", [r])
+    assert b["obj"] is None and b["reason"].startswith("best candidate is recognised as 'blue cylinder' (0.93)"), b
+    c = C.candidates([r["obj"]], "mug", Lib(), recognised=[r])
+    assert not c[0]["likely"] and "never another name" in c[0]["why"], c
+
+
+def test_unrecognised_object_much_more_like_a_library_name_is_vetoed():
+    # The silver knife at z 580: not recognised, but its crop is far more like a known name than like "blue lollipop"
+    # {NOW.NPZ KNIFE "LIB_GAP +0.089"; BLUE LOLLIPOPS "-0.015" TO "-0.103"} [CONFIDENCE: CONFIRMED 80% — real gaps]
+    knife = rec(crop(mug=0.30, red_knife=0.40, object=0.20))
+    b = best("mug", [knife])
+    assert b["obj"] is None and b["reason"] == "best candidate looks more like 'red knife'", b
+    close = rec(crop(mug=0.36, red_knife=0.40, object=0.20))  # +0.04: within OPEN_LIB_DELTA, CLIP mixes similar things
+    assert best("mug", [close])["obj"] is close["obj"]
 
 
 if __name__ == "__main__":

@@ -77,6 +77,44 @@ def test_thin_sliver_at_the_frame_stays_a_partial_sighting():
     assert not on.cables and len(on.excluded) == 1, (on.cables, on.excluded)
 
 
+def test_touching_objects_are_two():
+    # A knife against a lollipop's head: one blob, rounded edges meeting low between them; the grasp went to the knife
+    # {VIAM CENTERAL 2026-10-30 "GRASP BLUE LOLLIPOP 报 DONE，但放进桶的是银色美工刀"} [CONFIDENCE: CONFIRMED 90% — bucket/now.npz splits the same way]
+    rgb, d = frame()
+    box(rgb, d, 300, 370, 300, 620, 19, (170, 170, 170))  # knife, ~29 x 130 mm
+    box(rgb, d, 300, 370, 620, 632, 5)  # where the two rounded sides meet
+    box(rgb, d, 295, 375, 632, 712, 24, (30, 40, 160))  # lollipop head, ~33 mm
+    assert len(segment(rgb, d, False).objects) == 1
+    on = segment(rgb, d, True)
+    assert len(on.objects) == 2, [o.bbox for o in on.objects]
+    head = max(on.objects, key=lambda o: o.bbox[0])
+    assert head.bbox[0] >= 615 and head.colour == "blue", (head.bbox, head.colour)
+
+
+def test_flat_object_beside_a_tall_one_is_two():
+    # A cheese wedge against a standing cylinder: much lower, and thick
+    rgb, d = frame()
+    box(rgb, d, 300, 400, 300, 400, 60, (40, 160, 60))
+    box(rgb, d, 300, 400, 400, 560, 28, (220, 200, 40))
+    assert len(segment(rgb, d, False).objects) == 1
+    assert len(segment(rgb, d, True).objects) == 2
+
+
+def test_objects_own_lower_end_stays_one():
+    # A utility knife against an eraser: the eraser (31 mm) lifts the raised level to 15 mm, so the knife's blade end (13 mm)
+    # is a lower part; it is not much lower than the knife's body, so it stays with the knife: two objects, not three
+    # {BUCKET/T_MULTI "KNIFE H21, BLADE END H12-13", ERASER "H31"} [CONFIDENCE: CONFIRMED 80% — real frame no longer split]
+    rgb, d = frame()
+    box(rgb, d, 300, 380, 300, 520, 21, (200, 30, 30))
+    box(rgb, d, 300, 380, 520, 640, 13, (200, 30, 30))
+    box(rgb, d, 300, 380, 288, 300, 5)  # the knife's rounded side meeting the eraser's
+    box(rgb, d, 300, 380, 140, 288, 31, (30, 120, 200))
+    on = segment(rgb, d, True)
+    assert len(on.objects) == 2, [o.bbox for o in on.objects]
+    knife = max(on.objects, key=lambda o: o.bbox[2])
+    assert knife.bbox[0] >= 285 and knife.bbox[2] >= 635, knife.bbox
+
+
 def test_flat_table_unchanged():
     rgb, d = frame()
     box(rgb, d, 300, 400, 500, 600, 30)

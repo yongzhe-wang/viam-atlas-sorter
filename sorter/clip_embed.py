@@ -74,6 +74,22 @@ AMBIGUOUS_MARGIN = 0.02  # top-1 minus top-2 below this: let the user confirm in
 OPEN_SET_DELTA = 0.01
 OPEN_NEG_MARGIN = 0.03
 OPEN_NEGATIVES = ("table", "wooden table", "piece of paper", "object", "thing on a table", "cable", "hand")
+# A known object is never taken for another name: recognised this confidently (vote confidence), it is vetoed whatever its
+# crop looks like. Not lower: an object the library lacks is often recognised as its sibling up to 0.924 (held-out blue
+# cylinder as "green cylinder"), and those picks were right; correct recognitions are >= 0.93 in 140 of 195 scan views.
+# {VIAM CENTERAL 2026-10-30 "LIBRARY 高置信认出的已知物体，绝不能被当作另一个名字接受，不管那个名字是已知的还是未知的"}
+# {OPENVOCAB HELD OUT "RIGHT … 'BLUE CYLINDER', 'GREEN CYLINDER', 0.924"; FULL LIBRARY "T 0.93: 140/195", "WRONG: []"}
+# [CONFIDENCE: CONFIRMED 80% — openvocab: the right picks it would refuse top out at 0.924]
+HARD_VETO_CONF = 0.93
+# The same test by name when the library does not recognise the object (a view unlike the scan's: the silver knife at
+# z 580): vetoed if its crop is more like "a photo of a N" than like the query, N any library name the query does not
+# name, by more than OPEN_LIB_DELTA. Midway between the held-out targets (at most +0.052) and the unrecognised silver knife
+# asked as "blue lollipop" (at least +0.089); CLIP itself mixes knives and screwdrivers, so a lower delta refused right picks
+# (0.0: full name right 47 of 65; 0.05: 56; 0.08: 57, unchanged). The merged knife + lollipop blob (+0.008) is beyond it:
+# the touching-object split is what removes that. {OPENVOCAB "(0.052, 'RED SCREWDRIVER', '022', 'RED UTILITY KNIFE')";
+# BUCKET FRAMES KNIFE "+0.089" "+0.089" "+0.120" "+0.124"; BLUE LOLLIPOPS "-0.015" TO "-0.103"}
+# [CONFIDENCE: CONFIRMED 75% — 65 held-out cases and 19 bucket frames; margins of 0.018 either side are small]
+OPEN_LIB_DELTA = 0.07
 
 _model = _preprocess = _tokenizer = None
 
@@ -307,7 +323,8 @@ def rank(objs: list, text: str, store=None, recognised: list = None, known: bool
     Library term (store given, query known to the library): +LABEL_BONUS if the object is recognised as something
     the query names, -LABEL_PENALTY if it is confidently recognised as something else. An unknown query has no library
     term: the library has no opinion on an object it never saw (best() applies the open-set gate instead).
-    Sets obj.recognised / .recognised_names / .open_gate ({"x_gap", "neg_gap"}, unknown queries only).
+    Sets obj.recognised / .recognised_names / .recognised_conf (vote confidence) / .open_gate ({"x_gap", "neg_gap", "lib_gap",
+    "lib_name"}, unknown queries only).
     `recognised`: recognise_all() output for these objects; their embeddings and labels are reused.
     known: _known(text, store) if the caller already has it.
     """
@@ -317,6 +334,9 @@ def rank(objs: list, text: str, store=None, recognised: list = None, known: bool
     q = clean_query(text)
     words = set(q.split())
     pre = {id(r["obj"]): r for r in recognised or []}
+    # Library names the query does not name, for the by-name open-set test (unknown queries only)
+    others = [n for ns in library_names(store) for n in ns if not name_matches(q, [n])] if store is not None and not known else []
+    others_emb = np.stack([_name_emb(n) for n in others]) if others else None
     missing = [o for o in objs if id(o) not in pre]
     emb_of = {id(o): e for o, e in zip(missing, embed_images([o.crop for o in missing]))} if missing else {}
     emb_of.update({k: r["emb"] for k, r in pre.items()})
@@ -333,13 +353,13 @@ def rank(objs: list, text: str, store=None, recognised: list = None, known: bool
                 score -= COLOUR_PENALTY
         if words & {"long", "stick", "pen", "bar"}:
             score += SHAPE_BONUS if o.length_px / max(o.width_px, 1.0) > 2.0 else -SHAPE_BONUS
-        o.recognised, o.recognised_names = None, []
+        o.recognised, o.recognised_names, o.recognised_conf = None, [], 0.0
         if store is not None:
             if id(o) in pre:
-                lab, names = pre[id(o)]["label"], pre[id(o)]["names"]
+                lab, names, conf = pre[id(o)]["label"], pre[id(o)]["names"], pre[id(o)].get("score", 0.0)
             else:
-                lab, names, _ = recognise(emb, store, colour=o.colour, height_mm=o.height_mm)
-            o.recognised, o.recognised_names = lab, names
+                lab, names, conf = recognise(emb, store, colour=o.colour, height_mm=o.height_mm)
+            o.recognised, o.recognised_names, o.recognised_conf = lab, names, float(conf or 0.0)
             if known and lab is not None:
                 score += LABEL_BONUS if name_matches(q, names) else -LABEL_PENALTY
                 # Exact name beats a name that merely contains the query (see EXACT_NAME_BONUS)
@@ -347,7 +367,12 @@ def rank(objs: list, text: str, store=None, recognised: list = None, known: bool
                     score += EXACT_NAME_BONUS
             elif not known:
                 o.open_gate = {"x_gap": float(emb @ _name_emb(lab)) - float(s) if lab else None, "emb": emb,
-                               "neg_gap": float(s) - max(float(emb @ _name_emb(n)) for n in OPEN_NEGATIVES)}
+                               "neg_gap": float(s) - max(float(emb @ _name_emb(n)) for n in OPEN_NEGATIVES),
+                               "lib_gap": None, "lib_name": None}
+                if others_emb is not None:  # the library name this crop is most like, and by how much over the query
+                    sims_lib = others_emb @ emb
+                    k = int(np.argmax(sims_lib))
+                    o.open_gate.update(lib_gap=float(sims_lib[k]) - float(s), lib_name=others[k])
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
 
@@ -451,8 +476,7 @@ def _best_open(ranked: list, text: str, qcol: set, out: dict) -> dict:
     cands = []
     for o, s in ranked:
         g = o.open_gate
-        vetoed = g["x_gap"] is not None and g["x_gap"] > OPEN_SET_DELTA
-        if (not qcol or colour_present(qcol, o)) and not vetoed and g["neg_gap"] >= OPEN_NEG_MARGIN and s >= MIN_SCORE:
+        if (not qcol or colour_present(qcol, o)) and not _open_veto(o) and g["neg_gap"] >= OPEN_NEG_MARGIN and s >= MIN_SCORE:
             cands.append((o, s))
     if cands:
         margin = cands[0][1] - cands[1][1] if len(cands) > 1 else 1.0
@@ -462,13 +486,30 @@ def _best_open(ranked: list, text: str, qcol: set, out: dict) -> dict:
     o, s = next(((o, s) for o, s in ranked if qcol and colour_present(qcol, o)), ranked[0])
     if qcol and not colour_present(qcol, o):
         reason = f"no {'/'.join(sorted(qcol))} object found"
-    elif o.open_gate["x_gap"] is not None and o.open_gate["x_gap"] > OPEN_SET_DELTA:
-        reason = f"best candidate is recognised as {o.recognised!r}"
+    elif _open_veto(o):
+        reason = _open_veto(o)
     elif o.open_gate["neg_gap"] < OPEN_NEG_MARGIN:
         reason = f"nothing here looks like {clean_query(text)!r}"
     else:
         reason = f"best match only {s:.2f}"
     return {**out, "reason": reason, "searchable": False}
+
+
+def _open_veto(o) -> str:
+    """
+    Why this object is clearly something the query does not name ("" if not): the open-set tests of an unknown query.
+
+    Recognised with HARD_VETO_CONF: always. Recognised less surely: if its crop is more like its label than like the query
+    (OPEN_SET_DELTA). Not recognised: if its crop is more like some library name than like the query (OPEN_LIB_DELTA).
+    """
+    g = getattr(o, "open_gate", None) or {}
+    if o.recognised is not None and getattr(o, "recognised_conf", 0.0) >= HARD_VETO_CONF:
+        return f"best candidate is recognised as {o.recognised!r} ({o.recognised_conf:.2f}): a known object is never another name"
+    if g.get("x_gap") is not None and g["x_gap"] > OPEN_SET_DELTA:
+        return f"best candidate is recognised as {o.recognised!r}"
+    if o.recognised is None and g.get("lib_gap") is not None and g["lib_gap"] > OPEN_LIB_DELTA:
+        return f"best candidate looks more like {g['lib_name']!r}"
+    return ""
 
 
 # ---- candidates: everything that could be it, best first, for a search that can go and look closer ---------------------
@@ -523,7 +564,7 @@ def candidates(objs: list, text: str, store=None, recognised: list = None) -> li
     showing its back (recognised as granola bar). A two-stage search can look closer at the top candidates instead.
     Each: {obj, score, source ("library": recognised as what was named; "clip": by appearance), why, graspable,
     graspable_why, clip (CLIP similarity), neg_gap (beats the generic prompts by), x_gap (more like its recognised label
-    by), likely (named, or clears the open-set test)}.
+    by), likely (named, or clears the open-set tests of _open_veto)}.
     `recognised`: recognise_all() output for these objects, as for best(). Sets the same attributes on the objects as rank().
     """
     if not objs:
@@ -547,6 +588,9 @@ def candidates(objs: list, text: str, store=None, recognised: list = None) -> li
             why.append(f"library says {lab!r}" + (f", {g['x_gap']:+.2f} against the query" if g["x_gap"] is not None else ""))
         else:
             why.append("unknown to the library")
+        veto = "" if named else _open_veto(o)
+        if veto:
+            why.append(veto)
         if known and store is not None and not named:
             # Named by the library but not recognised here: does it at least have the right height for that?
             emb = g.get("emb")
@@ -564,5 +608,5 @@ def candidates(objs: list, text: str, store=None, recognised: list = None) -> li
         clip_sim = base  # base includes the colour and shape terms; the gate's own numbers are in neg_gap / x_gap
         out.append({"obj": o, "score": float(score), "source": "library" if named else "clip", "why": "; ".join(why),
                     "graspable": ok, "graspable_why": why_not, "clip": float(clip_sim), "neg_gap": float(g["neg_gap"]),
-                    "x_gap": g["x_gap"], "likely": bool(named or (g["neg_gap"] >= OPEN_NEG_MARGIN and (g["x_gap"] is None or g["x_gap"] <= OPEN_SET_DELTA)))})
+                    "x_gap": g["x_gap"], "likely": bool(named or (g["neg_gap"] >= OPEN_NEG_MARGIN and not veto))})
     return sorted(out, key=lambda c: -c["score"])
