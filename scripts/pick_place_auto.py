@@ -849,7 +849,12 @@ class Rig:
             # Arm move that cancels the pixel error; the image moves by J @ move. A probed J is noisy (damped,
             # short steps); the model J is exact up to calibration, so it goes the whole way in one move
             gain, cap = (0.85, 60.0) if probing else (1.0, MODEL_STEP_CAP_MM)
-            move = np.linalg.solve(J, -e) * gain
+            try:
+                move = np.linalg.solve(J, -e) * gain
+            except np.linalg.LinAlgError:
+                # Degenerate probes (the target did not move between them): the camera model's Jacobian instead
+                J = model_jacobian(self.fx, self.fy, self.cx, self.cy, p.theta, plane)
+                move = np.linalg.solve(J, -e) * gain
             n = np.linalg.norm(move)
             # Cap each correction so one bad Jacobian cannot throw the target out of view
             if n > cap:
@@ -965,7 +970,8 @@ def mark(times: dict, phase: str, t0: float) -> float:
     return now
 
 
-async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None, align: bool = True) -> tuple:
+async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None, align: bool = True,
+               slipped=None) -> tuple:
     """
     Steps 1-2: align over the block, measure it, descend and grab. Returns (block height, grip depth).
 
@@ -980,6 +986,9 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     Descent: one straight move from ALIGN_Z to the grasp height measured there (CLOSE_SERVO False).
     align=False: the caller already turned the wrist (executor.approach): keep that angle, no align_wrist, no
     re-servo after it. The reset's wrist re-align turned the camera away and the tracker jumped to another object.
+    slipped(rgb, depth, pose) -> (bool, why): after the lift, from a frame at ALIGN_Z, is the object still lying where
+    it was picked? The G2's holding() stays True with the fingers stopped half-closed after the red box cutter slid
+    out, twice; the picture decides.
     {VIAM CENTERAL 2026-10-29 "确认 RESET 真的走了 APPROACH 的一次 MOVE + OPEN-LOOP，不要再进 ALIGN"}
     """
     times = {} if times is None else times
@@ -1067,15 +1076,21 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         # First 30 mm as a short, slow move (the fingers leave the table without a jerk), then up to ALIGN_Z.
         # Holding: the carry follows (no frame). Missed: the re-servo's frame needs the settle
         await rig.goto(p.x, p.y, min(p.z + 30.0, ALIGN_Z), settle=False)
-        await rig.goto(p.x, p.y, ALIGN_Z, settle=not grabbed)
+        await rig.goto(p.x, p.y, ALIGN_Z, settle=not grabbed or slipped is not None)
         t = mark(times, "grab", t)
-        if grabbed and not await rig.holding():
+        if grabbed:
             # Held at the grab, gone after the lift: the red box cutter (16 mm, gripped by its top 3-4 mm) slipped
             # and the reset went on to "place" an empty gripper. The caller's retry looks again.
-            # {VIAM CENTERAL 2026-10-29 "RESET 和 GRASP 都要在 LIFT 之后、CARRY 之前检查 RIG.HOLDING()"}
-            rig.picked_at = None
-            await rig.open()
-            raise ObjectLost("slipped out of the gripper during the lift")
+            # {VIAM CENTERAL 2026-10-29 "滑落检查改用画面 ... HOLDING() 只作为辅助"}
+            gone, why = not await rig.holding(), "the gripper reports nothing held"
+            if not gone and slipped is not None:
+                q = await rig.pose()
+                rgb, depth = await rig.frame()
+                gone, why = slipped(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
+            if gone:
+                rig.picked_at = None
+                await rig.open()
+                raise ObjectLost(f"slipped out of the gripper during the lift ({why})")
         if grabbed:
             break
         # Missed (or the object was moved): re-align from the observation height, try again

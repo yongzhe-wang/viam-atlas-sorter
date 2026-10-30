@@ -428,11 +428,36 @@ async def under_jaws(rig) -> tuple:
 
 
 def footprint(rig, o, pose: dict) -> dict:
-    """Table xy of the object's grasp point and its area scaled to REF_TABLE_DEPTH_MM, for continuity checks."""
+    """Table xy of the object's grasp point, its area scaled to REF_TABLE_DEPTH_MM and its colour word."""
     gu, gv, _ = grasp_px(o, pose, intr(rig))
     xy = perception.world_xy(pose, intr(rig), gu, gv, o.top_depth_mm)
     return {"xy": (float(xy[0]), float(xy[1])),
-            "area": float(o.mask.sum()) * (o.top_depth_mm / perception.REF_TABLE_DEPTH_MM) ** 2}
+            "area": float(o.mask.sum()) * (o.top_depth_mm / perception.REF_TABLE_DEPTH_MM) ** 2,
+            "colour": getattr(o, "colour", None)}
+
+
+SLIP_XY_MM = 40.0  # the picked object counts as still lying there within this of where it was picked
+
+
+def still_on_table(rig, tracker, rgb: np.ndarray, depth: np.ndarray, pose: dict) -> tuple:
+    """
+    ppa.pick's slip check after the lift: (slipped?, why). Slipped = an object of the same colour and a similar
+    footprint (CONT_AREA) lies within SLIP_XY_MM of tracker.ref, where the picked one stood. The held object hangs
+    right under the camera (too close for depth) and is not a table object.
+    {VIAM CENTERAL 2026-10-29 "看 PICK 点附近 40 MM 内是否还有和 TRACKER.REF 相同大小、相同颜色的物体"}
+    [CONFIDENCE: INFERRED 75% — real frames offline; the slipped case itself not recorded]
+    """
+    ref = getattr(tracker, "ref", None)
+    if ref is None or depth is None:
+        return False, "no reference to compare"
+    seg = perception.segment_full(rgb, depth)
+    for o in list(seg.objects) + [o for o, _ in seg.excluded]:
+        now = footprint(rig, o, pose)
+        d = math.hypot(now["xy"][0] - ref["xy"][0], now["xy"][1] - ref["xy"][1])
+        ratio = now["area"] / max(ref["area"], 1.0)
+        if d <= SLIP_XY_MM and CONT_AREA[0] <= ratio <= CONT_AREA[1] and ref.get("colour") in (None, o.colour):
+            return True, f"a {o.colour} object of the same size still lies {d:.0f} mm from the pick point"
+    return False, "nothing like it left at the pick point"
 
 
 async def still_target(rig, text: str, store, tracker) -> tuple:
@@ -1153,7 +1178,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         # continuity before the descent
         await approach(rig, found, tracker)
         height, grip = await ppa.pick(rig, times, tracker, check=lambda: still_target(rig, text, store, tracker),
-                                      align=False)
+                                      align=False, slipped=lambda c, d, p: still_on_table(rig, tracker, c, d, p))
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
         ring = held_ring(rig, obj, found["pose"])
@@ -1652,7 +1677,8 @@ async def clear_square(rig, store) -> dict:
                     try:
                         tracker = ObjTracker(rig, obj, rgb)
                         await approach(rig, {"obj": obj, "rgb": rgb, "depth": depth, "pose": q}, tracker)
-                        height, grip = await ppa.pick(rig, None, tracker, align=False)
+                        height, grip = await ppa.pick(rig, None, tracker, align=False,
+                                                      slipped=lambda c, d, p, t=tracker: still_on_table(rig, t, c, d, p))
                     except (ppa.PickFailed, RuntimeError) as e:
                         if await rig.holding():
                             raise  # something in the jaws: recover() puts it back, never a silent retry
