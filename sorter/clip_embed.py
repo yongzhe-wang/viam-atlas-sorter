@@ -90,6 +90,15 @@ HARD_VETO_CONF = 0.93
 # BUCKET FRAMES KNIFE "+0.089" "+0.089" "+0.120" "+0.124"; BLUE LOLLIPOPS "-0.015" TO "-0.103"}
 # [CONFIDENCE: CONFIRMED 75% — 65 held-out cases and 19 bucket frames; margins of 0.018 either side are small]
 OPEN_LIB_DELTA = 0.07
+# A snack the library does not know, against the snacks it does: an unrecognised KIND bar (its back, conf 0) took "m&m snack".
+# The generic word carries that match, so the test takes the query without it: the crop must be more like "m&m's" than like
+# "kind bar" / "granola bar" by this much. Other queries never take this test. {USER 2026-10-30 "M AAND M IS WRONG YOU GRASP THE KIND"}
+# {JOB 21:36 KIND CROPS "M&M'S" - "KIND BAR": -0.029 -0.002 -0.092 -0.071; M&M CROPS +0.045 +0.038 +0.049 +0.055 +0.025}
+# [CONFIDENCE: INFERRED 75% — 4 KIND and 5 M&M crops, real embeddings; the margin is midway between the two groups]
+FOOD_SIBLING_MARGIN = 0.01
+FOOD_WORDS = {"snack", "snacks", "candy", "candies", "chocolate", "treat", "treats", "food"}
+FOOD_NAME_WORDS = FOOD_WORDS | {"granola", "breakfast"}  # a library entry with one of these in a name is a food
+MM_FORMS = re.compile(r"\bm\s*(?:&|\+|\band\b|\bn\b)\s*m(?:'?s)?\b|\bmnms?\b|\bmms\b", re.I)
 
 _model = _preprocess = _tokenizer = None
 
@@ -154,9 +163,17 @@ def embed_text(text: str) -> np.ndarray:
     return f[0].numpy().astype(np.float32)
 
 
+def normalise_brands(text: str) -> str:
+    """
+    Every way of saying M&M's as one word, "m&m's": "m and m" was cut at its "and" and came out as the object "m".
+    {PARSE 'M AND M' -> SPLIT=['M']} [CONFIDENCE: CONFIRMED 95% — run on the real library names]
+    """
+    return MM_FORMS.sub("m&m's", text)
+
+
 def clean_query(text: str) -> str:
-    """Lowercase, strip command verbs ("grasp", "pick up the") and normalise colour aliases."""
-    q = re.sub(STOP, "", text.strip().lower())
+    """Lowercase, strip command verbs ("grasp", "pick up the"), one spelling for a brand, normalise colour aliases."""
+    q = normalise_brands(re.sub(STOP, "", text.strip().lower()))
     return " ".join(ALIASES.get(w, w) for w in q.split())
 
 
@@ -310,6 +327,15 @@ def _names_exactly(text: str, store) -> bool:
     return any(_words(name) and _words(name) <= q for names in library_names(store) for name in names)
 
 
+def _food_siblings(q: str, store) -> tuple:
+    """(the cleaned query without its generic food words, the labels of the foods the library has), or (None, []) if not a new food."""
+    words = q.split()
+    rest = [w for w in words if w not in FOOD_WORDS and w not in FILLER]
+    if store is None or not rest or "m&m's" not in words or _known(q, store):  # M&M's only: this refused the real Sour Patch views
+        return None, []
+    return " ".join(rest), [ns[0] for ns in library_names(store) if any(set(n.lower().split()) & FOOD_NAME_WORDS for n in ns)]
+
+
 def _searchable(res: dict) -> dict:
     """A refusal of a query the library partly knows: its own object of that kind may be in another view."""
     return {**res, "searchable": res["obj"] is None}
@@ -337,6 +363,7 @@ def rank(objs: list, text: str, store=None, recognised: list = None, known: bool
     # Library names the query does not name, for the by-name open-set test (unknown queries only)
     others = [n for ns in library_names(store) for n in ns if not name_matches(q, [n])] if store is not None and not known else []
     others_emb = np.stack([_name_emb(n) for n in others]) if others else None
+    food_q, food_labels = _food_siblings(q, store) if not known else (None, [])
     missing = [o for o in objs if id(o) not in pre]
     emb_of = {id(o): e for o, e in zip(missing, embed_images([o.crop for o in missing]))} if missing else {}
     emb_of.update({k: r["emb"] for k, r in pre.items()})
@@ -373,6 +400,9 @@ def rank(objs: list, text: str, store=None, recognised: list = None, known: bool
                     sims_lib = others_emb @ emb
                     k = int(np.argmax(sims_lib))
                     o.open_gate.update(lib_gap=float(sims_lib[k]) - float(s), lib_name=others[k])
+                if food_labels:
+                    sib = max(food_labels, key=lambda n: float(emb @ _name_emb(n)))
+                    o.open_gate.update(food_gap=float(emb @ _name_emb(food_q)) - float(emb @ _name_emb(sib)), food_name=sib)
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
 
@@ -516,6 +546,8 @@ def _open_veto(o) -> str:
         return f"best candidate is recognised as {o.recognised!r} ({o.recognised_conf:.2f}): a known object is never another name"
     if g.get("x_gap") is not None and g["x_gap"] > OPEN_SET_DELTA:
         return f"best candidate is recognised as {o.recognised!r}"
+    if g.get("food_gap") is not None and g["food_gap"] < FOOD_SIBLING_MARGIN:
+        return f"best candidate looks more like {g['food_name']!r}"
     if o.recognised is None and g.get("lib_gap") is not None and g["lib_gap"] > OPEN_LIB_DELTA:
         return f"best candidate looks more like {g['lib_name']!r}"
     return ""

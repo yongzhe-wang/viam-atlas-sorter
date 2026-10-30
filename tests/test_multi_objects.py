@@ -62,9 +62,11 @@ CASES = [
     ("red and tape", ["red", "tape"]),
     ("red and blue then tape", ["red", "blue", "tape"]),
     # "&" and "+" inside a word belong to its name (robot test: preview "M&M" -> "'m' is not in view")
-    ("M&M", ["m&m"]),
+    ("M&M", ["m&m's"]),
+    ("m and m", ["m&m's"]),  # its "and" is no separator
+    ("mnm", ["m&m's"]),
     ("M&M's", ["m&m's"]),
-    ("the m&m bag and tape", ["m&m bag", "tape"]),
+    ("the m&m bag and tape", ["m&m's bag", "tape"]),
     ("tape & mouse", ["tape", "mouse"]),
     ("tape &mouse", ["tape", "mouse"]),
     ("tape& mouse", ["tape", "mouse"]),

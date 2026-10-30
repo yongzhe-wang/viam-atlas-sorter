@@ -7,7 +7,7 @@ stay whole. No model and no arm here: plain text in, plain text out.
 """
 import re
 
-from sorter.clip_embed import COLOURS, STOP
+from sorter.clip_embed import COLOURS, STOP, normalise_brands
 
 MAX_OBJECTS = 5
 # Spoken lead-ins on top of clip_embed.STOP's command verbs; tried over and over ("please can you get me the tape")
@@ -101,7 +101,8 @@ def split_objects(text: str, names=(), limit=MAX_OBJECTS) -> list:
     names = [n for n in names if n and n.strip()]
     whole = {_squash(n): n for n in names}
     words = {_squash(w): w.lower() for n in names for w in n.split() if _squash(w)}
-    q = re.sub(r"(?<=\w)-and-(?=\w)", " and ", _strip(text or ""))  # "red-and-blue" says the same as "red and blue"
+    # Brands first: the "and" of "m and m" is no separator
+    q = re.sub(r"(?<=\w)-and-(?=\w)", " and ", _strip(normalise_brands(text or "")))  # "red-and-blue" says the same as "red and blue"
     if _squash(q) in whole:
         return [whole[_squash(q)]]
     # Protect the names that a cut would break; spaces in them are optional ("blue and black screw driver")
