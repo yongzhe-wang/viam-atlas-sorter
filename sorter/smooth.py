@@ -25,7 +25,9 @@ import os
 import time
 
 AIR_Z = 280.0  # only moves with both ends at or above this height (travel, carry over the bucket, back to observe)
-V_DEG_S, A_DEG_S2 = 150.0, 220.0  # VIAM CENTERAL / AGENT1's spec
+# Same as the arm fragment's speed_degs_per_sec / acceleration (scratchpad set_speed.py 180 300), else the quintic is timed slow
+# {USER 2026-10-30 "OK WE NEED TO BE SLIGHTLY FASTER"}
+V_DEG_S, A_DEG_S2 = 180.0, 300.0
 MAX_DQ_DEG = 120.0  # a larger joint change goes the planner's way
 SAME_MM, SAME_DEG = 2.0, 0.5  # a pose this close to one stood at before has its joints
 SAMPLE_S = 0.05  # one path point per 50 ms of motion

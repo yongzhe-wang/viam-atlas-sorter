@@ -1206,6 +1206,13 @@ def view_blocked(rgb: np.ndarray, depth: np.ndarray, over_table: np.ndarray = No
     sel = over_table[:440] if over_table is not None else np.ones(band.shape, bool)
     if sel.mean() < 0.2:  # the upper view is mostly past the table's edge: nothing there to block
         sel = np.zeros(band.shape, bool)
+    # The bucket's rim (~180 mm up) is closer than 280 mm from z 400: the bucket, not a hand at the lens
+    # {SEARCH VIEW (HINT) "CAMERA BLOCKED …: 17% OF THE VIEW UNREADABLE OR CLOSER THAN 280 MM; WAITING"}
+    # [CONFIDENCE: INFERRED 75% — 17-21% at search views beside the bucket after the table-edge fix; perception cuts it too]
+    if bucket.TARGET == "bucket":
+        bk = bucket.find_mask(rgb)
+        if bk is not None:
+            sel = sel & ~ndimage.binary_dilation(bk["mask"], iterations=20)[:440]
     bad = (band == 0) | ((band > 0) & (band < 280))
     near = float(bad[sel].sum()) / band.size
     if near > BLOCKED_DEPTH_FRAC:
