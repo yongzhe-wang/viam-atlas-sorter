@@ -1241,7 +1241,7 @@ async def sweep_table(rig, progress=None) -> list:
 
 
 async def execute(rig, text: str, store, mode: str = "demo", target=None, target_xy=None, progress=None,
-                  skip_current: bool = False) -> dict:
+                  skip_current: bool = False, accept_ambiguous: bool = False) -> dict:
     """
     One command: put the object described by `text` into the blue square. Returns the logged attempt doc.
 
@@ -1252,6 +1252,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
     progress(k, n, path, found): passed to search_and_find (module status "searching... pose k/n").
     skip_current: the caller has just looked from the current pose (the module's idle frame): the search starts
       at the hint instead of taking that view again (~3.6 s on the arm).
+    accept_ambiguous: several objects fit `text` and any of them will do (one item of a list, "screwdriver" with a
+      red and a blue one on the table): take the best match instead of answering "ambiguous".
     The square comes from the found frame, else any frame of this search, else known_square() (the newer of
     LAST_SQUARE and the live map's), else it is searched only while carrying. Always ends at the observe pose.
     Never raises for an ordinary failure: status is done / not_found / ambiguous / too_wide / too_close /
@@ -1291,7 +1293,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         doc.update(label=found.get("recognised") or found.get("label") or obj.colour or "object", colour=obj.colour,
                    score=round(float(found.get("score", 0.0)), 3),
                    margin=round(float(found.get("margin", 0.0)), 3), img_before=jpeg(found["rgb"]))
-        if found.get("ambiguous"):
+        if found.get("ambiguous") and not accept_ambiguous:
             doc.update(status="ambiguous", fail_phase="find", fail_reason=found.get("reason"))
             return doc
         if not grasp.choose_primitives(obj, rig.fx):
