@@ -567,7 +567,7 @@ class GraspByDescription(Generic, EasyResource):
                     "height_mm": round(float(r["obj"].height_mm), 1), "bbox": _box(r["obj"].bbox)} for r in recs]
         # only what is over the table: a chair past its edge is no hand (camera_model.intruders_on_table)
         from sorter import camera_model
-        over = camera_model.intruders_on_table(seg.intruders, pose, intr, seg.table_depth_mm)
+        over = camera_model.intruders_on_table(seg.intruders, pose, intr, getattr(seg, "table_depth_mm", None))
         intruders = [{"bbox": _box(i["bbox"]), "reason": i.get("reason", "")} for i in over]
         return recs, objects, intruders, ms, seg, all_recs
 
@@ -861,12 +861,9 @@ class GraspByDescription(Generic, EasyResource):
         if refusal and refusal[0] == "ambiguous":
             return {"status": "ambiguous", "reason": refusal[1], "decide_ms": decide_ms, "decided_from_cache": True}
         seen_miss = pick is not None and pick.get("obj") is None
-        # Into the bucket this run and nothing it names on the table: answer now, no search (module/grasp_policy.py)
-        inside = self.in_bucket.check(text, self.live.map if self.live is not None else None)
-        if inside is not None:
-            when = time.strftime("%H:%M:%S", time.localtime(inside["ts"]))
-            return {"status": "already_in_bucket", "decide_ms": decide_ms, "via": "memory",
-                    "reason": f"{inside['label']!r} went into the bucket at {when} and has not been on the table since"}
+        # Into the bucket earlier is no answer: people put things back, so every ask searches the table
+        # {USER 2026-10-30 "I DONT WANT THIS HUMAN WILL PUT THEM BACK SO IT SHOULD ALWAYS TRY"}
+        # [CONFIDENCE: CONFIRMED 100% — user's direct instruction; in_bucket still lists deliveries for status]
         found = await self._from_map(text, any_match)
         if found is not None and not found["found"]:  # already in the drop square
             return {"status": found["status"], "reason": found["reason"], "decide_ms": found["decide_ms"], "via": "map"}

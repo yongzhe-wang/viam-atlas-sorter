@@ -256,22 +256,21 @@ async def main():
     await s.job
     print("10. more than 5 -> the first 5, the rest reported as ignored; repeats and empty parts dropped")
 
-    # Into the bucket: the bucket is cut out of the picture, so the object leaves the map; asked again -> answered at once
-    # {VIAM CENTERAL 2026-10-30 "已经投进桶、并且 MAP 上没再看到它 → 回答 ALREADY_IN_BUCKET，算 DONE，不动 ARM"}
+    # Into the bucket earlier is no answer: people put things back, so asking again searches again
+    # {USER 2026-10-30 "I DONT WANT THIS HUMAN WILL PUT THEM BACK SO IT SHOULD ALWAYS TRY"}
     s.in_bucket.add = remember
     s.live.map = {"ts": time.time(), "objects": [MAP["remembered"]]}
     calls.clear()
     r = await s.do_command({"grasp": "tape", "wait": True})
     assert r["status"] == "done" and len(calls) == 1
-    for ask in ("tape", "the black tape"):
-        r = await s.do_command({"grasp": ask})
-        assert r["status"] == "already_in_bucket" and not r["accepted"] and len(calls) == 1 and "'tape' went into the bucket" in r["reason"], r
+    for n, ask in enumerate(("tape", "the black tape"), start=2):
+        r = await s.do_command({"grasp": ask, "wait": True})
+        assert r.get("accepted") and r.get("status") != "already_in_bucket" and len(calls) == n, (r, calls)
     r = await s.do_command({"grasp": "tape and snack", "wait": True})
-    assert st(r) == ["already_in_bucket", "done"] and r["status"] == "done" and [c["text"] for c in calls] == ["tape", "snack"], (r, calls)
+    assert st(r) == ["done", "done"] and [c["text"] for c in calls][-2:] == ["tape", "snack"], (r, calls)
     p = await s.do_command({"preview": "tape"})
-    assert p["status"] == "already_in_bucket", p
-    assert [e["label"] for e in (await s.do_command({"status": True}))["bucket"]] == ["tape", "snack"]
-    print("11. delivered this run, not seen since: already_in_bucket at once (alone, in a list, preview), counts as done; status lists it")
+    assert p.get("status") != "already_in_bucket", p
+    print("11. delivered this run: asked again it is searched for again (alone, in a list, preview)")
 
     # Someone takes the tape out: the map sees it after it went in -> grasped as usual, and no longer listed
     MAP["tape"] = {"label": "tape", "names": ["tape", "black tape"], "xy": [350.0, -60.0], "colour": "black", "seen_ts": time.time() + 1}
