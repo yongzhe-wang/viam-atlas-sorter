@@ -143,6 +143,21 @@ await sorter.do_command({"reset": True})                    # empty the square (
     held, an unexpected error.
 
   `{"preview": "..."}` answers item by item without moving. One object takes the single path, as before.
+- **The library learns (`SORTER_TEACH=1`, off by default; `sorter/teach.py`):**
+  - `{"teach": "m&m bag"}` takes the object clicked (`"point": [u, v]`, 0-1 of the picture) or else the best match for
+    the name, then looks at it from where the arm stands, from two poses beside it at z 400 and from one at z 580. Each
+    view (CLIP embedding, height, colour, small JPEG, `source: "teach"`) goes to the Store at once, so `$vectorSearch`
+    answers with it; the summary says after how many seconds (`searchable_s`). The arm stays at z >= 400 and touches
+    nothing; it runs as a job (busy, E-stop) and ends at the observe pose. A known name adds views to that object, and
+    `"alias_of": "kind bar"` makes the name another word for one.
+  - A grasp that ends `done` with its check passed keeps the crop that found the object as a new view (`source: "grasp"`,
+    with `primitive` and `grip`), under its recognised name, or under the words used if it was not recognised and the
+    pick was clear. `learned` in the summary says what happened. Nothing is learned when the words name one object and
+    recognition says another: that may be a wrong pick, and `{"teach"}` settles it.
+  - A view within cosine 0.98 of one already there is skipped (a teach compares with its own label only). A label takes
+    at most 40 views from grasps. Atlas: observations stop going up at 450 MB (`SORTER_ATLAS_STOP_MB`) of the free
+    tier's 512 MB, so views and attempts still fit; they stay on the robot's disk and `flush()` sends them later.
+  - `{"status": true}` has `atlas` (views, labels, attempts, usage, `learned`, `last_search`) for the dashboard's panel.
 - One job at a time. A request while busy returns `{"accepted": false, "error": "busy", "running": {...}}`.
 - Summaries contain `status` (`done`, `failed`, `not_found`, `ambiguous` = two objects match about equally,
   `already_in_square` = the named object is only in the drop square (answered at once, no sweep), `too_wide`,

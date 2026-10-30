@@ -109,6 +109,18 @@
   .pl-ctl input[type=range] { flex: 1 1 200px; }
   .pl-ctl select, .pl-ctl a { font-size: 13px; }
   .pl-ctl a { color: var(--accent); }
+  .camwrap { position: relative; }
+  #cam.pickable { cursor: crosshair; }
+  #cam-mark { position: absolute; width: 18px; height: 18px; margin: -9px 0 0 -9px; border: 2px solid var(--accent);
+    border-radius: 50%; box-shadow: 0 0 0 2px rgba(0, 0, 0, .5); pointer-events: none; }
+  .atlas { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px 24px; align-items: start; }
+  .atlas h3 { font-size: 13px; margin: 0 0 8px; font-weight: 600; }
+  .atlas .kpis { margin-bottom: 6px; grid-template-columns: repeat(2, 1fr); }
+  .learned-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 13px; margin: 4px 0; }
+  .learned { font-size: 12px; color: var(--ok); }
+  #teach-form { margin-top: 12px; display: grid; gap: 6px; }
+  #teach-form input { min-width: 0; }
+  #teach-msg { font-size: 13px; }
   .bars div { display: grid; grid-template-columns: 120px 1fr 60px; gap: 8px; align-items: center; margin: 4px 0; font-size: 12px; }
   .bar { height: 8px; border-radius: 4px; background: var(--chip); overflow: hidden; }
   .bar i { display: block; height: 100%; background: var(--ok); }
@@ -126,7 +138,7 @@
 <main>
   <section class="card">
     <h2>What the arm sees</h2>
-    <img id="cam" alt="live camera">
+    <div class="camwrap"><img id="cam" alt="live camera"><span id="cam-mark" hidden></span></div>
     <div id="camnote"></div>
   </section>
 
@@ -170,6 +182,39 @@
     <svg id="tmap" viewBox="0 0 560 300" width="100%" role="img" aria-label="top-down table map"></svg>
     <div class="legend"><span><i class="sw" style="background:var(--ok);height:8px;width:8px;border-radius:50%"></i>on the live map (every picture updates it)</span>
       <span>○ last seen elsewhere (memory)</span><span>◌ ≈ only seen at a picture's edge (position approximate)</span><span><i class="sw" style="background:#2457d6;height:8px;width:8px;border-radius:50%"></i>✓ already delivered into the square</span><span>colour = when last seen: green &lt; 1 min, amber &lt; 5 min, grey older or not recognised (hover for "unknown"); dots fade as they age</span><span>ring = last preview / grasp target</span><span>click an object to grasp it</span></div>
+  </section>
+
+  <section class="card full" id="atlas-card">
+    <h2 id="a-title">MongoDB Atlas</h2>
+    <div class="atlas">
+      <div>
+        <div class="kpis">
+          <div class="kpi"><b id="a-views">–</b><span>views</span></div>
+          <div class="kpi"><b id="a-labels">–</b><span>objects</span></div>
+          <div class="kpi"><b id="a-attempts">–</b><span>grasps logged</span></div>
+          <div class="kpi"><b id="a-obs">–</b><span>observations</span></div>
+        </div>
+        <div id="a-usage" class="muted"></div>
+      </div>
+      <div>
+        <h3><code id="a-search-via">$vectorSearch</code> <span id="a-search-meta" class="muted"></span></h3>
+        <div id="a-hits" class="bars"></div>
+      </div>
+      <div>
+        <h3>Learned while running</h3>
+        <div id="a-learned"></div>
+        <form id="teach-form" hidden>
+          <h3>Teach an object</h3>
+          <input id="teach-name" type="text" placeholder="m&amp;m bag" autocomplete="off" maxlength="60" aria-label="name of the object">
+          <input id="teach-alias" type="text" placeholder="same object as… (optional)" autocomplete="off" maxlength="60" aria-label="known object this is another name for">
+          <button class="primary" type="submit">Teach</button>
+          <div class="muted"><span id="teach-pick">click the object in the picture, or leave it to the best match for the name</span>
+            <button type="button" id="teach-clear" hidden>clear</button></div>
+          <div id="teach-msg"></div>
+        </form>
+        <div id="teach-off" class="muted" hidden>Teaching is off on the robot (SORTER_TEACH=1).</div>
+      </div>
+    </div>
   </section>
 
   <section class="card full" id="charts-card" hidden>
@@ -225,11 +270,106 @@ function refreshCam() {
   img.src = "/api/snapshot.jpg?t=" + Date.now();
 }
 
+// ---- MongoDB Atlas panel: what the library knows, what it just answered, what it learned while running ----
+function renderAtlas(p) {
+  const pl = (n, w) => `${Math.round(n)} ${w}${Math.round(n) === 1 ? "" : "s"}`;
+  const atlas = p.store === "atlas";
+  $("a-title").textContent = atlas ? "MongoDB Atlas" : p.store === "jsonl" ? "Library (local files)" : "MongoDB Atlas";
+  $("a-views").textContent = p.views ?? p.library?.views ?? "–";
+  $("a-labels").textContent = p.labels ?? p.library?.labels ?? "–";
+  $("a-attempts").textContent = p.attempts ?? "–";
+  $("a-obs").textContent = p.observations?.count ?? "–";
+  const u = p.usage || {};
+  $("a-usage").textContent = u.used_mb != null ? `${Math.round(u.used_mb)} of ${u.limit_mb} MB used` : "";
+  const ls = p.last_search;
+  $("a-search-via").textContent = ls ? ls.via : "$vectorSearch";
+  $("a-search-meta").textContent = ls ? `${Number(ls.ms).toFixed(0)} ms · ${Math.round(p.searches || 0)} this run` : "no search yet";
+  const hits = $("a-hits");
+  hits.textContent = "";
+  for (const h of (ls && ls.hits) || []) {
+    const row = el("div", null, "hit");
+    row.appendChild(el("span", h.label || "?"));
+    const bar = el("span", null, "bar");
+    const fill = el("i");
+    fill.style.width = `${Math.round(Math.max(0, Math.min(1, h.score)) * 100)}%`;
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    row.appendChild(el("span", Number(h.score).toFixed(3)));
+    hits.appendChild(row);
+  }
+  const list = $("a-learned");
+  list.textContent = "";
+  for (const e of p.learned || []) {
+    const row = el("div", null, "learned-row");
+    row.appendChild(el("b", e.label));
+    if (e.new) row.appendChild(el("span", "new", "badge done"));
+    const how = [e.teach ? pl(e.teach, "taught view") : "", e.grasp ? pl(e.grasp, "view") + " from grasps" : ""];
+    row.appendChild(el("span", how.filter(Boolean).join(" · "), "muted"));
+    list.appendChild(row);
+  }
+  if (!list.childElementCount) list.appendChild(el("div", "nothing yet", "muted"));
+  const teach = p.teach || {};
+  $("teach-form").hidden = !teach.enabled;
+  $("teach-off").hidden = !!teach.enabled || p.store == null;
+  teachEnabled = !!teach.enabled;
+  $("cam").classList.toggle("pickable", teachEnabled);
+  const tp = teach.progress;
+  if (tp) $("teach-msg").textContent = `looking from pose ${Math.round(tp.k)} of ${Math.round(tp.n)}…`;
+  else if ($("teach-msg").textContent.startsWith("looking from pose")) $("teach-msg").textContent = "";
+}
+
+// A click on the picture says which object to teach; the point is 0-1 of the picture, not of the box around it
+let teachEnabled = false, teachPoint = null;
+function showTeachPoint() {
+  const cam = $("cam"), mark = $("cam-mark");
+  mark.hidden = !teachPoint;
+  $("teach-pick").textContent = teachPoint ? "object picked in the picture" : "click the object in the picture, or leave it to the best match for the name";
+  $("teach-clear").hidden = !teachPoint;
+  if (!teachPoint) return;
+  const r = picRect(cam);
+  mark.style.left = `${r.x + teachPoint[0] * r.w}px`;
+  mark.style.top = `${r.y + teachPoint[1] * r.h}px`;
+}
+function picRect(cam) {
+  // object-fit: contain leaves bars around a picture of another shape
+  const bw = cam.clientWidth, bh = cam.clientHeight, ar = (cam.naturalWidth || 16) / (cam.naturalHeight || 9);
+  const w = Math.min(bw, bh * ar), h = w / ar;
+  return { x: (bw - w) / 2, y: (bh - h) / 2, w, h };
+}
+$("cam").addEventListener("click", ev => {
+  if (!teachEnabled) return;
+  const r = picRect(ev.currentTarget), u = (ev.offsetX - r.x) / r.w, v = (ev.offsetY - r.y) / r.h;
+  if (u < 0 || u > 1 || v < 0 || v > 1) return;
+  teachPoint = [u, v];
+  showTeachPoint();
+});
+$("teach-clear").addEventListener("click", () => { teachPoint = null; showTeachPoint(); });
+$("teach-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const name = $("teach-name").value.trim();
+  if (!name) return;
+  try {
+    const r = await api("/api/teach", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, alias_of: $("teach-alias").value.trim() || null, point: teachPoint }) });
+    const m = r.module || {};
+    $("teach-msg").textContent = m.accepted ? `teaching "${name}" (${m.why || "chosen"}): the arm looks from above and does not touch it`
+      : m.error === "busy" ? "the arm is busy, try again when it is done" : (m.reason || m.error || "not accepted");
+    if (m.accepted) { $("teach-name").value = ""; $("teach-alias").value = ""; teachPoint = null; showTeachPoint(); }
+    refreshCommands();
+  } catch (err) { $("teach-msg").textContent = "error: " + err.message; }
+});
+
 async function refreshStatus() {
   try {
     const s = await api("/api/status");
     const q = Object.values(s.queued).reduce((a, b) => a + b, 0);
-    setPill("p-atlas", s.atlas ? "Atlas online" : `Atlas offline · ${q} queued locally`, s.atlas ? "ok" : "warn");
+    // Module mode: the robot's Store is what counts, this server has no MONGODB_URI (s.atlas null: no answer yet)
+    if (s.command_path === "module") {
+      if (s.atlas === null) setPill("p-atlas", "Atlas: waiting for the robot", "warn");
+      else if (s.atlas_stale) setPill("p-atlas", `${s.atlas ? "Atlas" : "Local files"} when last heard · robot link down`, "warn");
+      else setPill("p-atlas", s.atlas ? "Atlas online · robot" : "Robot on local files, no Atlas", s.atlas ? "ok" : "warn");
+    } else setPill("p-atlas", s.atlas ? "Atlas online" : `Atlas offline · ${q} queued locally`, s.atlas ? "ok" : "warn");
+    renderAtlas(s.atlas_panel || {});
     const c = s.camera;
     // Picture pill follows whichever source the server picked (worker frame or our own camera)
     if (s.frame) setPill("p-cam", `Picture: ${s.frame.source} · ${s.frame.age_s} s`, s.frame.age_s < 10 ? "ok" : "warn");
@@ -312,6 +452,7 @@ async function refreshCommands() {
     if (c.fail_reason && !c.items) left.appendChild(el("div", c.fail_reason + (c.status === "square_full" ? " · press Clear square" : ""), "cmdfail"));
     // A list of objects: where it is now, then every item with its result
     if (c.progress) left.appendChild(el("div", c.progress, "muted"));
+    if (c.note) left.appendChild(el("div", c.note, "learned"));
     for (const i of c.items || []) left.appendChild(itemRow(i));
     if (c.stopped_by) left.appendChild(el("div", `stopped: ${c.stopped_by}`, "cmdfail"));
     if ((c.ignored || []).length) left.appendChild(el("div", `only 5 at a time, ignored: ${c.ignored.join(", ")}`, "muted"));

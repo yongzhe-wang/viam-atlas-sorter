@@ -44,6 +44,12 @@ OBS_DIR = "observations"  # data/observations/<YYYYMMDD>/obs.jsonl + images: the
 OBS_ATLAS_IMAGE_MB = 300  # observation images uploaded to Atlas up to this (env SORTER_OBS_ATLAS_MB): an M0 cluster
 #                           holds 512 MB in all, and ~100 KB a frame at ~1 frame/s would fill it in under 2 hours
 OBS_MIN_FREE_BYTES = 5e9  # below this much free disk, thin_observations drops the oldest idle frames' images
+ATLAS_LIMIT_MB = 512  # the free tier's storage {VIAM CENTERAL 2026-10-30 "ATLAS 免费档有 512 MB 上限"}
+ATLAS_OBS_STOP_MB = 450  # observations stop going up here (env SORTER_ATLAS_STOP_MB), so views and attempts still fit
+ATLAS_USAGE_EVERY_S = 60.0  # how often dbStats is asked
+LEARN_DUP_COS = 0.98  # a learned view this close to a view already there adds nothing
+LEARN_MAX_VIEWS = 40  # views per label a delivered grasp may grow it to
+LEARNED_SOURCES = ("teach", "grasp")  # views the running system added, as opposed to the prepared library
 
 
 def _new_id() -> str:
@@ -132,6 +138,9 @@ class Store:
         self.db = None
         self._views_cache = None  # ((mtime_ns, size), views, normalised matrix) for offline search_views
         self._online_lib = None  # (normalised matrix, labels) loaded once from Atlas by library_matrix()
+        self.last_search = None  # what the latest search_views did, for the dashboard's Atlas panel
+        self.search_count = 0
+        self._atlas_usage = (0.0, {})  # (asked at, {"used_mb", "limit_mb"})
         self._obs_counts = None  # {"count", "bytes"} of the observation log, built on first use then kept current
         self._obs_atlas_bytes = None  # observation image bytes already in Atlas (budget), read on first upload
         if uri:
@@ -278,6 +287,7 @@ class Store:
         Returned docs omit the embedding and image bytes.
         """
         q = np.asarray(embedding, dtype=float).ravel()
+        t0 = time.monotonic()
         if self.online:
             stage = {"index": VECTOR_INDEX, "path": "embedding", "queryVector": q.tolist(),
                      "numCandidates": max(50, 20 * k), "limit": k}
@@ -286,7 +296,7 @@ class Store:
             pipeline = [{"$vectorSearch": stage},
                         {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
                         {"$project": {"embedding": 0, "jpeg": 0}}]
-            return list(self.db.views.aggregate(pipeline))
+            return self._note_search("$vectorSearch", list(self.db.views.aggregate(pipeline)), t0)
         views, matrix = self._views_offline()
         if label:
             keep = [i for i, v in enumerate(views) if v.get("label") == label]
@@ -300,7 +310,87 @@ class Store:
             v = {key: val for key, val in views[i].items() if key not in ("embedding", "jpeg")}
             v["score"] = float(scores[i])
             out.append(v)
-        return out
+        return self._note_search("local cosine", out, t0)
+
+    def _note_search(self, via: str, hits: list, t0: float) -> list:
+        """Remember the latest search for the Atlas panel: the judges see $vectorSearch answering, live."""
+        self.search_count += 1
+        self.last_search = {"via": via, "ts": time.time(), "ms": round((time.monotonic() - t0) * 1000.0, 1),
+                            "hits": [{"label": h.get("label"), "score": round(float(h["score"]), 3),
+                                      "source": h.get("source")} for h in hits[:3]]}
+        return hits
+
+    def add_learned_view(self, label: str, embedding, jpeg: bytes, meta: dict, same_label_only: bool = False,
+                         cap: int = None, dedupe: bool = True) -> dict:
+        """
+        A view the running system learned: {"id": ...}, or {"skipped": why} (with "cos" for a repeat).
+
+        Skipped when a view is already within LEARN_DUP_COS (of its own label only with same_label_only: someone teaching
+        an object overrules what another label's views say) or the label has `cap` views. dedupe=False keeps it anyway
+        (an alias lives on a view, so a new name needs one). Online the in-memory library
+        gets the new row, so nothing is reloaded from Atlas and a later view of this batch sees it.
+        """
+        v = np.asarray(embedding, dtype=np.float32).ravel()
+        v = v / max(float(np.linalg.norm(v)), 1e-12)
+        matrix, labels = self.library_matrix()
+        if dedupe and matrix is not None and len(labels):
+            rows = [i for i, x in enumerate(labels) if x == label] if same_label_only else list(range(len(labels)))
+            cos = float((matrix[rows] @ v).max()) if rows else -1.0
+            if cos > LEARN_DUP_COS:
+                return {"skipped": "already known", "cos": round(cos, 3)}
+        if cap is not None and labels.count(label) >= cap:
+            return {"skipped": f"{label!r} already has {cap} views"}
+        view_id = self.add_view(label, v, jpeg, meta)
+        if self.online:
+            self._online_lib = (v[None, :] if matrix is None else np.vstack([matrix, v]), [*labels, label])
+        return {"id": view_id}
+
+    def atlas_usage(self) -> dict:
+        """
+        {"used_mb", "limit_mb"} of the cluster, {} offline or when Atlas does not say. Asked at most once a minute.
+
+        Larger of the data and its compressed storage, plus indexes: which of them the free tier counts is not checked.
+        """
+        if not self.online:
+            return {}
+        asked, usage = self._atlas_usage
+        if time.monotonic() - asked >= ATLAS_USAGE_EVERY_S or not asked:
+            try:
+                s = self.db.command("dbStats")
+                used = (max(s.get("dataSize", 0), s.get("storageSize", 0)) + s.get("indexSize", 0)) / 1e6
+                usage = {"used_mb": round(used, 1), "limit_mb": ATLAS_LIMIT_MB}
+            except Exception:  # not reported: observations keep going up, as they did before this check
+                usage = {}
+            self._atlas_usage = (time.monotonic(), usage)
+        return usage
+
+    def _atlas_nearly_full(self) -> bool:
+        """Past this, Atlas refuses every write, so a taught view or an attempt would fail in front of the judges."""
+        return self.atlas_usage().get("used_mb", 0.0) >= float(os.environ.get("SORTER_ATLAS_STOP_MB", ATLAS_OBS_STOP_MB))
+
+    def panel(self) -> dict:
+        """
+        What the dashboard's Atlas panel shows, apart from last_search: counts and the objects learned while running.
+
+        learned: per label, newest first; new = the prepared library did not have it. One query over the views without
+        embeddings or pictures, so the module asks it in the background every few seconds.
+        """
+        rows = (self.db.views.find({}, {"label": 1, "source": 1, "ts": 1, "_id": 0}) if self.online
+                else self._read_offline("views"))
+        count, prepared, learned = 0, set(), {}
+        for r in rows:
+            count += 1
+            label = r.get("label")
+            if r.get("source") in LEARNED_SOURCES:
+                e = learned.setdefault(label, {"label": label, "teach": 0, "grasp": 0, "last_ts": 0.0})
+                e[r["source"]] += 1
+                e["last_ts"] = max(e["last_ts"], float(r.get("ts") or 0.0))
+            else:
+                prepared.add(label)
+        attempts = self.db.attempts.count_documents({}) if self.online else len(self._read_offline("attempts"))
+        return {"labels": len(prepared | set(learned)), "views": count, "attempts": attempts, "usage": self.atlas_usage(),
+                "learned": sorted(({**e, "new": e["label"] not in prepared} for e in learned.values()),
+                                  key=lambda e: -e["last_ts"])}
 
     def list_labels(self) -> list:
         """
@@ -621,6 +711,8 @@ class Store:
         """
         from bson import Binary
 
+        if self._atlas_nearly_full():
+            return False
         if doc:
             self.db.observations.replace_one({"_id": rec["_id"]}, _with_date(dict(rec)), upsert=True)
         if self._obs_atlas_bytes is None:

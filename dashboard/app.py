@@ -33,6 +33,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import List, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -61,6 +62,7 @@ store = Store()
 CAM_DIR = store.data / "camera"
 camproc = {"pid": None, "restarts": 0, "last_exit": None, "enabled": DIRECT_CAMERA or MODULE_MODE}
 module_cmds = deque(maxlen=30)  # module mode: commands sent this session, newest first
+_queue_panel = {"ts": 0.0, "panel": {}}
 _worker_render = {"key": None, "jpeg": None}  # last annotated worker frame, keyed by (worker, ts)
 
 
@@ -104,6 +106,12 @@ app = FastAPI(title="Sorter dashboard", lifespan=lifespan)
 
 class TextIn(BaseModel):
     text: str
+
+
+class TeachIn(BaseModel):
+    name: str
+    alias_of: Optional[str] = None
+    point: Optional[List[float]] = None  # where the object was clicked, 0-1 of the picture
 
 
 def _clean(text: str) -> str:
@@ -240,7 +248,35 @@ def status():
         seen = ((_module_state().get("status") or {}).get("seen") or {})
         out["module_seen"] = {"objects": len(seen.get("objects") or []), "intruders": len(seen.get("intruders") or []),
                               "at_observe": seen.get("at_observe")}
+        out.update(_module_atlas())
+    else:
+        out["atlas_panel"] = _queue_atlas()
     return out
+
+
+def _module_atlas() -> dict:
+    """
+    Module mode: the Atlas state is the robot's, this process has no MONGODB_URI (VIAM CENTERAL: the header said
+    "Atlas offline" with the robot writing to Atlas). atlas: what the module's "store" says; None until it has answered.
+    """
+    st = _module_state()
+    s = st.get("status") or {}
+    fresh = bool(st.get("ok")) and st.get("age_s") is not None and st["age_s"] <= MODULE_STALE_S
+    return {"atlas": s["store"] == "atlas" if s.get("store") else None, "atlas_stale": not fresh,
+            "atlas_panel": {**(s.get("atlas") or {}), "store": s.get("store"), "observations": s.get("observations") or {},
+                            "library": s.get("library") or {}, "teach": s.get("teach") or {}, "stale": not fresh}}
+
+
+def _queue_atlas() -> dict:
+    """Queue mode: the same panel from this process's own Store, asked at most every 5 s."""
+    if time.time() - _queue_panel["ts"] >= 5.0:
+        _queue_panel["ts"] = time.time()
+        try:
+            _queue_panel["panel"] = store.panel()
+        except Exception as e:  # Atlas unreachable: the rest of the dashboard still answers
+            print(f"atlas panel: {type(e).__name__}: {e}")
+    return {**_queue_panel["panel"], "store": "atlas" if store.online else "jsonl", "last_search": store.last_search,
+            "searches": store.search_count, "observations": store.observation_stats(), "teach": {}, "stale": False}
 
 
 def _module_state() -> dict:
@@ -276,6 +312,16 @@ def _module_worker() -> dict:
             "age_s": st["age_s"] if st["age_s"] is not None else 1e9, "online": online, "consumer": True}
 
 
+def _learned_note(last: dict) -> Optional[str]:
+    """One line on what a teach or a delivered grasp added to the library, for the command list."""
+    if last.get("kind") == "teach" and last.get("views_added") is not None:
+        when = f", searchable after {last['searchable_s']:.0f} s" if last.get("searchable_s") is not None else ""
+        also = f", {last['views_skipped']:.0f} not kept" if last.get("views_skipped") else ""
+        return f"learned {last.get('label')}: {last['views_added']:.0f} new views{also}{when}"
+    learned = last.get("learned") or {}
+    return f"library: new view of {learned['label']}" if learned.get("view") else None
+
+
 def _sync_module_cmds() -> None:
     """
     Update sent commands from the module's status: running while its job is the module's current job, then the
@@ -295,7 +341,7 @@ def _sync_module_cmds() -> None:
         if last and same:
             c.update(status=last.get("status") or "done", finished=last.get("finished"), attempt_id=last.get("_id"),
                      fail_reason=last.get("fail_reason") or last.get("error"), duration_s=last.get("duration_s"),
-                     items=last.get("items"), stopped_by=last.get("stopped_by"), progress=None,
+                     items=last.get("items"), stopped_by=last.get("stopped_by"), progress=None, note=_learned_note(last),
                      # A list reports per item instead of one pick
                      chosen={"label": last.get("label"), "colour": last.get("colour"), "score": last.get("score")}
                      if (last.get("label") or last.get("colour")) and not last.get("items") else None)
@@ -385,6 +431,33 @@ async def add_command(body: TextIn):
         busy = res.get("error") == "busy"
         # the "busy" badge says it all; a refusal for any other reason shows its message
         entry.update(status="busy" if busy else "rejected", fail_reason=None if busy else res.get("error"))
+    return {"id": entry["_id"], "module": res}
+
+
+@app.post("/api/teach")
+async def teach(body: TeachIn):
+    """Teach button: DoCommand {"teach"} on the module, shown in the command list like a grasp."""
+    name = _clean(body.name)
+    if not MODULE_MODE:
+        raise HTTPException(400, "Teach needs the Viam module (DASH_COMMAND_PATH=module)")
+    entry = {"_id": uuid.uuid4().hex, "text": f"teach: {name}", "ts": time.time(), "status": "sending"}
+    module_cmds.appendleft(entry)
+    command = {"teach": name}
+    if body.alias_of and body.alias_of.strip():
+        command["alias_of"] = body.alias_of.strip()
+    if body.point and len(body.point) == 2:
+        command["point"] = body.point
+    try:
+        res = await module_call(command)
+    except HTTPException as e:
+        entry.update(status="error", fail_reason=e.detail)
+        raise
+    if res.get("accepted"):
+        entry.update(status="running", job=res.get("job"))
+    else:
+        busy = res.get("error") == "busy"
+        entry.update(status="busy" if busy else res.get("status") or "rejected",
+                     fail_reason=None if busy else res.get("reason") or res.get("error"))
     return {"id": entry["_id"], "module": res}
 
 
@@ -505,7 +578,12 @@ async def clear_map():
 @app.get("/api/labels")
 def labels():
     """Known objects for the "you can ask for" list: [[label, *aliases], ...] from the view library."""
-    return store.list_labels()
+    rows = store.list_labels()
+    if MODULE_MODE:  # this process's library is the prepared one: what was taught on the robot is only known there
+        known = {row[0] for row in rows}
+        rows += [[e["label"]] for e in ((_module_state().get("status") or {}).get("atlas") or {}).get("learned") or []
+                 if e.get("label") not in known]
+    return rows
 
 
 @app.get("/api/attempts")

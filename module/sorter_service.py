@@ -78,6 +78,7 @@ from viam.services.generic import Generic
 from viam.utils import ValueTypes, struct_to_dict
 
 from module.live_map import LiveMap
+from sorter import teach
 
 NAMESPACE = "sorter-team"  # must match "module_id" in meta.json; change both to your registry namespace
 LOGGER = getLogger(__name__)
@@ -89,7 +90,8 @@ BUNDLE_DIR = Path(__file__).resolve().parent.parent / "library"
 BUILD_INFO_PATH = Path(__file__).resolve().parent.parent / "BUILD_INFO.json"
 # find_path / square_path (AGENT1 0d3c817): how the executor really found the object and the square, for status.last
 SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "duration_s", "fail_phase", "fail_reason",
-                "find_path", "find_views", "square_path", "objects", "check")
+                "find_path", "find_views", "square_path", "objects", "check", "learned", "alias_of", "views_added",
+                "views_skipped", "frames", "searchable_s", "top_score")
 # A grasp that fails by accident (slipped, closed on air) is tried this many times in all, each from a fresh
 # search {USER 2026-10-29 "I ALSO WANT RETRY WHEN FAIL"} [CONFIDENCE: SINGLE-SRC 90% — 3 is my pick: a 4th
 # try past ~45 s of retries loses the demo minute anyway]
@@ -241,6 +243,7 @@ class GraspByDescription(Generic, EasyResource):
             LOGGER.info(f"{config.name}: {seed_library(BUNDLE_DIR, data_dir)} into {data_dir}")
         self.store = Store(uri=uri, data_dir=str(data_dir) if data_dir else None)
         self.library = self.store.library_stats()
+        self.atlas_panel: Dict[str, Any] = {}  # Store.panel(), refreshed with the heartbeat (Atlas queries)
         self.worker_id = f"module:{config.name}"
         self.rig = None
         self.job: Optional[asyncio.Task] = None
@@ -1032,7 +1035,13 @@ class GraspByDescription(Generic, EasyResource):
                     kwargs["skip_current"] = True
                 if any_match and "accept_ambiguous" in params:
                     kwargs["accept_ambiguous"] = True
+                rig.picked_obj = None
                 doc = await rt.executor.execute(rig, text, self.store, mode="demo", **kwargs)
+                if teach.enabled():
+                    doc["learned"] = await self._learn(rt, doc, rig.picked_obj, text)
+            elif kind == "teach":
+                doc = await teach.teach(rig, rt, self.store, text, target, target.get("alias_of"), self._teach_progress)
+                self.atlas_panel = await asyncio.to_thread(self._panel)
             elif kind == "scan":
                 doc = await self._scan(rt, rig)
             else:
@@ -1053,6 +1062,69 @@ class GraspByDescription(Generic, EasyResource):
             except Exception:
                 pass
         return summary, via
+
+    # ---- the library learns: {"teach": name} and delivered grasps (sorter/teach.py) --------------------
+
+    def _teach_progress(self, k: int, n: int) -> None:
+        self.job_info["teach"] = {"k": k, "n": n}
+
+    async def _learn(self, rt, doc: dict, obj, text: str) -> Optional[dict]:
+        """A delivered grasp's crop into the library; what happened goes into the summary. Never raises."""
+        learned = await asyncio.to_thread(teach.learn_from_grasp, self.store, rt.clip_embed, doc, obj, text)
+        if learned and learned.get("view"):
+            self.atlas_panel = await asyncio.to_thread(self._panel)
+        return learned
+
+    def _panel(self) -> dict:
+        """Store.panel() and the library counters; {} (kept out of the status) when Atlas does not answer."""
+        try:
+            panel = self.store.panel()
+        except Exception as e:
+            LOGGER.warning(f"atlas panel: {type(e).__name__}: {e}")
+            return self.atlas_panel
+        self.library = {"labels": panel["labels"], "views": panel["views"]}
+        return panel
+
+    async def _teach_command(self, command: Mapping[str, ValueTypes]) -> Dict[str, ValueTypes]:
+        """
+        {"teach": "m&m bag"}: the object clicked ({"point": [u, v]}, 0-1 of the picture) or else the best match for the
+        name, from the observe pose. {"alias_of": "kind bar"} makes the name another word for that object.
+        Upstream: the dashboard's Teach button. Downstream: sorter/teach.py as a job like any other (busy, EStop).
+        """
+        rt = _runtime()
+        name = rt.clip_embed.clean_query(str(command.get("teach") or ""))
+        words = name.split()
+        if not teach.enabled():
+            return {"ok": False, "accepted": False, "error": "teaching is off: set SORTER_TEACH=1 on the module"}
+        if not words or len(name) > 60 or all(w in rt.clip_embed.COLOURS or w in rt.clip_embed.FILLER for w in words):
+            return {"ok": False, "accepted": False, "error": f"{name!r} does not name an object, say what it is called"}
+        cold = self._not_ready()
+        if cold:
+            return cold
+        if self._busy():
+            return {"accepted": False, "error": "busy", "running": dict(self.job_info)}
+        if rt.ppa.ESTOP["on"]:
+            return {"ok": False, "accepted": False, "status": "estop", "reason": rt.ppa.ESTOP_STATUS}
+        await self._fresh_look()
+        raw = self._seen_raw
+        if raw is None:
+            return {"ok": False, "accepted": False, "status": "no_frame",
+                    "reason": f"no fresh frame from the observe pose ({self.seen.get('reason') or 'no look yet'})"}
+        if self.seen.get("intruders"):
+            return {"ok": False, "accepted": False, "status": "intruder", "reason": "hand in the workspace"}
+        point = command.get("point")
+        h, w = raw["rgb"].shape[:2]
+        px = (float(point[0]) * w, float(point[1]) * h) if isinstance(point, (list, tuple)) and len(point) == 2 else None
+        rec, why = await asyncio.to_thread(
+            teach.choose, raw["recs"], px, lambda: rt.clip_embed.rank(raw["objs"], name, self.store, recognised=raw["recs"]))
+        if rec is None:
+            return {"ok": False, "accepted": False, "status": "not_found", "reason": why}
+        alias_of = str(command.get("alias_of") or "").strip() or None
+        started = await self._start("teach", name, bool(command.get("wait")),
+                                    target={"rec": rec, "pose": raw["pose"], "alias_of": alias_of})
+        o = rec["obj"]
+        return {"ok": True, "via": "teach", "why": why, "alias_of": alias_of,
+                "target": {"id": int(o.id), "label": rec.get("label"), "colour": o.colour, "bbox": _box(o.bbox)}, **started}
 
     async def _start(self, kind: str, text: Optional[str], wait: bool, target: Optional[dict] = None,
                      decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
@@ -1267,6 +1339,9 @@ class GraspByDescription(Generic, EasyResource):
                 "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats(),
                 "map": self.live.summary() if self.live is not None else {"live": False},
                 "observations": self.store.observation_stats(), "build": _build_info(),
+                "atlas": {**self.atlas_panel, "last_search": self.store.last_search,
+                          "searches": self.store.search_count},
+                "teach": {"enabled": teach.enabled(), "progress": self.job_info.get("teach") if self._busy() else None},
                 "llm": self._llm_status()}
 
     @staticmethod
@@ -1318,11 +1393,13 @@ class GraspByDescription(Generic, EasyResource):
                     return {"ok": False, "accepted": False, "error": f"say what to {key}, e.g. {{\"{key}\": \"green square\"}}"}
                 return await (self._grasp_command(raw, bool(command.get("wait"))) if key == "grasp"
                               else self._preview_command(raw))
+        if "teach" in command:
+            return await self._teach_command(command)
         if command.get("reset"):
             return await self._start("reset", None, bool(command.get("wait")))
         return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"preview\": \"<description>\"}, "
                          "{\"reset\": true}, {\"scan_table\": true}, {\"clear_map\": true}, {\"rebuild_map\": {}}, "
-                         "{\"observations\": {}}, "
+                         "{\"observations\": {}}, {\"teach\": \"<name>\"}, "
                          "{\"status\": true}, "
                          "{\"seen_image\": true} or {\"table_map\": true}"}
 
@@ -1340,6 +1417,8 @@ class GraspByDescription(Generic, EasyResource):
                 # consumers are live at once (EXEC_PLAN: exactly one)
                 self.store.heartbeat(self.worker_id, phase, error=err, last_status=self.last.get("status"),
                                      consumer=bool(self.attrs.get("consume_dashboard_commands", False)))
+                # In the background: these are Atlas queries, and {"status": true} answers from this copy
+                self.atlas_panel = await asyncio.to_thread(self._panel)
             except Exception as e:
                 LOGGER.warning(f"heartbeat failed: {e}")
             await asyncio.sleep(HEARTBEAT_S)
