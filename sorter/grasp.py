@@ -8,6 +8,7 @@ its paper core and slipped; a long object needs its handle; a tall one must not 
 
 choose_primitives(o) -> candidates, best first ([] = too wide to grasp):
   ring (hole in the mask)            -> ring_inside (if the hole fits the jaws), ring_wall
+  lying round (long, arched top)     -> lying_round, then as long or plain
   tall and small (> 50 mm high)      -> standing, top
   long (length / width > 2.5)        -> handle, centroid
   anything else                      -> top
@@ -33,6 +34,9 @@ MAX_OPEN_MM = 78.0  # jaws open ~84 mm; keep a margin so the fingers clear the s
 LONG_ASPECT = 2.5  # length / width above this is a long object: gripped across its short axis, at its thickest part
 TALL_MM = 50.0  # higher than this with a small footprint: gripped at half height so it is not pushed over
 TALL_MAX_FOOTPRINT_MM = 80.0
+LYING_ASPECT = 1.5  # length / width above this may be a round object on its side, if its top is arched
+ARCH_MIN_MM, ARCH_FRAC = 2.5, 0.12  # its sides this far below its crest, at least ARCH_FRAC of the radius (a circle: 0.24)
+LYING_ROUND_H_OVER_W = (0.6, 1.4)  # a round section is about as high as it is wide
 ROUND_RECT_FILL = 0.9  # perception.Obj.rect_fill below this is round (disc ~0.81): the wrist angle does not matter
 # Hole diameters the internal grip fits: the closed fingers must enter with room to spare, and the jaws (84 mm at most)
 # must reach the wall. The tape roll's core measures 73 mm (ring frames: inner radius 36.7 mm).
@@ -184,8 +188,46 @@ def ring_inner_mm(o, fx: float) -> float:
     return 2.0 * math.sqrt(hole.sum() / math.pi) * o.top_depth_mm / fx
 
 
-def choose_primitives(o, fx: float) -> list:
-    """Candidate primitives for object `o`, best first, from its geometry alone; [] if it is too wide to grasp."""
+def lying_round(o, depth: np.ndarray, fx: float) -> bool:
+    """
+    Is `o` a round object on its side? Long, about as high as wide, and its depth section across the long axis at the grasp
+    point is arched: higher in the middle than toward the sides. A block's top is flat.
+    {VIAM CENTERAL 2026-10-30 "横躺圆柱 = 长宽比 > 1.5 且 DEPTH 横截面中间高、两边低（有弧度），方块是平的"}
+    [CONFIDENCE: SINGLE-SRC 70% — thresholds from recorded frames: see smoke_lying.py]
+    """
+    mm = o.top_depth_mm / fx
+    half = o.width_px / 2.0
+    if depth is None or half <= 0.0 or o.length_px / (2.0 * half) <= LYING_ASPECT:
+        return False
+    if not LYING_ROUND_H_OVER_W[0] <= o.height_mm / (2.0 * half * mm) <= LYING_ROUND_H_OVER_W[1]:
+        return False
+    u0, v0 = o.top_centroid_px or o.centroid_px
+    a = math.radians(o.yaw_deg)
+    along, across = np.array([math.cos(a), -math.sin(a)]), np.array([math.sin(a), math.cos(a)])
+    table = o.top_depth_mm + o.height_mm
+    ts = np.arange(-half, half + 1.0)
+    heights = {}
+    for t in ts:
+        for s in (-10.0, -5.0, 0.0, 5.0, 10.0):
+            u, v = np.array([u0, v0]) + t * across + s * along
+            if 0 <= int(v) < depth.shape[0] and 0 <= int(u) < depth.shape[1] and depth[int(v), int(u)] > 0:
+                h = table - float(depth[int(v), int(u)])
+                if 3.0 < h < o.height_mm + 10.0:  # on the object: not the table, not a false reading
+                    heights.setdefault(float(t), []).append(h)
+    crest = [h for t, hs in heights.items() if abs(t) <= 0.2 * half for h in hs]
+    sides = [[h for t, hs in heights.items() if sign * t > 0 and 0.6 * half <= abs(t) <= 0.9 * half for h in hs] for sign in (-1, 1)]
+    sides = [x for x in sides if len(x) >= 10]
+    if len(crest) < 10 or not sides:
+        return False
+    drop = float(np.median(crest)) - max(float(np.median(x)) for x in sides)
+    return drop >= max(ARCH_MIN_MM, ARCH_FRAC * half * mm)
+
+
+def choose_primitives(o, fx: float, depth: np.ndarray = None) -> list:
+    """
+    Candidate primitives for object `o`, best first, from its geometry alone; [] if it is too wide to grasp.
+    `depth`: its frame's, for what the mask alone cannot tell (lying_round).
+    """
     mm = o.top_depth_mm / fx
     length, width = o.length_px * mm, o.width_px * mm
     if ring_geometry(o) is not None:
@@ -196,6 +238,8 @@ def choose_primitives(o, fx: float) -> list:
         return []
     if not enabled():
         return ["top"]
+    if lying_round(o, depth, fx):
+        return ["lying_round"] + (["handle", "centroid"] if length / max(width, 1.0) > LONG_ASPECT else ["top"])
     if o.height_mm > TALL_MM and length < TALL_MAX_FOOTPRINT_MM:
         return ["standing", "top"]
     if length / max(width, 1.0) > LONG_ASPECT:
@@ -204,7 +248,11 @@ def choose_primitives(o, fx: float) -> list:
 
 
 def target_px(primitive, o, pose: dict, k: dict, wall_mm: float = None) -> tuple:
-    """(u, v, yaw_deg): where the jaws go for this primitive in this frame. top, handle, standing, ring_wall: grasp_px."""
+    """
+    (u, v, yaw_deg): where the jaws go for this primitive in this frame. top, handle, standing, lying_round, ring_wall:
+    grasp_px, whose top centroid is the merged object's grip when perception joined see-through fragments (Obj.grip_px),
+    with the jaws across the short axis.
+    """
     if primitive == "ring_inside":
         ring = ring_geometry(o, wall_mm)
         if ring is not None:
@@ -238,8 +286,14 @@ def keeps_wrist_at_zero(primitive, o) -> bool:
 
 def grip_fn(primitive):
     """How far below the object's top the fingertips close, from its height; None = ppa.pick's default."""
-    # Halfway down a tall object, so closing on it does not tip it over
-    return (lambda height: height / 2.0) if primitive == "standing" else None
+    # Halfway down a tall object, so closing on it does not tip it over. A round one on its side: at its equator, since
+    # fingertips above the centre squeeze it out from under them {VIAM CENTERAL 2026-10-30 "下探：指尖到 H/2，受 MIN_GRASP_Z 限制"}
+    return (lambda height: height / 2.0) if primitive in ("standing", "lying_round") else None
+
+
+def slow_carry(primitive) -> bool:
+    """Lift and carry slowly: a round object on its side may be a full bottle, ~0.5 kg held by friction at its equator."""
+    return primitive == "lying_round"
 
 
 class Escalation:

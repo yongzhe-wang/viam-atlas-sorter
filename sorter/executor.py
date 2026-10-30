@@ -137,6 +137,9 @@ async def back_to_observe(rig) -> None:
     if ppa.ESTOP["on"]:
         print(f"  not returning to the observe pose: {ppa.ESTOP_STATUS}")
         return
+    # A failure may have ended the task with the arm still slowed for a heavy object
+    if getattr(rig, "slowed", False):
+        await rig.set_arm_speed(False)
     try:
         if ppa.fast("direct_return"):
             # Already there (the check's frame was taken here): no zero-length move and its settle
@@ -892,7 +895,7 @@ async def grasp_with_primitives(rig, found: dict, esc, times: dict, doc: dict, t
     """
     obj = found["obj"]
     last = None
-    for primitive in esc.order(grasp.choose_primitives(obj, rig.fx)):
+    for primitive in esc.order(grasp.choose_primitives(obj, rig.fx, found.get("depth"))):
         tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store, primitive=primitive)
         if ppa.fast("refine_skip"):
             tracker.servo_tol_mm = grasp.servo_tolerance(primitive, obj, rig.fx)
@@ -908,7 +911,8 @@ async def grasp_with_primitives(rig, found: dict, esc, times: dict, doc: dict, t
                                                        inner_mm=grasp.ring_inner_mm(obj, rig.fx))
             else:
                 height, grip = await ppa.pick(rig, times, tracker, check=check, align=False, slipped=slipped,
-                                              grip_for=grasp.grip_fn(primitive))
+                                              grip_for=grasp.grip_fn(primitive),
+                                              **({"slow_carry": True} if grasp.slow_carry(primitive) else {}))
             return height, grip, tracker
         except ppa.EStop:
             raise

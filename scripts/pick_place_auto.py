@@ -68,6 +68,10 @@ HOME_XY = (250.0, 0.0)
 MAX_STEP_MM = 250.0
 MAX_TRAVEL_MM = 1000.0  # goto(long_ok=True) only: travel() checked the line first, the guard still stops a wild target
 TRAVEL_MIN_R_MM = 150.0  # a one-move travel's straight line stays this far from the base (the looks' own limit)
+# Arm speed (deg/s, deg/s^2) with a heavy round object on the jaws, and the machine's configured one to go back to: the
+# module has no call that reads it. {VIAM CENTERAL 2026-10-30 "ARM 配置现在是 120°/S、300°/S²"}
+SLOW_ARM = (60.0, 100.0)
+ARM_NORMAL = (float(os.environ.get("ARM_SPEED_DEG", 120.0)), float(os.environ.get("ARM_ACCEL_DEG", 300.0)))
 RETREAT_CLEAR_MM = 110.0  # fingertips 10 + this above the table (z ~284) before leaving a release: over the 112 mm cups
 TOL_PX = 7.0
 # While carrying, align the square here relative to the axis pixel: up-left, away from the held object that
@@ -567,6 +571,7 @@ class Rig:
         self.tables = []  # table depths measured at ALIGN_Z, newest last (measure keeps 5)
         # "internal": the jaws hold the object by pressing outward from inside it, so closing them is what lets go
         self.grip_mode = "external"
+        self.slowed = False  # set_arm_speed(True) in force: a heavy object is on the jaws
         self.released_at = None  # flange (x, y) of the last release: the place check's reference from another pose
         self.expand_stop_mm = None  # where the last expand() stopped: logged with the grasp, for tuning on the arm
 
@@ -690,6 +695,21 @@ class Rig:
 
     async def holding(self) -> bool:
         return (await self.call("holding", lambda: self.gripper.is_holding_something())).is_holding_something
+
+    async def set_arm_speed(self, slow: bool) -> None:
+        """
+        Slow the arm for a heavy object, or back to normal; never fails: at the wrong speed the move still happens.
+
+        WHY: a full bottle is ~0.5 kg held by friction at its equator; ~0.5 s of speeding up per move shakes it.
+        {VIAM-UFACTORY-XARM README "AWAIT ARM.DO_COMMAND({"SET_SPEED": 50.0, "SET_ACCELERATION": 100.0})"}
+        [CONFIDENCE: SINGLE-SRC 70% — not run; back to ARM_NORMAL, set ARM_SPEED_DEG / ARM_ACCEL_DEG if the config changes]
+        """
+        deg, acc = SLOW_ARM if slow else ARM_NORMAL
+        try:
+            await self.call("arm speed", lambda: self.arm.do_command({"set_speed": deg, "set_acceleration": acc}))
+            self.slowed = slow
+        except Exception as e:
+            print(f"  arm speed {deg:.0f} deg/s not set: {e}")
 
     async def expand(self, mm: float) -> float:
         """
@@ -1119,7 +1139,7 @@ def finger_obstacle(depth: np.ndarray, fx: float, fy: float, cx: float, cy: floa
 
 
 async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None, align: bool = True,
-               slipped=None, grip_for=None) -> tuple:
+               slipped=None, grip_for=None, slow_carry: bool = False) -> tuple:
     """
     Steps 1-2: align over the block, measure it, descend and grab. Returns (block height, grip depth).
 
@@ -1138,6 +1158,7 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     it was picked? The G2's holding() stays True with the fingers stopped half-closed after the red box cutter slid
     out, twice; the picture decides.
     grip_for(height) -> how far below the object's top the fingertips close (default GRIP_DEPTH, at most half of it).
+    slow_carry: from the grab until the release the arm runs at SLOW_ARM (a heavy object).
     {VIAM CENTERAL 2026-10-29 "确认 RESET 真的走了 APPROACH 的一次 MOVE + OPEN-LOOP，不要再进 ALIGN"}
     """
     times = {} if times is None else times
@@ -1230,6 +1251,8 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
             # Open down here, where the object stands: if the holding sensor missed a thin object, it stays put
             # instead of falling from ALIGN_Z
             await rig.open()
+        if grabbed and slow_carry:
+            await rig.set_arm_speed(True)
         # First 30 mm as a short, slow move (the fingers leave the table without a jerk), then up to ALIGN_Z.
         # Holding: the carry follows (no frame). Missed: the re-servo's frame needs the settle
         await rig.goto(p.x, p.y, min(p.z + 30.0, ALIGN_Z), settle=False)
@@ -1252,6 +1275,8 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
             if gone:
                 rig.picked_at = None
                 await rig.open()
+                if slow_carry:
+                    await rig.set_arm_speed(False)
                 raise ObjectLost(f"slipped out of the gripper during the lift ({why})")
         if grabbed:
             break
@@ -1275,6 +1300,8 @@ async def release_jaws(rig: Rig) -> None:
         rig.grip_mode = "external"
     else:
         await rig.open()
+    if getattr(rig, "slowed", False):
+        await rig.set_arm_speed(False)
 
 
 async def release_here(rig: Rig, height: float, grip: float, observe: bool = False, retreat: bool = True) -> None:
