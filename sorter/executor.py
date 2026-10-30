@@ -714,6 +714,10 @@ def held_ring(rig, obj, frame_pose: dict):
 PAPER_BORDER_MM = 40.0  # a footprint may reach this far past the white interior onto the tape (ring ~55 mm wide)
 SPOT_GRID_MM = 5.0  # candidate release points over the interior
 OCC_MARGIN_MM = 8.0  # kept between the footprint / fingers and anything already standing there
+PILE_BLIND_MM = 70.0  # a blind patch on the interior (black tape, a clear bottle) may stand this high: the bottle's height
+PILE_INSET_MM = 15.0
+PILE_BLIND_MIN_PX = 500  # smaller holes are sensor noise (largest on an empty interior: see smoke_pile)
+PILE_GROW_PX, PILE_GROW_MM = 300, 8.0  # the interior gained this many raised pixels, or its top this much: something was put there
 
 
 def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None, ref_fn=None, used: dict = None):
@@ -745,6 +749,12 @@ def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None, ref_fn=No
         vs, us = np.nonzero(standing[::4, ::4])
         occ = np.array([perception.world_xy(pose, k, 4.0 * u, 4.0 * v, float(depth[4 * v, 4 * u]))
                         for u, v in zip(us, vs)]).reshape(-1, 2)
+        occ_h = h[4 * vs, 4 * us].astype(float)  # how high each occupied point stands
+        if ppa.pile_on():
+            if used is not None:
+                hole = square_mask(sq, pose, k, depth.shape, float(np.median(plane)))
+                used["before"] = raised_stats(depth, hole)
+            occ, occ_h = add_blind_patches(occ, occ_h, depth, plane, pose, k, sq)
         c = np.array(sq["xy"], float)
         t = math.radians(sq["yaw_deg"])
         ax, bx = np.array([math.cos(t), math.sin(t)]), np.array([-math.sin(t), math.cos(t)])
@@ -786,6 +796,8 @@ def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None, ref_fn=No
                         and ((np.abs(occ[:, 0] - J[0]) < strip[0]) & (np.abs(occ[:, 1] - J[1]) < strip[1])).any()):
                     continue
                 best = (d, J, C)
+        if best is None and ppa.pile_on():
+            return pile_spot(c, ax, bx, sa, sb, off, ring, box, strip, occ, occ_h, used)
         if best is None:
             what = f"ring {2 * ring['r_out']:.0f} mm" if ring else f"{size_mm[1]:.0f} x {size_mm[0]:.0f} mm object"
             return None, f"no room on the square for the {what} ({len(occ)} occupied points)"
@@ -793,6 +805,105 @@ def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None, ref_fn=No
         return (float(J[0]), float(J[1])), (f"object centre ({C[0]:.0f},{C[1]:.0f}) {d:.0f} mm from the interior "
                                             f"centre, jaws ({J[0]:.0f},{J[1]:.0f}), {len(occ)} occupied points")
     return choose
+
+
+def raised_stats(depth: np.ndarray, hole: np.ndarray) -> tuple:
+    """(raised pixels, height of the highest few percent in mm) on the interior: the before / after of a place."""
+    a, b, c = perception.fit_table(depth.astype(float))
+    H, W = depth.shape
+    h = a * np.arange(W)[None, :] + b * np.arange(H)[:, None] + c - depth
+    raised = hole & (depth > 0) & (h > perception.MIN_HEIGHT_MM) & (h < perception.MAX_OBJ_HEIGHT_MM)
+    return int(raised.sum()), float(np.percentile(h[raised], 98)) if raised.any() else 0.0
+
+
+def add_blind_patches(occ: np.ndarray, occ_h: np.ndarray, depth: np.ndarray, plane: np.ndarray, pose: dict, k: dict, sq: dict) -> tuple:
+    """
+    Occupied points plus the interior's large patches without depth, at PILE_BLIND_MM: a black roll or a clear bottle stands
+    there, seen by no depth pixel, and a release onto "nothing" would hit it. Patches reaching the image's bottom edge
+    are the fingers and what they hold.
+    """
+    hole = square_mask(sq, pose, k, depth.shape, float(np.median(plane)))
+    # Labelled over the whole frame: only there can a patch be seen to reach the bottom edge
+    blind, _ = ndimage.label(depth == 0)
+    held = np.isin(blind, np.unique(blind[-1][blind[-1] > 0]))
+    lab, n = ndimage.label(ndimage.binary_opening(hole & (depth == 0) & ~held, iterations=2))
+    if not n:
+        return occ, occ_h
+    sizes = np.bincount(lab.ravel())
+    keep = [i for i in range(1, n + 1) if sizes[i] >= PILE_BLIND_MIN_PX]
+    if not keep:
+        return occ, occ_h
+    vs, us = np.nonzero(np.isin(lab, keep)[::4, ::4])
+    pts = np.array([perception.world_xy(pose, k, 4.0 * u, 4.0 * v, float(plane[4 * v, 4 * u])) for u, v in zip(us, vs)]).reshape(-1, 2)
+    return np.vstack([occ, pts]), np.concatenate([occ_h, np.full(len(pts), PILE_BLIND_MM)])
+
+
+def top_of(heights: np.ndarray) -> float:
+    """The top of what stands somewhere, mm: past the last few sampled points, since one speck of depth noise is no object."""
+    return float(np.sort(heights)[-min(4, len(heights))]) if len(heights) else 0.0
+
+
+def pile_spot(c, ax, bx, sa: float, sb: float, off, ring: dict, box: tuple, strip: tuple, occ, occ_h, used: dict) -> tuple:
+    """
+    No free spot: the point of the white interior for the object's centre where its footprint is least occupied, then where
+    what stands there is lowest, then nearest the centre. (flange xy, why), or (None, why) if even that is too high.
+    {VIAM CENTERAL 2026-10-30 "选 FOOTPRINT 被占最少的位置（物体中心仍在白区内）放下去 ... 也选凸起最低的那块放"}
+    [CONFIDENCE: SINGLE-SRC 80% — rule from the coordinator; the 10-point rounding treats near-equal crowding as equal]
+    """
+    internal = bool(ring and ring.get("internal"))
+    best = None
+    # The centre well inside the white, not on its edge: the place check looks for it there
+    ia, ib = max(0.0, sa / 2 - PILE_INSET_MM), max(0.0, sb / 2 - PILE_INSET_MM)
+    for da in np.arange(-ia, ia + 0.1, SPOT_GRID_MM):
+        for db in np.arange(-ib, ib + 0.1, SPOT_GRID_MM):
+            C = c + da * ax + db * bx
+            if ring:
+                under = np.hypot(*(occ - C).T) < ring["r_out"] + OCC_MARGIN_MM
+            else:
+                under = (np.abs(occ[:, 0] - C[0]) < box[0]) & (np.abs(occ[:, 1] - C[1]) < box[1])
+            J = C - off
+            fingers = (np.abs(occ[:, 0] - J[0]) < strip[0]) & (np.abs(occ[:, 1] - J[1]) < strip[1])
+            foot = top_of(occ_h[under])
+            at_fingers = top_of(occ_h[fingers]) if not internal else 0.0
+            key = (int(under.sum()) // 10, max(foot, at_fingers), math.hypot(da, db))
+            if best is None or key < best[0]:
+                best = (key, J, C, foot, at_fingers, int(under.sum()))
+    key, J, C, foot, at_fingers, points = best
+    if max(foot, at_fingers) > ppa.PILE_MAX_MM:
+        return None, f"pile too high: lowest place stands {max(foot, at_fingers):.0f} mm (limit {ppa.PILE_MAX_MM:.0f})"
+    if used is not None:
+        used["pile"] = (foot, at_fingers)
+    return (float(J[0]), float(J[1])), (f"no free spot: on the pile, object centre ({C[0]:.0f},{C[1]:.0f}), "
+                                        f"{points} points under it, top {foot:.0f} mm, at the fingers {at_fingers:.0f} mm")
+
+
+def pile_grew(depth: np.ndarray, pose: dict, k: dict, used: dict) -> tuple:
+    """(did the interior gain something since the release was planned?, why): a stacked object can be seen by nothing else."""
+    sq, before = used.get("sq"), used.get("before")
+    if sq is None or before is None or depth is None or not sq.get("corners"):
+        return False, "no before picture"
+    after = raised_stats(depth, square_mask(sq, pose, k, depth.shape, float(np.median(table_plane(depth)))))
+    if after[0] >= before[0] + PILE_GROW_PX or after[1] >= before[1] + PILE_GROW_MM:
+        return True, f"the square's interior grew: {before[0]} -> {after[0]} raised px, top {before[1]:.0f} -> {after[1]:.0f} mm"
+    return False, f"the square's interior did not grow: {before[0]} -> {after[0]} raised px, top {before[1]:.0f} -> {after[1]:.0f} mm"
+
+
+def held_centre(rig, obj, frame_pose: dict, tracker) -> dict:
+    """
+    Where a held object's centre sits from the jaws, as held_ring(): {"offset", "theta"}, from the found frame; None if not held.
+
+    WHY: the jaws need not grip the middle of a long object. The KIND bar (165 mm) lay with its centre on the white interior
+    and one end on the tape, and the check said "nothing at the release point": its fresh grasp point was over
+    RELEASE_MATCH_MM from the jaws' release point. {VIAM CENTERAL 2026-10-30 "请像 RING 那样用 TRACKER 记下的偏移算期望位置"}
+    [CONFIDENCE: SINGLE-SRC 80% — the offset is from the found frame; the jaws closing moves the object across, not along]
+    """
+    if rig.picked_at is None:
+        return None
+    k = intr(rig)
+    u, v, _ = grasp.target_px(getattr(tracker, "primitive", None), obj, frame_pose, k)
+    g = perception.world_xy(frame_pose, k, u, v, obj.top_depth_mm)
+    c = perception.world_xy(frame_pose, k, *obj.centroid_px, obj.top_depth_mm)
+    return {"offset": (c[0] - g[0], c[1] - g[1]), "theta": float(rig.picked_at[2])}
 
 
 def ring_offset_at(ring: dict, theta: float) -> tuple:
@@ -851,7 +962,14 @@ def placed_ok(rig, rgb: np.ndarray, depth: np.ndarray, text: str, store, expect:
             u, v, _ = grasp_px(o, pose, k)
             ref = perception.world_xy(pose, k, u, v, o.top_depth_mm)
         d = math.hypot(ref[0] - expect["xy"][0], ref[1] - expect["xy"][1])
-        if d < best_d and in_square(ref, u, v):
+        inside = in_square(ref, u, v)
+        if rw is None and expect.get("centre") is not None:
+            # A long object: its centre against where it should be, from the offset it was held at (held_centre)
+            cen = perception.world_xy(pose, k, *o.centroid_px, o.top_depth_mm)
+            dc = math.hypot(cen[0] - expect["centre"][0], cen[1] - expect["centre"][1])
+            if dc < tol and (dc < d or not inside) and in_square(cen, *o.centroid_px):
+                d, inside = dc, True
+        if d < best_d and inside:
             best_o, best_d = o, d
     if best_o is None:
         return True, False, "nothing at the release point in the square", seg
@@ -860,6 +978,10 @@ def placed_ok(rig, rgb: np.ndarray, depth: np.ndarray, text: str, store, expect:
         return True, True, f"target in the square ({best_d:.0f} mm from where it was put)", seg
     if found.get("recognised") is None:
         return True, True, f"placed in the square, not re-recognised ({best_d:.0f} mm from where it was put)", seg
+    if ppa.pile_on():
+        # On a pile the masks join and recognition sees what lay there before: where it stands is what counts
+        # {VIAM CENTERAL 2026-10-30 "叠放时只要新物体的中心落在白区范围内就算成功"}
+        return True, True, f"in the square on the pile ({best_d:.0f} mm from where it was put), seen as {found['recognised']!r}", seg
     return True, False, f"the object in the square is recognised as {found['recognised']!r}", seg
 
 
@@ -1330,6 +1452,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         doc["grip"] = grip_record(rig, tracker.primitive, height, grip)
         size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
         ring = held_ring(rig, obj, found["pose"])
+        centre_off = None if ring else held_centre(rig, obj, found["pose"], tracker)
         # Look first where the found frame saw part of the paper, then the recent sightings; search the observe
         # pose before any z 580 pose (most squares are in that view)
         partial = partial_square_xy(found, rig)
@@ -1348,7 +1471,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
                                            confirm=square_confirm(rig, ref_fn),
                                            more_guesses=([partial] if partial else []) + [xy for xy, _ in sightings],
                                            search_poses=[(*ppa.HOME_XY, ppa.ALIGN_Z)]
-                                           + [(x, y, SWEEP_Z) for x, y in SWEEP_XY], **route)
+                                           + [(x, y, SWEEP_Z) for x, y in SWEEP_XY],
+                                           clearance=lambda: used.get("pile"), **route)
         LAST_SQUARE.update(xy=tuple(centre), ts=time.time())
         q = await rig.pose()
         # Left low: on to the observe pose in one move, and the check uses that frame (no stop above the release)
@@ -1370,11 +1494,17 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if ring:
             ox, oy = ring_offset_at(ring, q.theta)
             expect = {"xy": (rx + ox, ry + oy), "r": ring["r_out"]}
-        elif low:
+        else:
             au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, ppa.TABLE_DEPTH_MM)
             expect = {"xy": perception.world_xy({"x": rx, "y": ry, "z": ppa.ALIGN_Z, "theta": q.theta}, intr(rig), au, av,
                                                 ppa.TABLE_DEPTH_MM)}
+            if centre_off:
+                ox, oy = ring_offset_at(centre_off, q.theta)
+                expect["centre"] = (rx + ox, ry + oy)
         seen, right, why, seg = placed_ok(rig, rgb, depth, text, store, expect, ref_fn, used.get("sq"))
+        if not right and ppa.pile_on():
+            grew, why_grew = pile_grew(depth, pose_dict(q), intr(rig), used)
+            right, why = grew or right, why_grew if grew else f"{why}; {why_grew}"
         if seg is not None:
             publish_frame(store, rgb, seg, "place")
         doc["img_after"] = jpeg(rgb)

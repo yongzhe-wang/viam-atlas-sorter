@@ -434,6 +434,15 @@ def bbox_near(bbox, uv, radius: float) -> bool:
 STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "arm_state.json"
 
 
+def pile_on() -> bool:
+    """
+    SORTER_PILE (default on): the square is never "full": objects go on top of each other, and nothing is cleared between.
+    {USER 2026-10-30 "I WANT MULTIPLE OBJECTS AS YOU DONT NEED TO REMOVE IT AND JUST PUT EVERYTHING IN"}
+    [CONFIDENCE: UNVERIFIED 60% — offline on real frames with synthetic piles; not run on the arm]
+    """
+    return os.environ.get("SORTER_PILE", "1") == "1"
+
+
 def fast(name: str) -> bool:
     """
     Is this route shortcut on? FAST_ROUTE=1 turns on all, or a comma list picks: skip_confirm, one_move, direct_return,
@@ -1293,6 +1302,40 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     return height, grip
 
 
+# Above this the depth map at ALIGN_Z is blind (table ~378 mm, sensor minimum ~280 mm): a pile cannot be seen any more
+PILE_MAX_MM = 90.0
+PILE_FINGER_CLEAR_MM = 5.0  # fingertips stay this far above what stands beside the release at the fingers
+
+
+def above_for(foot_top: float, strip_top: float, height: float, grip: float) -> float:
+    """How far above its normal release height (PLACE_GAP over the table) to let go, over a pile: mm, 0 on a clear spot."""
+    return max(0.0, foot_top, strip_top + PILE_FINGER_CLEAR_MM - (height - grip) - PLACE_GAP)
+
+
+def finger_strip_top(depth: np.ndarray, fx: float, fy: float, cx: float, cy: float, table: float) -> float:
+    """
+    Height above the table of what stands in the fingers' open position in this frame: mm, 0 if nothing; each point at its
+    own depth, as finger_obstacle(). No blind patches here: with something held the view below the jaws always has them.
+    """
+    if depth is None:
+        return 0.0
+    h, w = depth.shape
+    vv, uu = np.mgrid[:h, :w]
+    d = np.where(depth > 0, depth, table).astype(float)
+    aud, avd = axis_pixel(fx, fy, cx, cy, d)
+    xd, yd = (uu - aud) * d / fx, (vv - avd) * d / fy
+    area = (FINGER_ACROSS_MM[1] - FINGER_ACROSS_MM[0]) * 2.0 * FINGER_ALONG_MM * (fx / table) * (fy / table)
+    high = (depth > 0) & (depth < table - 8.0)
+    top = 0.0
+    for side in (-1.0, 1.0):
+        lab, n = ndimage.label(high & (side * xd >= FINGER_ACROSS_MM[0]) & (side * xd <= FINGER_ACROSS_MM[1])
+                               & (np.abs(yd) <= FINGER_ALONG_MM))
+        sizes = np.bincount(lab.ravel())[1:] if n else np.zeros(0)
+        if sizes.size and sizes.max() >= FINGER_HIGH_FRAC * area:
+            top = max(top, table - float(np.percentile(depth[lab == 1 + int(np.argmax(sizes))], 5)))
+    return top
+
+
 async def release_jaws(rig: Rig) -> None:
     """Let go of what is held: every release goes through this, since an internal grip lets go by closing, not opening."""
     if getattr(rig, "grip_mode", "external") == "internal":
@@ -1304,18 +1347,27 @@ async def release_jaws(rig: Rig) -> None:
         await rig.set_arm_speed(False)
 
 
-async def release_here(rig: Rig, height: float, grip: float, observe: bool = False, retreat: bool = True) -> None:
+async def release_here(rig: Rig, height: float, grip: float, observe: bool = False, retreat: bool = True,
+                       above_mm: float = 0.0) -> None:
     """
     Lower the held block straight down until its bottom is PLACE_GAP above the table, open, lift to ALIGN_Z.
 
     `observe` records jaw-calibration samples from the released block before lifting away.
     retreat=False: lift only until the fingertips clear what stands on the table (RETREAT_CLEAR_MM, no frame needs this
     height); the caller goes on from there with leave_low(). {VIAM CENTERAL 2026-10-30 "从放置点抬到净空高度后直接回 OBSERVE"}
+    above_mm: let go this much higher: the top of a pile under the object (above_for). From this frame too (pile_on): the
+    fingers must come down no lower than what stands where they are, so the release rises rather than hits it.
+    {VIAM CENTERAL 2026-10-30 "物体底部离最高点 PLACE_GAP 以上再松手，指尖不能碰堆"}
     """
     z1, table, _ = await rig.measure()
     await rig.wait_clear(axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table))
     # Block bottom hangs (height - grip) below the fingertips; release it PLACE_GAP above the table
-    z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z, MIN_GRASP_Z)
+    if pile_on():
+        strip = finger_strip_top(getattr(rig, "last_depth", None), rig.fx, rig.fy, rig.cx, rig.cy, table)
+        above_mm = max(above_mm, above_for(0.0, strip, height, grip))
+    if above_mm > PILE_MAX_MM:
+        raise SquareFull(f"pile too high: {above_mm:.0f} mm at the release (limit {PILE_MAX_MM:.0f}), still holding")
+    z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP) + above_mm, rig.floor_z, MIN_GRASP_Z)
     print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
     await rig.descend(z_place, settle=False)  # the release follows, no frame
     await release_jaws(rig)
@@ -1323,7 +1375,8 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
     q = await rig.pose()
     rig.released_at = (q.x, q.y)
     if not retreat:
-        await rig.rise(min(ALIGN_Z, max(rig.floor_z, MIN_GRASP_Z) + RETREAT_CLEAR_MM), settle=False)
+        # Above what stands around, and above the object just let go: the fingertips are `grip` below its top
+        await rig.rise(min(ALIGN_Z, max(max(rig.floor_z, MIN_GRASP_Z) + RETREAT_CLEAR_MM, q.z + grip + 20.0)), settle=False)
         return
     if observe:
         # Free calibration data: the released block marks where the jaw axis really is
@@ -1470,7 +1523,7 @@ async def locate_by_estimate(rig: Rig, guesses: list, search_poses: list, confir
 
 async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None,
                           choose_spot=None, more_guesses: list = (), search_poses: list = None,
-                          confirm=None, direct: dict = None, low_retreat=None) -> tuple:
+                          confirm=None, direct: dict = None, low_retreat=None, clearance=None) -> tuple:
     """
     Steps 3-4: carry to the square, release in its hole; returns the flange xy over the hole's centre.
 
@@ -1486,6 +1539,7 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     direct_square): the spot is chosen from it and there is no look pose, unless it is past "until" or shows no room.
     {VIAM CENTERAL 2026-10-30 "跳过确认视角 ... 只有 PARTIAL 或过期才去确认。放置安全靠放完后的 CHECK"}
     low_retreat() -> True: leave the release low (release_here retreat=False); the caller moves on with leave_low().
+    clearance() -> (top under the object, top under the fingers) mm at the chosen spot, or None on a clear one (a pile).
     """
     times = {} if times is None else times
     t = time.monotonic()
@@ -1517,7 +1571,11 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
         raise ObjectLost("object no longer in the gripper during the carry")
     print("4/5 lower + release")
     times["at"] = "place"
-    if low_retreat is not None and low_retreat():
+    pile = clearance() if clearance is not None else None
+    above = above_for(*pile, height, grip) if pile else 0.0
+    if above > 0.0:
+        await release_here(rig, height, grip, above_mm=above)
+    elif low_retreat is not None and low_retreat():
         await release_here(rig, height, grip, retreat=False)
     else:
         await release_here(rig, height, grip)
