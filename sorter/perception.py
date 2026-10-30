@@ -126,6 +126,7 @@ class Segmentation:
     intruders: list  # [{"bbox", "area", "reason"}]: pause the arm while non-empty
     align: tuple  # depth -> colour model that was used (IDENTITY or UNALIGNED)
     plane: tuple  # (a, b, c): table depth = a*u + b*v + c on the depth grid
+    cables: list = field(default_factory=list)  # SPLIT_BLOBS: [{"bbox", "length_mm", "width_mm"}] depth grid, never targets
 
 
 def fit_table(depth: np.ndarray) -> tuple:
@@ -333,11 +334,14 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
     seeded[np.unique(grp[above])] = True
     seeded[0] = False
     lab_d = np.where(seeded[grp] & low, grp, 0)
+    H, W = d.shape
+    table_depth = float(a * W / 2 + b * H / 2 + c)
+    cables = []
+    if SPLIT_BLOBS:
+        lab_d, n, cables = _split_cables(lab_d, n, INTRINSICS["fx"] / table_depth)
     # No fingertip mask for objects: the fingers are ~140 mm from the camera, inside the depth blind range, so they
     # never become objects; masking them erased a real 30 mm cube that a z=500 sweep saw in that corner
     lab_c = to_colour(lab_d, model)
-    H, W = d.shape
-    table_depth = float(a * W / 2 + b * H / 2 + c)
     ascale = area_scale(table_depth)
     min_area = MIN_AREA_PX * ascale
     poly = load_workspace()
@@ -406,7 +410,94 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         o.id = -1 - k  # negative ids never collide with targets
     intruders += find_intruders(rgb, valid, model, ascale)
     return Segmentation(table_depth_mm=table_depth, objects=objs, excluded=excluded,
-                        intruders=intruders, align=model, plane=(a, b, c))
+                        intruders=intruders, align=model, plane=(a, b, c), cables=cables)
+
+
+# ---- cables: a thin strip that joins a blob to the frame is not part of the object -------------------------
+# The robot's cable lying against a screwdriver handle made one blob 97 mm wide: refused as too wide. Bodies are what
+# survives removing everything narrower than SPLIT_BRIDGE_MM; a thin strip left over is a cable only if it runs to the
+# image border or is longer than any part of an object. A screwdriver's shaft (thin, ends in the open) stays.
+# {VIAM CENTERAL 2026-10-30 "TOO_WIDE 97 MM, MASK 把把手和相邻的线缆连成一块"} {SCAN 071 "BLACK 167X51 E" -> "97X53" (MOUSE + ITS
+# WIRE), 009 "BLUE 91X67 E" -> "59X35" (BLOCK + SHAFT)} [CONFIDENCE: CONFIRMED 75% — real blobs by eye; not yet that screwdriver frame]
+SPLIT_BLOBS = os.environ.get("SORTER_SPLIT_BLOBS") == "1"  # off by default (VIAM CENTERAL: behind a flag)
+SPLIT_BRIDGE_MM = 14.0  # cable ~10 mm, nearer the camera when lifted; the thinnest graspable bodies are ~25 mm
+SPLIT_EDGE_MIN_MM = 30.0  # a strip this long reaching the image border is a cable
+SPLIT_LONG_MM = 160.0  # a strip this long is a cable wherever it ends (the longest shaft here is ~130 mm)
+SPLIT_CONTACT_MAX = 0.5  # shared edge with the body / strip length: a wedge shaved off a cut object lies along it
+SPLIT_WIDE_MM = 60.0  # a blob this wide cannot be gripped as it is, so it is split even if still cut by the frame
+
+
+def _split_cables(lab: np.ndarray, n: int, px_mm: float) -> tuple:
+    """
+    (labels, n, cables): cable strips removed from a blob, one label per connected part of what remains.
+
+    A blob changes only if it gains from it: its main part stops touching the frame (it becomes a whole target) or
+    it was too wide to grasp. The opening also shaves wedges off objects cut by the frame; those lie along the body
+    (contact as long as the strip), a cable leaves it end-on, so contact / length must be small.
+    """
+    H, W = lab.shape
+    r = SPLIT_BRIDGE_MM / 2 * px_mm
+    cables = []
+    lab = lab.copy()
+    e = EDGE_MARGIN_PX
+
+    def at_edge(v0, u0, v1, u1):
+        return v0 <= e or u0 <= e or v1 >= H - 1 - e or u1 >= W - 1 - e
+
+    def width_mm(mask):
+        vs, us = np.nonzero(mask)
+        pts = np.column_stack([us, vs]).astype(float)
+        minor = np.linalg.eigh(np.cov(pts.T))[1][:, 0]
+        return float(np.ptp(pts @ minor)) / px_mm
+
+    for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+        if sl is None or max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start) < SPLIT_EDGE_MIN_MM * px_mm:
+            continue
+        # One empty pixel all round, so a mask on the image border still erodes from that side
+        m = np.pad(lab[sl] == i, 1)
+        if m.sum() < 4:
+            continue
+        dt = ndimage.distance_transform_edt(m)
+        body = (ndimage.distance_transform_edt(dt <= r) <= r) & m  # opening: grow the core back inside the mask
+        strips, k = ndimage.label(m & ~body, structure=np.ones((3, 3), bool))
+        cut, found = np.zeros_like(m), []
+        for j, ss in enumerate(ndimage.find_objects(strips), start=1):
+            one = strips == j
+            vs, us = np.nonzero(one[ss])
+            if len(vs) < 3:
+                continue
+            pts = np.column_stack([us, vs]).astype(float)
+            length = float(np.ptp(pts @ np.linalg.eigh(np.cov(pts.T))[1][:, -1])) / px_mm
+            # Back to image coordinates (the pad added 1) to see whether it reaches the frame
+            v0, v1 = sl[0].start + ss[0].start - 1, sl[0].start + ss[0].stop - 2
+            u0, u1 = sl[1].start + ss[1].start - 1, sl[1].start + ss[1].stop - 2
+            if not ((at_edge(v0, u0, v1, u1) and length >= SPLIT_EDGE_MIN_MM) or length >= SPLIT_LONG_MM):
+                continue
+            contact = float((ndimage.binary_dilation(one, iterations=2) & body).sum()) / 2.0 / px_mm  # mm of shared edge
+            if contact / max(length, 1.0) > SPLIT_CONTACT_MAX:
+                continue
+            cut |= one
+            found.append({"bbox": (u0, v0, u1, v1), "length_mm": round(length, 1), "width_mm": round(len(vs) / px_mm ** 2 / max(length, 1.0), 1)})
+        if not found or not body.any():
+            continue  # (a blob with no body at all may be a thin real object: only the frame cuts it, it stays excluded)
+        rest, parts = ndimage.label(m & ~cut)
+        sizes = ndimage.sum(m, rest, range(1, parts + 1))
+        main = rest == 1 + int(np.argmax(sizes))
+        vs, us = np.nonzero(main)
+        if 2 * ndimage.distance_transform_edt(main).max() / px_mm < SPLIT_BRIDGE_MM:
+            continue  # nothing thick is left: a thin sliver of something the frame cuts, still useful as a partial sighting
+        whole = not at_edge(sl[0].start + vs.min() - 1, sl[1].start + us.min() - 1, sl[0].start + vs.max() - 1, sl[1].start + us.max() - 1)
+        if not whole and width_mm(m) <= SPLIT_WIDE_MM:
+            continue  # still cut by the frame and not too wide: nothing gained
+        cables += found
+        lab[sl] = np.where(lab[sl] == i, 0, lab[sl])
+        for p in range(1, parts + 1):
+            piece = rest == p
+            if 2 * ndimage.distance_transform_edt(piece).max() / px_mm < SPLIT_BRIDGE_MM:
+                continue  # a thin leftover between strips: more cable, not a new target
+            n += 1
+            lab[sl] = np.where(piece[1:-1, 1:-1], n, lab[sl])
+    return lab, n, cables
 
 
 # ---- see-through objects: fragments of one object joined by its depth-less body ---------------------------
