@@ -21,6 +21,8 @@ import numpy as np
 
 from sorter import perception
 
+TABLE_BAND_MM = 15.0  # a ray ending this far below the table plane still saw the table (depth noise at a grazing angle)
+MAX_TOP_MM = 300.0  # anything higher is the arm, a person or the bucket's handle, not an object top on the table
 CAM_BELOW_POSE_MM = 24.0  # {OBSERVE Z 400 "TABLE 376" / HIGH Z 580 "TABLE 557": THE TABLE TOP IS AT WORLD Z ~0}
 # Camera axes in the tool frame (columns: image +u, image +v, viewing direction): straight down at theta 0, image +u is world
 # -y and +v is world -x (perception), and Viam's straight-down tool frame is Ry(180): x and z flipped
@@ -93,9 +95,13 @@ def visible_cells(depth: np.ndarray, pose_full, intr: dict, table_plane=None, ce
     pts = camera_to_world(pose_full, intr, uu[ok], vv[ok], d[ok])
     ix = np.floor(pts[:, 0] / cell_mm).astype(int)
     iy = np.floor(pts[:, 1] / cell_mm).astype(int)
-    top = pts[:, 2] > perception.MIN_HEIGHT_MM
+    z = pts[:, 2]
+    # Only the table's own level and object tops count: the floor beyond the table's edge (y- view: 1473 mm away) and flying
+    # pixels at depth edges land far below it, and marked whole regions off the table as seen
+    table = (z >= -TABLE_BAND_MM) & (z <= perception.MIN_HEIGHT_MM)
+    top = (z > perception.MIN_HEIGHT_MM) & (z <= MAX_TOP_MM)
     out = {"cell_mm": cell_mm}
-    for name, sel in (("table", ~top), ("object", top)):
+    for name, sel in (("table", table), ("object", top)):
         cells, counts = np.unique(np.stack([ix[sel], iy[sel]], axis=1), axis=0, return_counts=True) if sel.any() else (np.zeros((0, 2), int), np.zeros(0))
         out[name] = [[int(a), int(b)] for (a, b), n in zip(cells, counts) if n >= min_hits]
     return out
