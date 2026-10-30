@@ -178,6 +178,14 @@ def _no_none(x):
     return x
 
 
+async def _back_to_observe(rig) -> None:
+    """executor.back_to_observe for a job whose last try stayed where it failed; never raises."""
+    try:
+        await _runtime().executor.back_to_observe(rig)
+    except Exception as e:
+        LOGGER.warning(f"back to the observe pose failed: {type(e).__name__}: {e}")
+
+
 def _runtime():
     """
     The arm/perception stack, imported on first use so viam-server can start the module and validate config
@@ -1009,10 +1017,15 @@ class GraspByDescription(Generic, EasyResource):
         excluded: list = []
         failure, again, listed = None, False, False  # the last failed pick; one more try used; the summary is in attempts
         keys = ("status", "fail_phase", "fail_reason", "duration_s", "target_xy", "primitive")
+        stayed = False  # the last try ended where it failed (a retry was to follow), not at the observe pose
         for n in range(1, tries + 1):
             self.job_info.update(attempt=n, attempts_max=tries)
             # skip_current only for the first try: a failed try moved the arm, so a retry looks from where it is
-            summary, run_via = await self._once(kind, text, target, target_xy, skip_current and n == 1, any_match, list(excluded))
+            # A try that is not the last stays where it fails: the retry starts there, not from the observe pose
+            # {USER 2026-10-30 "WHEN YOU RETRY IT SHOULD JUST RETRY AT THAT LOCATION SO IT DOESNT NEED TO GO BACK TO ORIGNAL"}
+            stayed = kind == "grasp" and n < tries
+            summary, run_via = await self._once(kind, text, target, target_xy, skip_current and n == 1, any_match,
+                                                list(excluded), stay=stayed)
             # The first attempt's path names the job (frame / map / search); retries always search
             via = run_via if n == 1 else via
             if v2 and summary.get("status") == "not_found" and failure is not None:
@@ -1042,6 +1055,8 @@ class GraspByDescription(Generic, EasyResource):
                     excluded.append(summary["target_xy"])
             else:
                 target_xy = summary.get("target_xy")
+        if stayed and summary.get("status") != "done" and getattr(self, "rig", None) is not None:
+            await _back_to_observe(self.rig)  # no retry after all: end at the observe pose like every task
         if attempts:
             summary["attempts"] = attempts + ([] if listed else [{k: summary.get(k) for k in keys}])
         if kind == "grasp":
@@ -1109,7 +1124,7 @@ class GraspByDescription(Generic, EasyResource):
 
     async def _once(self, kind: str, text: Optional[str], target: Optional[dict],
                     target_xy: Optional[list], skip_current: bool = False, any_match: bool = False,
-                    excluded: Optional[list] = None) -> tuple:
+                    excluded: Optional[list] = None, stay: bool = False) -> tuple:
         """One grasp attempt, reset or table scan -> (summary, via); never raises (an exception becomes "error")."""
         via = "scan" if kind == "scan" else "search"
         try:
@@ -1135,6 +1150,8 @@ class GraspByDescription(Generic, EasyResource):
                     kwargs["accept_ambiguous"] = True
                 if excluded and "excluded" in params:
                     kwargs["excluded"] = excluded
+                if stay and "stay_on_fail" in params:
+                    kwargs["stay_on_fail"] = True  # a retry follows: no trip back to the observe pose in between
                 rig.picked_obj = None
                 waits = dict(smooth.STATS)
                 doc = await rt.executor.execute(rig, text, self.store, mode="demo", **kwargs)

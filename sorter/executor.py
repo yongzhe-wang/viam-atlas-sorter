@@ -1689,9 +1689,12 @@ async def sweep_table(rig, progress=None) -> list:
 
 
 async def execute(rig, text: str, store, mode: str = "demo", target=None, target_xy=None, progress=None,
-                  skip_current: bool = False, accept_ambiguous: bool = False, excluded: list = ()) -> dict:
+                  skip_current: bool = False, accept_ambiguous: bool = False, excluded: list = (),
+                  stay_on_fail: bool = False) -> dict:
     """
     One command: put the object described by `text` into the blue square. Returns the logged attempt doc.
+    stay_on_fail: a failure ends where the arm is (lifted by recover), not at the observe pose: the module's retry
+      starts from there {USER 2026-10-30 "WHEN YOU RETRY IT SHOULD JUST RETRY AT THAT LOCATION SO IT DOESNT NEED TO GO BACK"}
 
     target: clip_embed.best() dict + "rgb", "depth", "pose", "ts" from a frame the caller already took at the
       observe pose (theta within +-1 deg): no observe move, pick at once. Ignored if its theta is off.
@@ -1892,7 +1895,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         doc["phase_times"], doc["duration_s"] = times, round(time.monotonic() - t0, 1)
         finish(rig, store, doc)
         STATE.update(times=None, error=doc["fail_reason"] if doc["status"] in ("failed", "estop") else None)
-        await back_to_observe(rig)
+        if not (stay_on_fail and doc["status"] != "done"):
+            await back_to_observe(rig)
     return doc
 
 

@@ -32,7 +32,7 @@ def service(outcomes: list) -> tuple:
     s.store = SimpleNamespace(list_labels=lambda: [])
     s._search_v2 = lambda: True
 
-    async def once(kind, text, target, target_xy, skip, any_match, excluded):
+    async def once(kind, text, target, target_xy, skip, any_match, excluded, stay=False):
         calls.append({"target_xy": target_xy, "excluded": list(excluded)})
         return dict(outcomes.pop(0)), "search"
     s._once = once
