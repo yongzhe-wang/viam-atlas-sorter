@@ -38,6 +38,11 @@ ROUND_RECT_FILL = 0.9  # perception.Obj.rect_fill below this is round (disc ~0.8
 # must reach the wall. The tape roll's core measures 73 mm (ring frames: inner radius 36.7 mm).
 INSIDE_MIN_ID_MM, INSIDE_MAX_ID_MM = 45.0, 80.0
 EXPAND_MARGIN_MM = 4.0  # the jaws are told to open this far past the wall, so they press on it
+JAW_OPEN_MM = 84.0
+REFINE_MARGIN_MM = 5.0  # servo_tolerance: kept between a finger and the object at the far end of the error
+# Also the most a finger may push the object on closing: the formula alone gives 23 mm for a 27 mm block, and that
+# push turns a long handle or knocks a tall block; the 7 mm of the coordinator's case passes
+REFINE_MAX_MM = 8.0
 FAILS_TO_ESCALATE = 2
 ESCALATION_TTL_S = 180.0
 
@@ -208,6 +213,22 @@ def target_px(primitive, o, pose: dict, k: dict, wall_mm: float = None) -> tuple
     if primitive == "centroid" and pose is not None and k is not None:
         return along_axis(o, pose, k, *o.centroid_px)
     return grasp_px(o, pose, k, wall_mm)
+
+
+def servo_tolerance(primitive, o, fx: float):
+    """
+    (across, along the jaws) mm a first-frame error may be and the refine still makes no move; None = always refine.
+
+    Across: the margin between the open jaws and the object. Along: the fingers must stay on it. Thin objects and rings
+    always refine (the jaws must hit a narrow target), and so does a tall one held at half height: a push would tip it.
+    {VIAM CENTERAL 2026-10-30 "薄物体和 RING 不跳"}
+    """
+    if primitive not in ("top", "handle") or o.height_mm < ppa.THIN_MM or ring_geometry(o) is not None:
+        return None
+    mm = o.top_depth_mm / fx
+    across = min(REFINE_MAX_MM, (JAW_OPEN_MM - o.width_px * mm) / 2.0 - REFINE_MARGIN_MM)
+    along = min(REFINE_MAX_MM, o.length_px * mm / 2.0 - REFINE_MARGIN_MM)
+    return (across, along) if across > 0.0 and along > 0.0 else None
 
 
 def keeps_wrist_at_zero(primitive, o) -> bool:

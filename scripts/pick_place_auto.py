@@ -66,6 +66,9 @@ ALIGN_Z = 400.0  # observation height; sees the whole table scene
 SANITY_MIN_Z = 120.0  # absolute flange floor; Viam's own collision check refuses below ~132
 HOME_XY = (250.0, 0.0)
 MAX_STEP_MM = 250.0
+MAX_TRAVEL_MM = 1000.0  # goto(long_ok=True) only: travel() checked the line first, the guard still stops a wild target
+TRAVEL_MIN_R_MM = 150.0  # a one-move travel's straight line stays this far from the base (the looks' own limit)
+RETREAT_CLEAR_MM = 110.0  # fingertips 10 + this above the table (z ~284) before leaving a release: over the 112 mm cups
 TOL_PX = 7.0
 # While carrying, align the square here relative to the axis pixel: up-left, away from the held object that
 # hangs into the bottom-right (it hid the hole twice on 2026-10-29); then one J^-1 step to the real target
@@ -427,6 +430,17 @@ def bbox_near(bbox, uv, radius: float) -> bool:
 STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "arm_state.json"
 
 
+def fast(name: str) -> bool:
+    """
+    Is this route shortcut on? FAST_ROUTE=1 turns on all, or a comma list picks: skip_confirm, one_move, direct_return,
+    refine_skip. Default off: each shortens a path that ran on the arm, and each is checked there one by one.
+    {VIAM CENTERAL 2026-10-30 "剩下的时间主要在路线和固定等待上"}
+    [CONFIDENCE: UNVERIFIED 60% — offline only; the time saved is estimated from the coordinator's timeline]
+    """
+    value = os.environ.get("FAST_ROUTE", "0")
+    return value == "1" or name in value.split(",")
+
+
 def save_state(holding: bool, height: float = None, grip: float = None, mode: str = "external") -> None:
     """
     Remember what the gripper holds, so a restarted process can finish the job.
@@ -553,6 +567,7 @@ class Rig:
         self.tables = []  # table depths measured at ALIGN_Z, newest last (measure keeps 5)
         # "internal": the jaws hold the object by pressing outward from inside it, so closing them is what lets go
         self.grip_mode = "external"
+        self.released_at = None  # flange (x, y) of the last release: the place check's reference from another pose
         self.expand_stop_mm = None  # where the last expand() stopped: logged with the grasp, for tuning on the arm
 
     async def connect(self) -> None:
@@ -711,7 +726,8 @@ class Rig:
             print(f"  expand: position not read ({e})")
             return None
 
-    async def goto(self, x: float, y: float, z: float, theta: float = None, settle: bool = True) -> None:
+    async def goto(self, x: float, y: float, z: float, theta: float = None, settle: bool = True,
+                   long_ok: bool = False) -> None:
         """
         Move the flange to (x, y, z) with the tool pointing straight down.
 
@@ -719,13 +735,15 @@ class Rig:
         or a jump larger than MAX_STEP_MM, so a bad calculation raises instead of hitting the table.
         settle=False skips the SETTLE_S wait: only for moves that no frame follows (descend to grab, lift,
         intermediate travel legs); the wait exists for the camera's stale frame, not for the motion.
+        long_ok: a travel across the table whose line travel() already checked (line_clear); MAX_STEP_MM stays for every
+        move computed from a frame, which is what it guards.
         """
         if z < max(self.floor_z, SANITY_MIN_Z):
             raise RuntimeError(f"refusing z={z:.0f} below floor {max(self.floor_z, SANITY_MIN_Z):.0f}")
         if math.hypot(x, y) > 650 or math.hypot(x, y) < 120:
             raise RuntimeError(f"refusing xy=({x:.0f},{y:.0f}) outside safe reach")
         p = await self.pose()
-        if math.dist((p.x, p.y, p.z), (x, y, z)) > MAX_STEP_MM:
+        if math.dist((p.x, p.y, p.z), (x, y, z)) > (MAX_TRAVEL_MM if long_ok else MAX_STEP_MM):
             raise RuntimeError(f"refusing step larger than MAX_STEP_MM: ({p.x:.0f},{p.y:.0f},{p.z:.0f}) -> "
                                f"({x:.0f},{y:.0f},{z:.0f})")
         if theta is not None:
@@ -843,7 +861,7 @@ class Rig:
             await self.goto(p.x, p.y, cur, settle=settle and cur >= z - 0.5)
 
     async def servo(self, finder, use_top: bool, label: str, plane_at=None, offset=(0.0, 0.0),
-                    blind_step: bool = True) -> None:
+                    blind_step: bool = True, tol_mm: tuple = None) -> None:
         """
         Bring the target found by `finder` onto the gripper axis, closed loop.
 
@@ -855,6 +873,9 @@ class Rig:
         J^-1 (-offset) with the last measured Jacobian. Used while carrying: the held object covers the
         bottom-right of the image, where the axis pixel is, so the square is aligned somewhere visible.
         blind_step=False stops at the offset alignment (the caller picks the final spot from that view).
+        tol_mm (across the jaws, along them): close enough, by the object's own margin in the fingers: no more moves.
+        The blue block's refine moved for 19 px, ~7 mm, with ~23 mm to spare on each side, and that cost ~1 s.
+        {VIAM CENTERAL 2026-10-30 "小于 (JAW 张开 − 物体宽度)/2 − 5 MM 就不再迭代"}
         """
         J, probing, prev = None, not SERVO_MODEL_J, None  # prev: error before an uncapped model step
         t_end = time.monotonic() + SERVO_MAX_S
@@ -880,6 +901,12 @@ class Rig:
             self.record(label, rgb, iter=it, px=[round(hit[0]), round(hit[1])], want=[round(tu), round(tv)],
                         err_px=round(err, 1), depth_mm=round(float(plane)))
             # A model step that did not cut the error to < 30% means the model is off here: probe instead
+            if tol_mm is not None:
+                # Image u is the jaws' closing direction at any wrist angle: the camera turns with them
+                mm = float(plane) / self.fx
+                if abs(e[0]) * mm <= tol_mm[0] and abs(e[1]) * mm <= tol_mm[1]:
+                    print(f"  {label}: {e[0] * mm:.0f},{e[1] * mm:.0f} mm off, within {tol_mm[0]:.0f},{tol_mm[1]:.0f}: no move")
+                    return
             if not probing and prev is not None and err > max(TOL_PX, 0.3 * prev):
                 print(f"  {label}: model Jacobian step left {err:.0f}px of {prev:.0f}px; probing from here")
                 probing = True
@@ -1066,7 +1093,9 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     await rig.goto(p.x, p.y, ALIGN_Z, theta=None if not align else 0.0)
 
     print("1/5 find + align over block" if align else "1/5 refine over the target (wrist already turned)")
-    await rig.servo(finder, True, "block")
+    # Only this first refine may stop early: after a missed grab the object is not where the frame said
+    tol = getattr(finder, "servo_tol_mm", None)
+    await rig.servo(finder, True, "block", **({"tol_mm": tol} if tol else {}))
     if verify is not None:
         # Centred at theta 0: the frame where the whole object is visible, so recognition is fair
         ok, why = await verify()
@@ -1187,11 +1216,13 @@ async def release_jaws(rig: Rig) -> None:
         await rig.open()
 
 
-async def release_here(rig: Rig, height: float, grip: float, observe: bool = False) -> None:
+async def release_here(rig: Rig, height: float, grip: float, observe: bool = False, retreat: bool = True) -> None:
     """
     Lower the held block straight down until its bottom is PLACE_GAP above the table, open, lift to ALIGN_Z.
 
     `observe` records jaw-calibration samples from the released block before lifting away.
+    retreat=False: lift only until the fingertips clear what stands on the table (RETREAT_CLEAR_MM, no frame needs this
+    height); the caller goes on from there with leave_low(). {VIAM CENTERAL 2026-10-30 "从放置点抬到净空高度后直接回 OBSERVE"}
     """
     z1, table, _ = await rig.measure()
     await rig.wait_clear(axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table))
@@ -1201,6 +1232,11 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
     await rig.descend(z_place, settle=False)  # the release follows, no frame
     await release_jaws(rig)
     save_state(False)
+    q = await rig.pose()
+    rig.released_at = (q.x, q.y)
+    if not retreat:
+        await rig.rise(min(ALIGN_Z, max(rig.floor_z, MIN_GRASP_Z) + RETREAT_CLEAR_MM), settle=False)
+        return
     if observe:
         # Free calibration data: the released block marks where the jaw axis really is
         await observe_release(rig, z1, table, height)
@@ -1346,7 +1382,7 @@ async def locate_by_estimate(rig: Rig, guesses: list, search_poses: list, confir
 
 async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None,
                           choose_spot=None, more_guesses: list = (), search_poses: list = None,
-                          confirm=None) -> tuple:
+                          confirm=None, direct: dict = None, low_retreat=None) -> tuple:
     """
     Steps 3-4: carry to the square, release in its hole; returns the flange xy over the hole's centre.
 
@@ -1358,22 +1394,33 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     point from the carry-offset view, where the hole is clear of the held object; None raises SquareFull (still
     holding). The blue screwdriver was put down on the yellow block already in the hole (2026-10-29). Without it
     the release goes to the hole's centre.
+    direct {"frame": (rgb, depth, pose), "xy", "until"}: a recent frame with the full square (the executor's
+    direct_square): the spot is chosen from it and there is no look pose, unless it is past "until" or shows no room.
+    {VIAM CENTERAL 2026-10-30 "跳过确认视角 ... 只有 PARTIAL 或过期才去确认。放置安全靠放完后的 CHECK"}
+    low_retreat() -> True: leave the release low (release_here retreat=False); the caller moves on with leave_low().
     """
     times = {} if times is None else times
     t = time.monotonic()
     print("3/5 carry to the blue square")
     times["at"] = "carry"
     guesses = [g for g in [square_xy, *more_guesses] if g is not None]
-    centre = await locate_square_carrying(rig, guesses, search_poses, confirm)
-    spot = centre
-    if choose_spot is not None:
-        q = await rig.pose()
-        rgb, depth = await rig.frame()
-        spot, why = choose_spot(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
-        rig.record("square-spot", rgb, spot=None if spot is None else [round(spot[0]), round(spot[1])], why=why)
-        print(f"  drop spot in the square: {why}")
-        if spot is None:
-            raise SquareFull(f"square is full, clear it first ({why})")
+    spot = None
+    if direct is not None and choose_spot is not None and time.time() <= direct["until"]:
+        spot, why = choose_spot(*direct["frame"])
+        print(f"  no look pose, drop spot from the found frame: {why}")
+        if spot is not None:
+            centre, direct["used"] = direct["xy"], True
+    # No shortcut, or no room in that frame (it may be out of date): the look pose decides, as always
+    if spot is None:
+        centre = spot = await locate_square_carrying(rig, guesses, search_poses, confirm)
+        if choose_spot is not None:
+            q = await rig.pose()
+            rgb, depth = await rig.frame()
+            spot, why = choose_spot(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
+            rig.record("square-spot", rgb, spot=None if spot is None else [round(spot[0]), round(spot[1])], why=why)
+            print(f"  drop spot in the square: {why}")
+            if spot is None:
+                raise SquareFull(f"square is full, clear it first ({why})")
     await travel(rig, *spot, theta=0.0)
     t = mark(times, "carry", t)
 
@@ -1382,7 +1429,10 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
         raise ObjectLost("object no longer in the gripper during the carry")
     print("4/5 lower + release")
     times["at"] = "place"
-    await release_here(rig, height, grip)
+    if low_retreat is not None and low_retreat():
+        await release_here(rig, height, grip, retreat=False)
+    else:
+        await release_here(rig, height, grip)
     mark(times, "place", t)
     return centre
 
@@ -1574,6 +1624,24 @@ def reachable(x: float, y: float, z: float = ALIGN_Z) -> bool:
     return allowed(x, y) and math.hypot(x, y) <= r_max
 
 
+def line_clear(x0: float, y0: float, x1: float, y1: float) -> bool:
+    """Does the straight line between two table points stay TRAVEL_MIN_R_MM from the base and out of the keep-outs?"""
+    for i in range(21):
+        x, y = x0 + (x1 - x0) * i / 20.0, y0 + (y1 - y0) * i / 20.0
+        if math.hypot(x, y) < TRAVEL_MIN_R_MM or not allowed(x, y):
+            return False
+    return True
+
+
+async def leave_low(rig: Rig, x: float, y: float, theta: float = None) -> None:
+    """From a low retreat (release_here retreat=False) up and across to (x, y, ALIGN_Z) in one move, when the line is clear."""
+    p = await rig.pose()
+    if line_clear(p.x, p.y, x, y):
+        await rig.goto(x, y, ALIGN_Z, theta=theta, long_ok=True)
+    else:
+        await travel(rig, x, y, theta=theta)
+
+
 async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = ALIGN_Z, settle: bool = True) -> None:
     """
     Move to (x, y) at height z (default ALIGN_Z) in legs short enough for the MAX_STEP_MM guard.
@@ -1583,6 +1651,12 @@ async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = A
     carry rose at its grasp xy (r ~573 mm) to z 580 and the planner had no IK solution; the target (a sweep pose)
     is reachable high, the far grasp xy is not. {VIAM CENTERAL 2026-10-29 "上升时在目标 XY 升；下降时在起点 XY 降"}
     Only the last move waits SETTLE_S (and only with settle=True): no frame follows the others.
+    fast("one_move"): the crossing in one move when its line is clear (line_clear). Each 200 mm leg was planned, sped up
+    and slowed down on its own: three legs and the wrist took ~6.3 s of a grasp. The legs exist only to pass MAX_STEP_MM,
+    a guard against a bad calculation; the target here was checked above. NOT KNOWN: whether the arm follows a straight
+    line on a long move or interpolates its joints; z 400 leaves ~235 mm under the fingertips either way.
+    {VIAM CENTERAL 2026-10-30 "MAX_STEP_MM 是 250，能不能让 Z400 上的长距离平移一次走完"}
+    [CONFIDENCE: UNVERIFIED 60% — not run on the arm]
     """
     if not allowed(x, y):
         raise RuntimeError(f"refusing ({x:.0f},{y:.0f}): inside an obstacle keep-out zone")
@@ -1597,6 +1671,11 @@ async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = A
         cur = z
         await rig.goto(p.x, p.y, cur, settle=False)
     rise = z > cur + 1
+    if fast("one_move") and line_clear(p.x, p.y, x, y):
+        await rig.goto(x, y, cur, theta=theta, settle=settle and not rise, long_ok=True)
+        if rise:
+            await rig.goto(x, y, z, theta=theta, settle=settle)
+        return
     legs = max(1, math.ceil(math.hypot(x - p.x, y - p.y) / 200.0))
     for i in range(1, legs + 1):
         await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, cur, theta=theta,

@@ -138,6 +138,11 @@ async def back_to_observe(rig) -> None:
         print(f"  not returning to the observe pose: {ppa.ESTOP_STATUS}")
         return
     try:
+        if ppa.fast("direct_return"):
+            # Already there (the check's frame was taken here): no zero-length move and its settle
+            p = await rig.pose()
+            if math.hypot(p.x - ppa.HOME_XY[0], p.y - ppa.HOME_XY[1]) <= 3.0 and abs(p.z - ppa.ALIGN_Z) <= 3.0 and abs(p.theta) <= 1.0:
+                return
         await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
         return
     except ppa.EStop:
@@ -889,6 +894,8 @@ async def grasp_with_primitives(rig, found: dict, esc, times: dict, doc: dict, t
     last = None
     for primitive in esc.order(grasp.choose_primitives(obj, rig.fx)):
         tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store, primitive=primitive)
+        if ppa.fast("refine_skip"):
+            tracker.servo_tol_mm = grasp.servo_tolerance(primitive, obj, rig.fx)
         esc.attempt(primitive)
         doc["primitive"], doc["attempt_primitives"] = primitive, list(esc.tried)
         print(f"  grasp primitive: {primitive}")
@@ -911,6 +918,41 @@ async def grasp_with_primitives(rig, found: dict, esc, times: dict, doc: dict, t
             esc.failed(primitive)
             raise
     raise last if last is not None else ppa.PickFailed("no grasp primitive for this object")
+
+
+SKIP_CONFIRM_FRAME_S = 5.0  # the frame's age when the pick starts: older means another look before the release
+SKIP_CONFIRM_TOTAL_S = 20.0  # ...and when the carry starts: a pick that took longer (a person's hand paused it) looks too
+SKIP_NEAR_PAPER_MM = 90.0  # picked this close to the interior (the 40 mm paper border + a margin) it may have moved the paper
+
+
+def direct_square(rig, found: dict, obj, frame_ts: float):
+    """
+    ppa.place_in_square's `direct`: the found frame when it shows the whole square recently, else None (look as before).
+
+    WHY: the found frame already holds everything the look pose is for: all four sides, and what stands on the interior.
+    {VIAM CENTERAL 2026-10-30 "找到目标那一帧已有 PARTIAL FALSE 的完整方框，且 < 5 S 时，不去 CARRY-OFFSET LOOK POSE"}
+    [CONFIDENCE: SINGLE-SRC 75% — the 5 s counts up to the start of the pick: the pick itself takes ~10 s, so counted at
+    the carry it would never hold. The later limit is SKIP_CONFIRM_TOTAL_S]
+    """
+    if found.get("depth") is None or time.time() - frame_ts > SKIP_CONFIRM_FRAME_S:
+        return None
+    k, pose = intr(rig), found["pose"]
+    sq = frame_square(found["rgb"], found["depth"], pose, k)
+    if sq is None or sq.get("partial"):
+        return None
+    u, v, _ = grasp_px(obj, pose, k)
+    if drop_square.contains(sq, perception.world_xy(pose, k, u, v, obj.top_depth_mm), margin=SKIP_NEAR_PAPER_MM):
+        return None
+    return {"frame": (found["rgb"], found["depth"], pose), "xy": tuple(sq["xy"]), "until": frame_ts + SKIP_CONFIRM_TOTAL_S}
+
+
+def square_in_observe_view(rig, sq: dict) -> bool:
+    """Would the observe pose show this whole square, clear of the fingers? Then the place check can use that frame."""
+    if not sq or not sq.get("corners"):
+        return False
+    pose = {"x": ppa.HOME_XY[0], "y": ppa.HOME_XY[1], "z": ppa.ALIGN_Z, "theta": 0.0}
+    corners = [perception.project_xy(pose, intr(rig), tuple(c), ppa.TABLE_DEPTH_MM) for c in sq["corners"]]
+    return all(20.0 <= u <= 1260.0 and 20.0 <= v <= ppa.FINGER_ROW - 20.0 for u, v in corners)  # 1280 x 720 frames
 
 
 def width_mm(obj, fx: float) -> float:
@@ -1239,6 +1281,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if obj is None:
             doc.update(status="not_found", fail_phase="find", fail_reason=found.get("reason"))
             return doc
+        frame_ts = float(found.get("ts") or time.time())  # a search's frame was just taken
         doc.update(label=found.get("recognised") or found.get("label") or obj.colour or "object", colour=obj.colour,
                    score=round(float(found.get("score", 0.0)), 3),
                    margin=round(float(found.get("margin", 0.0)), 3), img_before=jpeg(found["rgb"]))
@@ -1259,6 +1302,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         # One move (translation + wrist yaw) to the pre-grasp pose computed from the found frame, where best()
         # already accepted the whole object: identity is fixed there (tracker.ref); pick() refines and checks
         # continuity before the descent
+        direct = direct_square(rig, found, obj, frame_ts) if ppa.fast("skip_confirm") else None
         esc = grasp.escalation_for(text)
         height, grip, tracker = await grasp_with_primitives(rig, found, esc, times, doc, text, store)
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
@@ -1271,6 +1315,11 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         ref_fn = lambda: full_square_ref(rig, found)  # noqa: E731
         ref = ref_fn()
         used = {}  # the square estimate the release is planned on
+        route = {}  # the shortcuts FAST_ROUTE turns on; empty keeps the path as it ran on the arm
+        if direct is not None:
+            route["direct"] = direct
+        if ppa.fast("direct_return"):
+            route["low_retreat"] = lambda: square_in_observe_view(rig, used.get("sq"))
         if square_xy is None and ref is not None:
             square_xy, doc["square_path"] = tuple(ref["xy"]), "full estimate"
         centre = await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy,
@@ -1278,9 +1327,16 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
                                            confirm=square_confirm(rig, ref_fn),
                                            more_guesses=([partial] if partial else []) + [xy for xy, _ in sightings],
                                            search_poses=[(*ppa.HOME_XY, ppa.ALIGN_Z)]
-                                           + [(x, y, SWEEP_Z) for x, y in SWEEP_XY])
+                                           + [(x, y, SWEEP_Z) for x, y in SWEEP_XY], **route)
         LAST_SQUARE.update(xy=tuple(centre), ts=time.time())
         q = await rig.pose()
+        # Left low: on to the observe pose in one move, and the check uses that frame (no stop above the release)
+        low = q.z < ppa.ALIGN_Z - 1.0
+        if route:
+            doc["route"] = {"no_look_pose": bool(direct and direct.get("used")), "check_from_observe": low}
+        if low:
+            await ppa.leave_low(rig, *ppa.HOME_XY, theta=0.0)
+            q = await rig.pose()
         times["at"] = "check"
         rgb, depth = await rig.frame()
         rig.record("check", rgb)
@@ -1288,9 +1344,15 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         square_from_frame(rgb, depth, pose_dict(q), intr(rig))
         # Where the object itself should be: the release point, or for a ring its centre beside the jaws
         expect = None
+        # The release's flange xy: straight below this pose, unless the check is from the observe pose
+        rx, ry = rig.released_at if low else (q.x, q.y)
         if ring:
             ox, oy = ring_offset_at(ring, q.theta)
-            expect = {"xy": (q.x + ox, q.y + oy), "r": ring["r_out"]}
+            expect = {"xy": (rx + ox, ry + oy), "r": ring["r_out"]}
+        elif low:
+            au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, ppa.TABLE_DEPTH_MM)
+            expect = {"xy": perception.world_xy({"x": rx, "y": ry, "z": ppa.ALIGN_Z, "theta": q.theta}, intr(rig), au, av,
+                                                ppa.TABLE_DEPTH_MM)}
         seen, right, why, seg = placed_ok(rig, rgb, depth, text, store, expect, ref_fn, used.get("sq"))
         if seg is not None:
             publish_frame(store, rgb, seg, "place")
