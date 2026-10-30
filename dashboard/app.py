@@ -33,6 +33,7 @@ from pydantic import BaseModel
 ROOT = Path(__file__).resolve().parent.parent
 CAM_DIR = Path(os.environ.get("SORTER_DATA") or ROOT / "data") / "camera"
 MODULE_NAME = os.environ.get("DASH_MODULE_NAME", "sorter")
+STOP_COMMAND = "__stop__"  # Stop button: the module ends the current task, the queue goes on
 RESET_COMMAND = "__reset__"  # Reset button: the module clears the drop target
 SCAN_COMMAND = "__scan__"  # "Scan table": the module looks over the whole table into its live map
 MAX_TEXT = 200
@@ -278,6 +279,8 @@ def _answered(entry: dict, res: dict) -> None:
 async def add_command(body: TextIn):
     """Grasp (a description, or several), Reset or Scan table: DoCommand on the module, which runs it in the background."""
     text = body.text.strip()
+    if text == STOP_COMMAND:  # no entry of its own: the job line keeps showing the task, which ends as "stopped"
+        return {"module": await module_call({"stop": True})}
     text = text if text in (RESET_COMMAND, SCAN_COMMAND) else _clean(text)
     entry = _new_command(text)
     try:

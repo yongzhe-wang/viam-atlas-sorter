@@ -85,6 +85,7 @@
     <form id="f">
       <input id="t" type="text" placeholder="red lollipop, green block, tape — each one goes into the bucket" autocomplete="off" maxlength="200" aria-label="what to put into the bucket, comma separated">
       <button class="primary" type="submit">Grasp</button>
+      <button type="button" id="b-stop" style="color:var(--bad);border-color:var(--bad)" title="End the current task: the arm lifts, puts back what it holds and goes on with the queue">Stop</button>
       <button type="button" id="b-reset" title="Clear the drop target; after an E-stop, release it first">Reset</button>
     </form>
     <div id="state" class="warn"><i>…</i><span>connecting to the robot</span></div>
@@ -423,6 +424,7 @@ $("f").addEventListener("submit", (ev) => {
   const text = $("t").value.trim();
   if (text) { send(text, "grasp"); $("t").value = ""; }
 });
+$("b-stop").onclick = () => send("__stop__", "stop");
 $("b-reset").onclick = () => send("__reset__", "reset");
 // The camera and the map are view only: the box above is the one control (user, 2026-10-30)
 

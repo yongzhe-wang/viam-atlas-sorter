@@ -336,6 +336,23 @@ async def main():
     r = await s.do_command({"grasp": "lollipop", "wait": True})
     assert len(calls) == 1 and "items" not in r, (calls, r)
     print("14. a name that fits two objects: both, in sequence ('of' 1/2, 2/2); a repeat that finds none ends them; one object: single path")
+    # The Stop button: this task ends without a retry, the queue goes on {USER 2026-10-30 "TO JUST CLEAR THE CURRENT TASK"}
+    assert (await s.do_command({"stop": True}))["stopped"] is False
+    OUTCOME["stopme"] = {"status": "failed", "fail_phase": "carry", "fail_reason": "slipped out", "_id": "a", "duration_s": 0.1}
+    calls.clear()
+    r = await s.do_command({"grasp": "stopme"})
+    await asyncio.sleep(0.01)
+    q = await s.do_command({"grasp": "snack"})
+    assert q.get("queued"), q
+    assert (await s.do_command({"stop": True}))["stopped"] is True
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if len(calls) >= 2 and not s._busy() and not s.queue:
+            break
+    assert [c["text"] for c in calls] == ["stopme", "snack"], calls
+    assert any(j.get("status") == "stopped" for j in s.recent), s.recent
+    OUTCOME.pop("stopme")
+    print("14b. Stop: the current task ends as stopped, no retry; the queue goes on; idle: nothing to stop")
     await s.close()
 
     # The rule itself: another object of the same name on the table, a reset

@@ -494,6 +494,13 @@ class EStop(MoveRefused):
 # reaching the arm, and clear_error is never sent, until Reset (executor.clear_square) clears it.
 # {VIAM CENTERAL 2026-10-29 "FAIL_REASON 里出现 'EMERGENCY STOP' 时，立刻停止所有重试和 RECOVER ... 不做 CLEAR_ERROR"}
 ESTOP = {"on": False, "why": ""}
+STOP = {"on": False}  # the dashboard's Stop: the current task ends at its next arm command, recover() takes it from there
+
+
+class TaskStopped(RuntimeError):
+    """The Stop button {USER 2026-10-30 "IT SHOULD HAVE STOP BUTTON" "TO JUST CLEAR THE CURRENT TASK"}. Not a MoveRefused: nothing is tried instead."""
+
+
 ESTOP_STATUS = "E-STOP pressed — release it, then press Reset on the dashboard"
 EXPAND_WAIT_S = 6.0  # Rig.expand: longest wait for the jaws to stop against the wall
 EXPAND_SPEED = 1000  # of 1-5000: slower than the module's default 2000, it arrives at the wall gently
@@ -599,6 +606,8 @@ class Rig:
         """Run `fn()` (a zero-arg coroutine factory using self.arm/cam/gripper), reconnecting on a dropped link."""
         if ESTOP["on"] and what not in READ_CALLS:
             raise EStop(f"{what} not sent: {ESTOP_STATUS}")
+        if STOP["on"] and what not in READ_CALLS:
+            raise TaskStopped(f"{what} not sent: stopped by the user")
         last = None
         for wait in (0.0,) + RETRY_BACKOFF_S:
             if wait:

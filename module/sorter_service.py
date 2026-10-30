@@ -179,6 +179,13 @@ def _no_none(x):
     return x
 
 
+def _arm_stop(on: bool) -> None:
+    """Rig.call's Stop flag (pick_place_auto.STOP); a stack without it has nothing to set."""
+    flag = getattr(_runtime().ppa, "STOP", None)
+    if flag is not None:
+        flag["on"] = on
+
+
 async def _back_to_observe(rig) -> None:
     """executor.back_to_observe for a job whose last try stayed where it failed; never raises."""
     try:
@@ -1020,6 +1027,8 @@ class GraspByDescription(Generic, EasyResource):
         failure, again, listed = None, False, False  # the last failed pick; one more try used; the summary is in attempts
         keys = ("status", "fail_phase", "fail_reason", "duration_s", "target_xy", "primitive")
         stayed = False  # the last try ended where it failed (a retry was to follow), not at the observe pose
+        self._stopping = False  # this task's own Stop: one pressed for the last task is spent
+        _arm_stop(False)
         for n in range(1, tries + 1):
             self.job_info.update(attempt=n, attempts_max=tries)
             # skip_current only for the first try: a failed try moved the arm, so a retry looks from where it is
@@ -1030,6 +1039,8 @@ class GraspByDescription(Generic, EasyResource):
                                                 list(excluded), stay=stayed)
             # The first attempt's path names the job (frame / map / search); retries always search
             via = run_via if n == 1 else via
+            if getattr(self, "_stopping", False):
+                break  # the Stop button: no retry, the next task in line goes on
             if v2 and summary.get("status") == "not_found" and failure is not None:
                 # Nothing left but what already failed: that failure is the answer, unless one more try may fix it
                 attempts.append({k: summary.get(k) for k in keys})
@@ -1057,7 +1068,12 @@ class GraspByDescription(Generic, EasyResource):
                     excluded.append(summary["target_xy"])
             else:
                 target_xy = summary.get("target_xy")
-        if stayed and summary.get("status") != "done" and getattr(self, "rig", None) is not None:
+        stopped = getattr(self, "_stopping", False)
+        self._stopping = False
+        _arm_stop(False)
+        if stopped and summary.get("status") != "done":
+            summary.update(status="stopped", fail_reason="stopped by the user")
+        if (stayed or stopped) and summary.get("status") != "done" and getattr(self, "rig", None) is not None:
             await _back_to_observe(self.rig)  # no retry after all: end at the observe pose like every task
         if attempts:
             summary["attempts"] = attempts + ([] if listed else [{k: summary.get(k) for k in keys}])
@@ -1609,6 +1625,13 @@ class GraspByDescription(Generic, EasyResource):
                               else self._preview_command(raw))
         if "teach" in command:
             return await self._teach_command(command)
+        if command.get("stop"):
+            # Only the current task: what is queued or next in a list goes on {USER 2026-10-30 "TO JUST CLEAR THE CURRENT TASK"}
+            if not self._busy():
+                return {"ok": True, "stopped": False, "reason": "nothing is running"}
+            self._stopping = True
+            _arm_stop(True)
+            return {"ok": True, "stopped": True, "text": self.job_info.get("text")}
         if command.get("clear_queue"):
             n, self.queue[:] = len(self.queue), []
             return {"ok": True, "cleared": n}

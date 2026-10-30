@@ -1940,6 +1940,7 @@ async def recover(rig, doc: dict) -> None:
     last refused spot, half on the square's tape. The pick spot is the one place known to fit this object, so
     the gripper opens only there (lowered to the measured table); with no pick spot known it keeps holding.
     """
+    ppa.STOP["on"] = False  # a stopped task still lifts and puts back what it holds
     if ppa.ESTOP["on"]:
         doc["fail_reason"] = ppa.ESTOP_STATUS  # nothing is sent to the arm until a person resets
         return
