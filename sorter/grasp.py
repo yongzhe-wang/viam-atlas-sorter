@@ -247,6 +247,34 @@ def choose_primitives(o, fx: float, depth: np.ndarray = None) -> list:
     return ["top"]
 
 
+def section_centre(o, u: float, v: float) -> tuple:
+    """
+    The middle of the object's mask across its short axis, through (u, v) (stays there if that is off the mask).
+
+    WHY: a body as wide as the bottle leaves each finger ~7 mm when centred. The label's top centroid is ~4 mm off the
+    body's midline, which left one finger ~3 mm, about what the servo may still be off by (TOL_PX), and the finger check
+    refused it at 3 mm off to that side. A section can only be centred by its silhouette: the sides have no depth.
+    {VIAM CENTERAL 2026-10-30 "瓶身余量只有每边约 8 MM（84 − 67），REFINE 对不准就拒绝"}
+    [CONFIDENCE: INFERRED 75% — measured on bottle/centered.npz; the silhouette is taken as symmetric about the body]
+    """
+    a = math.radians(o.yaw_deg)
+    du, dv = math.sin(a), math.cos(a)
+    h, w = o.mask.shape
+
+    def run(sign: float) -> float:
+        t = 0.0
+        while True:
+            x, y = int(round(u + sign * (t + 1.0) * du)), int(round(v + sign * (t + 1.0) * dv))
+            if not (0 <= y < h and 0 <= x < w and o.mask[y, x]):
+                return t
+            t += 1.0
+
+    if not (0 <= int(v) < h and 0 <= int(u) < w and o.mask[int(v), int(u)]):
+        return u, v
+    shift = (run(1.0) - run(-1.0)) / 2.0
+    return u + shift * du, v + shift * dv
+
+
 def target_px(primitive, o, pose: dict, k: dict, wall_mm: float = None) -> tuple:
     """
     (u, v, yaw_deg): where the jaws go for this primitive in this frame. top, handle, standing, lying_round, ring_wall:
@@ -260,7 +288,10 @@ def target_px(primitive, o, pose: dict, k: dict, wall_mm: float = None) -> tuple
             return float(ring[0][0]), float(ring[0][1]), 90.0
     if primitive == "centroid" and pose is not None and k is not None:
         return along_axis(o, pose, k, *o.centroid_px)
-    return grasp_px(o, pose, k, wall_mm)
+    u, v, yaw = grasp_px(o, pose, k, wall_mm)
+    if primitive == "lying_round":
+        u, v = section_centre(o, u, v)
+    return u, v, yaw
 
 
 def servo_tolerance(primitive, o, fx: float):
