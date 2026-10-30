@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sorter import drop_bucket as D  # noqa: E402
 
@@ -83,6 +85,74 @@ def test_last_known_newest_of_map_and_memory():
     assert D.last_known({"bucket": {"xy": [300.0, 300.0], "seen_ts": now - 10}}) == (300.0, 300.0)
     assert D.last_known({"bucket": {"xy": [300.0, 300.0], "seen_ts": now - 500}}) == (100.0, 200.0)
     assert D.last_known(None) == (100.0, 200.0)
+
+
+def test_partial_view_stops_the_search():
+    # {USER 2026-10-30 "IT ALREADY FIND IT RIGHT NOW BTU STILL TAKES THE ROUDN TRIPE"}
+    rig = Rig((300.0, 200.0, 580.0), (315.0, 300.0))
+    _from_frame.rig = rig
+    ppa.travel = _travel
+    D.from_frame = lambda *a: {"xy": [315.0, 300.0], "radius_mm": 98.0, "partial": True, "confidence": 0.05}
+    b = asyncio.run(D.locate(rig, {}, POSES, hint=(315.0, 300.0)))
+    assert b is not None and b["partial"] and rig.moves == [], rig.moves
+
+
+def test_seen_within_a_minute_is_carried_to_at_once():
+    D._LAST.clear()
+    D.from_frame = lambda *a: None
+    now = 1000.0
+    assert D.fresh_bucket({}, {"bucket": {"xy": [1.0, 2.0], "seen_ts": now - 30}}, {}, now)["xy"] == [1.0, 2.0]
+    assert D.fresh_bucket({}, {"bucket": {"xy": [1.0, 2.0], "seen_ts": now - 90}}, {}, now) is None
+    D.remember({"xy": [5.0, 6.0], "seen_ts": now - 10, "radius_mm": 98.0})
+    got = D.fresh_bucket({}, {"bucket": {"xy": [1.0, 2.0], "seen_ts": now - 30}}, {}, now)
+    assert got["xy"] == [5.0, 6.0] and got["radius_mm"] == 98.0, got  # the newest
+    D._LAST.clear()
+
+
+class MouthRig(Rig):
+    """Frames with a set share of orange pixels; the jaws let go by release_jaws."""
+
+    def __init__(self, at, share):
+        super().__init__(at, None)
+        self.share = share
+
+    async def frame(self):
+        rgb = np.zeros((100, 100, 3), np.uint8)
+        rgb[:] = (190, 150, 110)
+        rgb[:int(100 * self.share)] = (240, 110, 30)
+        return rgb, np.zeros((100, 100))
+
+
+def _place(rig, seen_from_look):
+    released = []
+
+    async def release(_):
+        released.append(True)
+
+    ppa.travel, ppa.release_jaws, D.from_frame = _travel, release, lambda *a: seen_from_look
+    b = {"xy": [315.0, 300.0], "radius_mm": 98.0, "rim_height_mm": 175.0, "source": "map"}
+    times = {}
+    done = asyncio.run(D.place_in_bucket(rig, 30.0, 10.0, times, b, {}, POSES))
+    return done, released
+
+
+def test_orange_over_the_mouth_needs_no_trip_up():
+    # {LOG "BUCKET: NOT IN THE VIEW OVER ITS MOUTH; LOOKING FROM HIGHER UP"}: 6 carries of 7
+    rig = MouthRig((450.0, 100.0, 400.0), 0.5)
+    done, released = _place(rig, None)
+    assert released and done["looks"] == [0.0], done
+    assert all(m[2] <= 400.0 + 1 for m in rig.moves), rig.moves  # never rose to LOOK_Z
+
+
+def test_no_orange_over_the_mouth_is_never_let_go():
+    # Moved away: the table below, no orange anywhere: not released, the job puts it back
+    rig = MouthRig((450.0, 100.0, 400.0), 0.0)
+    try:
+        _place(rig, None)
+    except ppa.SquareNotFound as e:
+        assert "not seen again" in str(e), e
+    else:
+        raise AssertionError("released with no bucket in view")
 
 
 if __name__ == "__main__":

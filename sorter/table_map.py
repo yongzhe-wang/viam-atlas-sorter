@@ -309,9 +309,9 @@ def observe_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = N
     sq = perception.find_drop_square(rgb, depth, plane=seg.plane)
     square = drop_square.observe(sq, pose, intr) if sq else None
     bk = None
-    if seg.bucket is not None and seg.bucket.get("center_px") is not None:
+    if seg.bucket is not None:  # with no free circle (objects in it) locate() goes by its known size: the map keeps up
         a, b, c = seg.plane
-        cu, cv = seg.bucket["center_px"]
+        cu, cv = seg.bucket["center_px"] if seg.bucket.get("center_px") is not None else (0.0, 0.0)
         bk = bucket.locate(seg.bucket, depth.astype(float), float(a * cu + b * cv + c), pose, intr)
     return {"ts": float(time.time() if now is None else now), "source": source,
             "pose": {k: float(pose[k]) for k in ("x", "y", "z", "o_x", "o_y", "o_z", "theta") if k in pose},  # o_*: tilted wrist

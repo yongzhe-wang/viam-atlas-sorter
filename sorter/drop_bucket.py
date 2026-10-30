@@ -7,7 +7,8 @@ WHY: the user replaced the blue square with a ~180 mm tall Halloween bucket and 
 {USER 2026-10-30 "MAKE SURE IT CAN WORK WHERE EVER THE BUCKET IS, THE BUCKET CAN MOVE"}
 [CONFIDENCE: SINGLE-SRC 70% — offline only; the bucket's position comes from AGENT3's sorter.bucket on real frames]
 Flow: executor.execute -> (after the pick) fresh_bucket() or locate() -> place_in_bucket(): over the mouth, a frame there
-confirms it (or moves to where the bucket now is), then release_jaws. Never lets go without a bucket estimate under 5 s old.
+confirms it (or moves to where the bucket now is), then release_jaws. Never lets go without the bucket seen over its mouth,
+or orange filling the view there.
 """
 import math
 import sys
@@ -23,9 +24,16 @@ from sorter import bucket  # noqa: E402
 
 RIM_CLEAR_MM = 25.0  # the held object's bottom passes this far above the rim
 MOUTH_MARGIN_MM = 35.0  # the jaws let go this far inside the rim at least: the object falls in, not onto the rim
-FRESH_S = 5.0  # a bucket estimate older than this is looked for again: people move it
+# A bucket seen this recently (found frame, live map, this process) is carried to at once: the look over the mouth follows it if
+# it was moved. {USER 2026-10-30 "IT ALWSY GET A ROUND TRIPE, BUT IT ALREADY FIND IT RIGHT NOW BTU STILL TAKES THE ROUDN TRIPE"}
+# [CONFIDENCE: CONFIRMED 90% — user's instruction via the coordinator: "60 S 内 … 零绕圈"; was 5 s]
+FRESH_S = 60.0
 CONFIRM_MM = 30.0  # the frame over the mouth puts it farther than this from the target: move there
-TRUST_CARRY_S = 20.0  # a bucket found this recently in the carry is released over even when what is held hides it
+# No rim in the frame, but this much of the view orange: the bucket is there, what is held or lies in it hides the rim
+# {OBSERVE Z 400 "ORANGE 0.44" WITH THE BUCKET 85 MM OFF THE FLANGE; Z 580 WITH IT CUT BY THE FRAME "ORANGE 0.05-0.16"}
+# [CONFIDENCE: INFERRED 75% — no saved frame right over the mouth; the table alone reads 0.00]
+MOUTH_ORANGE_SHARE = 0.15  # over the mouth at the release height
+HIGH_ORANGE_SHARE = 0.02  # from LOOK_Z over it
 LOOK_Z = 580.0  # the whole 197 mm bucket fits one view from here
 RELEASE_TRIES = 3  # moves toward a bucket that keeps moving before giving up (still holding)
 HINT_SKIP_MM = 150.0  # a search pose this close to the one over the last-known spot shows the same table: not looked from again
@@ -53,22 +61,26 @@ def from_frame(rgb, depth, pose: dict, k: dict):
 
 
 def fresh_bucket(found: dict, live: dict, k: dict, now: float = None):
-    """The bucket from the found frame or the live map if seen under FRESH_S ago, else None (look again: it may have moved)."""
+    """The newest bucket from the found frame, the live map and this process's last look, if under FRESH_S old, else None."""
     now = time.time() if now is None else now
+    cands = []
     if found and now - float(found.get("ts") or 0.0) <= FRESH_S:
         b = from_frame(found.get("rgb"), found.get("depth"), found.get("pose"), k)
         if b is not None:
-            return dict(b, source="frame", seen_ts=float(found["ts"]))
+            cands.append(dict(b, source="frame", seen_ts=float(found["ts"])))
     m = (live or {}).get("bucket")
     if m and now - float(m.get("seen_ts") or 0.0) <= FRESH_S:
-        return dict(m, source="map")
-    return None
+        cands.append(dict(m, source="map"))
+    if _LAST.get("xy") is not None and now - float(_LAST.get("seen_ts") or 0.0) <= FRESH_S:
+        cands.append(dict(_LAST, source="last look"))
+    return max(cands, key=lambda e: float(e.get("seen_ts") or 0.0)) if cands else None
 
 
 def remember(b) -> None:
     """Keep `b`'s centre as the last-known bucket spot (the first look of the next search)."""
     if b and b.get("xy") is not None:
-        _LAST.update(xy=[float(b["xy"][0]), float(b["xy"][1])], seen_ts=float(b.get("seen_ts") or time.time()))
+        _LAST.update(xy=[float(b["xy"][0]), float(b["xy"][1])], seen_ts=float(b.get("seen_ts") or time.time()),
+                     radius_mm=b.get("radius_mm"), rim_height_mm=b.get("rim_height_mm"))
 
 
 def last_known(live: dict = None):
@@ -113,15 +125,16 @@ async def look(rig, k: dict):
 async def locate(rig, k: dict, poses: list, hint=None):
     """
     Look for the bucket while holding: from here, then from LOOK_Z over `hint` (where it was last seen, last_known()), then
-    from LOOK_Z over here, then from each of `poses` ((x, y, z), nearest first); the first full view wins, else the best
-    partial one; None if no view shows it. With a hint, the rise over here and the poses near the hint's are skipped.
+    from LOOK_Z over here, then from each of `poses` ((x, y, z), nearest first); the first view that shows it wins, even in part:
+    the look over the mouth corrects the rest (no more trips for a fuller view). None if no view shows it. With a hint, the
+    rise over here and the poses near the hint's are skipped.
     {VIAM CENTERAL 2026-10-30 "先在当前位置看一眼，看不到就升到 Z580 看全景"}
     {USER 2026-10-30 "IT SHOULD FIRST GO TO THE REGION PREVIOSU FIND THEN IF NOT FOUND"}
     [CONFIDENCE: SINGLE-SRC 75% — offline (tests/test_drop_bucket.py); the logs found it at the 3rd-5th pose every time]
     """
-    best = await look(rig, k)
-    if best is not None and not best["partial"]:
-        return best
+    b = await look(rig, k)
+    if b is not None:
+        return b
     p = await rig.pose()
     first = [(p.x, p.y, LOOK_Z)] if ppa.reachable(p.x, p.y, LOOK_Z) else []
     left = [q for q in poses if ppa.reachable(*q) and math.hypot(q[0], q[1]) >= 150.0]
@@ -130,10 +143,8 @@ async def locate(rig, k: dict, poses: list, hint=None):
         print(f"  bucket: looking first where it was last seen ({hint[0]:.0f},{hint[1]:.0f})")
         await ppa.travel(rig, over[0], over[1], theta=0.0, z=over[2])
         b = await look(rig, k)
-        if b is not None and not b["partial"]:
+        if b is not None:
             return b
-        if b is not None and (best is None or b["confidence"] > best["confidence"]):
-            best = b
         p = await rig.pose()
         first = []  # moved away from "here": its rise would look at the hint's table again
         left = [q for q in left if math.hypot(q[0] - over[0], q[1] - over[1]) > HINT_SKIP_MM]
@@ -148,11 +159,9 @@ async def locate(rig, k: dict, poses: list, hint=None):
             await ppa.travel(rig, x, y, theta=0.0, z=z)
         at = (x, y)
         b = await look(rig, k)
-        if b is not None and not b["partial"]:
+        if b is not None:
             return b
-        if b is not None and (best is None or b["confidence"] > best["confidence"]):
-            best = b
-    return best
+    return None
 
 
 def lowest_release_z(b: dict, height: float, grip: float) -> float:
@@ -252,6 +261,12 @@ async def carry_over(rig, b: dict, xy, z: float, z_low: float) -> float:
     raise BucketOutOfReach(f"bucket at ({b['xy'][0]:.0f},{b['xy'][1]:.0f}): the arm cannot get over its mouth: {where_to_move(b, z)}")
 
 
+async def _orange_share(rig) -> float:
+    """Share of a new frame from where the arm is that is the bucket's colour."""
+    rgb, _ = await rig.frame()
+    return float(bucket.orange_mask(rgb).mean())
+
+
 async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict, k: dict, poses: list,
                           off=(0.0, 0.0)) -> dict:
     """
@@ -259,8 +274,10 @@ async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict,
     centre from the bucket's centre, by the last look), "looks"}. Still holding, raises BucketOutOfReach (no point of the mouth
     within reach: says which way to move it) or ppa.SquareNotFound (the bucket is nowhere to be seen, or kept moving).
     Up first where it is, then across: the object then crosses the rim already above it. Over the mouth a frame confirms the
-    bucket within CONFIRM_MM, else the arm follows it; a frame without it sends the arm up to LOOK_Z over here to look, and a
-    look from there that agrees stands as the confirmation. {VIAM CENTERAL 2026-10-30 "松手前再确认一次 ... 不在桶外松手"}
+    bucket within CONFIRM_MM, else the arm follows it. A frame with no rim but orange filling it is the bucket under the jaws, no
+    trip up (6 of 7 carries rose to LOOK_Z and back: {LOG "BUCKET: NOT IN THE VIEW OVER ITS MOUTH; LOOKING FROM HIGHER UP"}); a
+    frame without either sends the arm up to look, and a look from there that agrees stands as the confirmation.
+    {VIAM CENTERAL 2026-10-30 "松手前再确认一次 ... 不在桶外松手"}
     No hand check over the mouth: the bucket is in the depth sensor's blind range there and read as an intruder.
     """
     t = time.monotonic()
@@ -277,18 +294,23 @@ async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict,
         z = await carry_over(rig, b, xy, z, lowest_release_z(b, height, grip))
         seen = await look(rig, k)
         if seen is None:
+            share = await _orange_share(rig)
+            if share >= MOUTH_ORANGE_SHARE:
+                print(f"  bucket: no rim in view but {share:.0%} of the view is orange: it is under the jaws")
+                looks.append(0.0)
+                break
             # Over the mouth the bucket may fill the view: from higher up it is whole
             print("  bucket: not in the view over its mouth; looking from higher up")
             q = await rig.pose()
             if ppa.reachable(q.x, q.y, LOOK_Z):
                 await rig.rise(LOOK_Z)
                 seen = await look(rig, k)
-            if seen is None and time.monotonic() - t <= TRUST_CARRY_S:
-                # What is held can hide the bucket from both looks (the M&M bag, flat and wide under the camera): it was
-                # found for this carry seconds ago, so it is let go there instead of carried back to the table
+            if seen is None and await _orange_share(rig) >= HIGH_ORANGE_SHARE:
+                # What is held can hide the rim from both looks (the M&M bag, flat and wide under the camera), but not all
+                # the orange: it is let go there instead of carried back to the table
                 # {USER 2026-10-30 "M&M SNACK FAILED … BUCKET: NOT SEEN AGAIN BEFORE THE RELEASE … WHAT HAPPENED"}
                 # [CONFIDENCE: INFERRED 80% — the log: unseen over the mouth and from LOOK_Z right after a carry look found it]
-                print(f"  bucket: hidden by what is held; letting go where it was found {time.monotonic() - t:.0f} s ago")
+                print("  bucket: hidden by what is held; letting go where it was found")
                 seen = b
             if seen is None:
                 seen = await locate(rig, k, poses, hint=b["xy"])
@@ -314,7 +336,9 @@ async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict,
             continue
         break
     else:
-        raise ppa.SquareNotFound(f"bucket kept moving ({looks} mm between looks); still holding, nothing let go")
+        # Estimates that keep differing with orange under the jaws are poor arcs, not a moving bucket: let go here
+        if await _orange_share(rig) < MOUTH_ORANGE_SHARE:
+            raise ppa.SquareNotFound(f"bucket kept moving ({looks} mm between looks); still holding, nothing let go")
     times["carry"] = round(time.monotonic() - t, 1)
     times["at"] = "place"
     # Nothing on the jaws: no release and no delivery reported; the job's retry looks again

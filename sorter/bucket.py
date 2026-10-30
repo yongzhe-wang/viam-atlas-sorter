@@ -26,6 +26,12 @@ MIN_AREA_NO_CIRCLE_PX = 40000  # cut out without a circle only when this big: an
 MIN_INLIERS = 0.45  # share of the contour on the fitted circle (handle lugs, the frame and objects take the rest)
 MASK_GROW_PX = 14  # segmentation stays this far from the bucket: its shadow, and parallax between colour and depth
 ARC_FULL = 0.8  # share of the circle seen for it not to count as partial
+# The known-size fit (_known_radius_fit): objects in the bucket, the frame's edge and the wall seen off-axis leave the rim only
+# part of the outline, so a free circle has no support; with its radius known one arc is enough.
+# {T_MM.NPZ "FREE FIT SHARE 0.18"; T_QUEUE 0.35; EMPTY HIGH.NPZ 0.89} [CONFIDENCE: CONFIRMED 85% — saved z 580 / z 400 frames]
+KNOWN_MIN_SHARE = 0.2  # share of the outline on the circle of the bucket's size
+KNOWN_MIN_ARC = 0.15  # share of the circle seen
+KNOWN_RADIUS_SCALES = (0.92, 0.96, 1.0)  # of the radius in pixels at RIM_HEIGHT_MM: the z 400 frames read r 436 where 457 is computed
 EDGE_PX = 6
 MOVED_MM = 25.0  # a sighting this far from the map's entry: the bucket was moved, jump to it
 ALPHA = 0.5
@@ -66,6 +72,72 @@ def _fit_circle(pts: np.ndarray, tol: float, iters: int = 150) -> tuple:
     return float(o[0]), float(o[1]), float(r), inl
 
 
+def _centroid(region: np.ndarray) -> tuple:
+    """(u, v) mean of a bool mask."""
+    vs, us = np.nonzero(region)
+    return float(us.mean()), float(vs.mean())
+
+
+def _known_radius_fit(pts: np.ndarray, r: float, centroid: tuple, tol: float, iters: int = 200) -> tuple:
+    """
+    (u, v, inlier mask) of the circle of radius `r` px through most of `pts` with the orange region's centroid inside it, or
+    None. Seeded RANSAC on point pairs: each pair closer than 2r gives two centres, which may lie outside the picture.
+    """
+    rng = np.random.default_rng(0)
+    best, best_n = None, 0
+    for _ in range(iters):
+        a, b = pts[rng.choice(len(pts), 2, replace=False)]
+        chord = float(np.hypot(*(b - a)))
+        if chord < 20.0 or chord >= 2.0 * r:
+            continue
+        mid, h = (a + b) / 2.0, math.sqrt(r * r - chord * chord / 4.0)
+        normal = np.array([a[1] - b[1], b[0] - a[0]]) / chord
+        for o in (mid + h * normal, mid - h * normal):
+            if math.hypot(centroid[0] - o[0], centroid[1] - o[1]) > r:
+                continue
+            inl = np.abs(np.hypot(*(pts - o).T) - r) < tol
+            n = int(inl.sum())
+            if n > best_n:
+                best, best_n = (float(o[0]), float(o[1]), inl), n
+    return best
+
+
+def _locate_known_size(hit: dict, pose: dict, intr: dict) -> dict:
+    """
+    locate() for a straight-down view from the bucket's known size: the table is CAM_BELOW_POSE_MM under the pose, so the rim's
+    radius in pixels is known and an arc of the outline gives the centre. None without enough of the rim in view.
+    {USER 2026-10-30 "IT ALWAYS COUDLTN FIND THE BUCJJKET"} {T_MM.NPZ "SHARE 0.18 ARC 0.00 R NONE"}
+    [CONFIDENCE: CONFIRMED 85% — on the saved frames with objects in the bucket; depth is not read: over the mouth it is blind]
+    """
+    from sorter import camera_model
+
+    pts = hit.get("outline")
+    if pts is None or len(pts) < 50 or pose is None or camera_model.is_tilted(pose):
+        return None
+    rim_depth = float(pose["z"]) - camera_model.CAM_BELOW_POSE_MM - RIM_HEIGHT_MM
+    if rim_depth <= 50.0:
+        return None
+    best = None
+    for scale in KNOWN_RADIUS_SCALES:
+        r = RADIUS_MM * float(intr["fx"]) / rim_depth * scale
+        fit = _known_radius_fit(pts, r, hit["centroid"], tol=max(5.0, 0.015 * r))
+        if fit is not None and (best is None or fit[2].sum() > best[1][2].sum()):
+            best = (r, fit)
+    if best is None:
+        return None
+    r, (cu, cv, inl) = best
+    share = float(inl.mean())
+    angles = np.arctan2(pts[inl, 1] - cv, pts[inl, 0] - cu)
+    arc = len(np.unique(((angles + math.pi) / (2 * math.pi) * 72).astype(int))) / 72.0
+    if share < KNOWN_MIN_SHARE or arc < KNOWN_MIN_ARC:
+        return None
+    depth_at_rim = RADIUS_MM * float(intr["fx"]) / r  # what this radius in pixels says about the rim's distance
+    xy = camera_model.world_xy_full(pose, intr, cu, cv, depth_at_rim)
+    return {"xy": [round(float(xy[0]), 1), round(float(xy[1]), 1)], "radius_mm": RADIUS_MM,
+            "rim_height_mm": round(float(pose["z"]) - camera_model.CAM_BELOW_POSE_MM - depth_at_rim, 1),
+            "partial": bool(arc < ARC_FULL), "confidence": round(arc * share * 0.9, 2)}
+
+
 def find_mask(rgb: np.ndarray) -> dict:
     """
     {"mask" (bool, the bucket and a margin, circle included), "center_px", "radius_px", "arc", "inliers", "cut"} or None.
@@ -98,14 +170,16 @@ def find_mask(rgb: np.ndarray) -> dict:
         if sizes[k] < MIN_AREA_NO_CIRCLE_PX:
             return None
         mask = ndimage.binary_dilation(region, iterations=MASK_GROW_PX)
-        return {"mask": mask, "center_px": None, "radius_px": None, "arc": 0.0, "inliers": share, "cut": bool((~keep).any())}
+        return {"mask": mask, "center_px": None, "radius_px": None, "arc": 0.0, "inliers": share, "cut": bool((~keep).any()),
+                "outline": pts, "centroid": _centroid(region)}
     cu, cv, r, inl = fit
     angles = np.arctan2(pts[inl, 1] - cv, pts[inl, 0] - cu)
     arc = len(np.unique(((angles + math.pi) / (2 * math.pi) * 72).astype(int))) / 72.0
     vv, uu = np.ogrid[:H, :W]
     disc = (uu - cu) ** 2 + (vv - cv) ** 2 <= (r + MASK_GROW_PX) ** 2
     mask = disc | ndimage.binary_dilation(region, iterations=MASK_GROW_PX)
-    return {"mask": mask, "center_px": (cu, cv), "radius_px": r, "arc": arc, "inliers": share, "cut": bool((~keep).any())}
+    return {"mask": mask, "center_px": (cu, cv), "radius_px": r, "arc": arc, "inliers": share, "cut": bool((~keep).any()),
+            "outline": pts, "centroid": _centroid(region)}
 
 
 def locate(hit: dict, depth: np.ndarray, table_depth_mm: float, pose: dict, intr: dict) -> dict:
@@ -117,7 +191,7 @@ def locate(hit: dict, depth: np.ndarray, table_depth_mm: float, pose: dict, intr
     further from the camera axis.
     """
     if hit.get("center_px") is None:
-        return None  # no circle fitted (tilted view): cut out, but not located
+        return _locate_known_size(hit, pose, intr)  # no free circle: the known size, else cut out but not located
     cu, cv, r = *hit["center_px"], hit["radius_px"]
     H, W = depth.shape
     vv, uu = np.ogrid[:H, :W]
@@ -136,8 +210,11 @@ def locate(hit: dict, depth: np.ndarray, table_depth_mm: float, pose: dict, intr
         return _locate_tilted(hit, depth, pose, intr)
     rim_depth = table_depth_mm - rim_height
     radius = r * rim_depth / float(intr["fx"])
-    if not RADIUS_RANGE_MM[0] <= radius <= RADIUS_RANGE_MM[1]:
-        return None
+    if hit["arc"] < ARC_FULL or not RADIUS_RANGE_MM[0] <= radius <= RADIUS_RANGE_MM[1]:
+        # Part of a circle fits many sizes, and the table's fit is poor when the bucket fills the view: the known size decides
+        known = _locate_known_size(hit, pose, intr)
+        if known is not None or not RADIUS_RANGE_MM[0] <= radius <= RADIUS_RANGE_MM[1]:
+            return known
     xy = camera_model.world_xy_full(pose, intr, cu, cv, rim_depth)
     return {"xy": [round(float(xy[0]), 1), round(float(xy[1]), 1)], "radius_mm": round(float(radius), 1),
             "rim_height_mm": round(float(rim_height), 1), "partial": bool(hit["arc"] < ARC_FULL),
@@ -172,13 +249,14 @@ def find_bucket(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict) -> d
     from sorter import perception
 
     hit = find_mask(rgb)
-    if hit is None or hit["center_px"] is None:
-        return None  # no bucket, or one seen too obliquely to fit its rim (still cut out of segmentation)
+    if hit is None:
+        return None
     d = depth.astype(float).copy()
     d[hit["mask"]] = 0
     a, b, c = perception.fit_table(d)
     H, W = d.shape
-    return locate(hit, depth.astype(float), float(a * hit["center_px"][0] + b * hit["center_px"][1] + c), pose, intr)
+    cu, cv = hit["center_px"] if hit["center_px"] is not None else (W / 2.0, H / 2.0)  # no circle: locate() reads no table depth
+    return locate(hit, depth.astype(float), float(a * cu + b * cv + c), pose, intr)
 
 
 def update(entry: dict, seen: dict, now: float) -> dict:

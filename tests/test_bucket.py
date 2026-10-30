@@ -83,7 +83,42 @@ def test_oblique_bucket_is_cut_but_not_located():
     rgb[ell], d[ell] = (240, 110, 30), TABLE - 175.0
     hit = B.find_mask(rgb)
     assert hit is not None and hit["center_px"] is None and hit["mask"][360, 640]
-    assert B.find_bucket(rgb, d, POSE, K) is None
+    # A tilted wrist is what shows an ellipse: the known-size fit is for straight-down views only
+    assert B.find_bucket(rgb, d, {**POSE, "o_x": 0.42, "o_y": 0.0, "o_z": -0.91}, K) is None
+
+
+def _crossing_objects(rgb, cu, cv, r):
+    """Objects lying in the bucket across its rim, breaking the outline like the KIND bar and the knife do."""
+    for ang in (0.4, 1.3, 2.2, 3.0, 3.9, 4.8, 5.6):
+        u, v = int(cu + r * np.cos(ang)), int(cv + r * np.sin(ang))
+        rgb[max(0, v - 45):max(0, v + 45), max(0, u - 45):max(0, u + 45)] = (40, 90, 60)
+
+
+def test_objects_across_the_rim_are_still_located():
+    # {T_MM.NPZ "SHARE 0.18 ARC 0.00 R NONE"}: a free circle has no support, the known size does
+    cu, cv, r = 150, 300, int(B.RADIUS_MM * K["fx"] / (TABLE - B.RIM_HEIGHT_MM))
+    rgb, d = scene(cu=cu, cv=cv, r=r, block=False)
+    _crossing_objects(rgb, cu, cv, r)
+    b = B.find_bucket(rgb, d, POSE, K)
+    want = P.world_xy(POSE, K, cu, cv, TABLE - B.RIM_HEIGHT_MM)
+    assert b is not None and abs(b["xy"][0] - want[0]) < 8 and abs(b["xy"][1] - want[1]) < 8, (b, want)
+
+
+def test_over_the_mouth_at_z400_it_fills_the_view():
+    # The rim only as two arcs at the picture's sides, the table hardly in view, no depth: the look that failed 6 carries of 7
+    table = 376.0
+    pose = {"x": 360.0, "y": 300.0, "z": 400.0, "theta": 0.0}
+    cu, cv, r = 640, 300, int(B.RADIUS_MM * K["fx"] / (table - B.RIM_HEIGHT_MM))
+    rgb = np.zeros((720, 1280, 3), np.uint8)
+    rgb[:] = (190, 150, 110)
+    vv, uu = np.ogrid[:720, :1280]
+    rgb[(uu - cu) ** 2 + (vv - cv) ** 2 <= r ** 2] = (240, 110, 30)
+    rgb[250:470, 560:720] = (40, 90, 60)  # what lies in it
+    d = np.zeros((720, 1280))  # the rim and the inside are in the blind range
+    d[(uu - cu) ** 2 + (vv - cv) ** 2 > (r + 10) ** 2] = table
+    b = B.find_bucket(rgb, d, pose, K)
+    want = P.world_xy(pose, K, cu, cv, table - B.RIM_HEIGHT_MM)
+    assert b is not None and abs(b["xy"][0] - want[0]) < 8 and abs(b["xy"][1] - want[1]) < 8, (b, want)
 
 
 def test_map_contains():
