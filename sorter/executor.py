@@ -1168,6 +1168,134 @@ async def drop_somewhere(rig, height: float, grip: float) -> tuple:
     raise RuntimeError("no free spot to drop the object; still holding it")
 
 
+# Frame-based drop spots for the reset (drop_spots_in_frame). The knife (160 x 25 mm) found no 166 mm free disc on
+# the cluttered table and went back into the square, though a ~100 x 200 mm patch below the square was empty.
+# {VIAM CENTERAL 2026-10-29 "空位候选用 LIVE MAP 加当前帧的 FREE MASK ... 长物体允许旋转 WRIST，让长轴沿空隙方向"}
+# [CONFIDENCE: INFERRED 70% — offline on real frames; not run on the arm]
+DROP_ANGLES = (0.0, 45.0, 90.0, 135.0)  # image angles tried for the object's long axis
+DROP_MARGIN_MM = 12.0  # clear table around the footprint
+SQUARE_KEEP_MM = 60.0  # never drop within this of the square's interior (tape ring ~40 mm + paper edge)
+DISCARD_XY = [(280.0, 0.0), (280.0, -120.0), (280.0, 120.0)]  # last resort, below/left of the observe view
+DISCARD_CHECK_MM = 30.0  # the discard spot only has to be clear this close to the jaws
+
+
+FINGER_W_MM = 20.0  # finger width along the object's long axis
+FINGER_T_MM = 8.0  # finger thickness beyond the full jaw opening
+
+
+def drop_spots_in_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, k: dict, size_mm: tuple,
+                        sq: dict = None, near_xy: tuple = None, n: int = 4) -> list:
+    """
+    Up to n drop spots seen free in this empty-gripper frame: [(table xy, image angle of the long axis, why, frame
+    pose)], nearest to near_xy first.
+
+    Free = nothing raised above the fitted table, nothing far below it (the floor past the table's edge read as free
+    on 084) and depth readable (each opened by 2 px against noise); flat tape,
+    paper or wood grain do not block (only raised things can stop the object or the opening fingers); the arm's
+    hanging cable is raised, so it blocks. The square's interior grown by SQUARE_KEEP_MM is never free. Two
+    rectangles must be free around the spot, at DROP_ANGLES for the long axis, every 16 px on an 8 px sample grid:
+    the object (length capped at 200 mm, plus DROP_MARGIN_MM) and the finger strip across its middle (the full jaw
+    opening + finger thickness, FINGER_W_MM wide). The first version also counted bright wood as paper and took
+    the finger strip as the object's width: 0 spots on 076/080/084 for the knife.
+    """
+    if depth is None:
+        return []
+    h, w = depth.shape
+    plane = table_plane(depth)
+    table = float(np.median(plane))
+    mm = k["fx"] / table
+    up = (depth > 0) & (plane - depth > ppa.SPOT_MIN_H_MM)
+    off = (depth > 0) & (depth - plane > 8.0)  # below the table plane: the floor past the table's edge (084)
+    busy = (ndimage.binary_opening(up, iterations=2) | ndimage.binary_opening(depth == 0, iterations=2)
+            | ndimage.binary_opening(off, iterations=2))
+    free = ~busy
+    free[ppa.FINGER_ROW:] = False
+    if sq is not None and sq.get("corners"):
+        keep = square_mask(sq, pose, k, rgb.shape, table)
+        free &= ~ndimage.binary_dilation(keep, iterations=int(SQUARE_KEEP_MM * mm))
+    across, along = size_mm
+    rects = [((min(along, 200.0) + 2 * DROP_MARGIN_MM) * mm, (across + 2 * DROP_MARGIN_MM) * mm),
+             ((FINGER_W_MM + 2 * DROP_MARGIN_MM) * mm, (2 * SPOT_JAW_MM + 2 * FINGER_T_MM) * mm)]
+    cu, cv = np.meshgrid(np.arange(0, w, 16), np.arange(0, h, 16))
+    cu, cv = cu.ravel(), cv.ravel()
+    found = []
+    for ang in DROP_ANGLES:
+        a = math.radians(ang)
+        lu, lv = math.cos(a), -math.sin(a)  # long axis in (u, v); image yaw convention atan2(-dv, du)
+        fits = np.ones(len(cu), bool)
+        for L, W in rects:
+            su, sv = np.meshgrid(np.arange(-L / 2, L / 2 + 1, 8.0), np.arange(-W / 2, W / 2 + 1, 8.0))
+            ou = (su * lu - sv * lv).ravel()  # across axis = long axis turned 90 deg: (-lv, lu)
+            ov = (su * lv + sv * lu).ravel()
+            uu = (cu[:, None] + ou[None, :]).round().astype(int)
+            vv = (cv[:, None] + ov[None, :]).round().astype(int)
+            inside = (uu >= 0) & (uu < w) & (vv >= 0) & (vv < h)
+            ok = np.zeros(uu.shape, bool)
+            ok[inside] = free[vv[inside], uu[inside]]
+            fits &= ok.all(axis=1)
+        for i in np.nonzero(fits)[0]:
+            u, v = float(cu[i]), float(cv[i])
+            xy = perception.world_xy(pose, k, u, v, float(plane[int(v), int(u)]))
+            found.append((tuple(float(c) for c in xy), ang, u, v))
+    if not found:
+        return []
+    ref = near_xy or (pose["x"], pose["y"])
+    found.sort(key=lambda f: math.hypot(f[0][0] - ref[0], f[0][1] - ref[1]))
+    out = []
+    for xy, ang, u, v in found:
+        # Spread the picks: skip spots within 40 mm of one already chosen
+        if all(math.hypot(xy[0] - o[0][0], xy[1] - o[0][1]) > 40.0 for o in out):
+            out.append((xy, ang, f"free {along:.0f} x {across:.0f} mm footprint at image angle {ang:.0f} ({u:.0f},{v:.0f})",
+                        pose))
+        if len(out) >= n:
+            break
+    return out
+
+
+async def drop_at(rig, height: float, grip: float, spots: list) -> tuple:
+    """
+    Put the held object at the first spot of drop_spots_in_frame() that still looks clear at the jaws, with the
+    wrist turned so its long axis (image-vertical since align_wrist) lies along the spot's angle; then the
+    DISCARD_XY spots at theta 0. Returns the xy used; raises (still holding) if none.
+    {VIAM CENTERAL 2026-10-29 "实在找不到时，退到一个固定的 DISCARD 区 ... 不要放回方框"}
+    """
+    k = intr(rig)
+    table = ppa.TABLE_DEPTH_MM
+    tries = [(xy, ang, fp) for xy, ang, _, fp in spots] + [(xy, None, None) for xy in DISCARD_XY]
+    for xy, ang, fp in tries:
+        theta = 0.0
+        if ang is not None:
+            d = table + (fp["z"] - ppa.ALIGN_Z)  # the table's depth in that frame (z 580 views are ~180 mm farther)
+            u, v = perception.project_xy(fp, k, xy, d)
+            theta = wrist_for(fp, k, u, v, ang, d)
+        # Flange that puts the jaws over xy at this theta (the jaw offset turns with the wrist)
+        au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
+        jx, jy = perception.world_xy({"x": 0.0, "y": 0.0, "z": ppa.ALIGN_Z, "theta": theta}, k, au, av, table)
+        fx, fy = xy[0] - jx, xy[1] - jy
+        if not ppa.reachable(fx, fy) or math.hypot(fx, fy) < 150.0:
+            continue
+        try:
+            await ppa.travel(rig, fx, fy, theta=theta)
+        except ppa.MoveRefused as e:
+            print(f"  drop: ({xy[0]:.0f},{xy[1]:.0f}) refused: {e}")
+            continue
+        rgb, depth = await rig.frame()
+        if depth is None:
+            continue
+        t, _ = ppa.table_and_near(depth)
+        hint = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, t)
+        # Only what is right under the jaws now (a hand, something moved there): the footprint was checked above
+        free, why = ppa.spot_free(rgb, depth, hint, radius=DISCARD_CHECK_MM * rig.fx / t)
+        rig.record("drop", rgb, xy=[round(xy[0]), round(xy[1])], theta=round(theta), free=free, why=why,
+                   discard=ang is None)
+        if not free and "near the tape square" not in why:
+            print(f"  drop: ({xy[0]:.0f},{xy[1]:.0f}) not clear now: {why}")
+            continue
+        await ppa.release_here(rig, height, grip)
+        return xy
+    raise RuntimeError("no free spot to drop the object (frame spots and discard area); still holding it")
+
+
 async def wipe(rig) -> None:
     """
     Push whatever is in the hole out sideways with the closed gripper (fallback when picking fails).
@@ -1270,7 +1398,7 @@ async def clear_square(rig, store) -> dict:
 
     Locates the square with go_over_square() (drop_square, no servo on the tape), counts what stands on its
     estimated interior (objects_in_hole with the frame pose), picks each out (<= 2 tries) and puts it at a free
-    spot (drop_somewhere); a failed pick -> wipe (<= 2 passes). Raises nothing for ordinary failures; status
+    spot seen free in an empty-gripper view (drop_spots_in_frame, else DISCARD_XY: never back into the square); a failed pick -> wipe (<= 2 passes). Raises nothing for ordinary failures; status
     "failed" means it parked and the next trial must not start.
     """
     doc = {"ts": time.time(), "mode": "reset", "target_text": "__reset__", "success": False, "status": "failed",
@@ -1279,7 +1407,11 @@ async def clear_square(rig, store) -> dict:
     STATE.update(times={"at": "reset"}, error=None)
     start_recording(rig, store, doc)
     k = intr(rig)
+    dropped = []
     try:
+        # The view the reset starts from (normally the observe pose, empty gripper): more table to drop on
+        rgb0, depth0 = await rig.frame()
+        first = (rgb0, depth0, pose_dict(await rig.pose()))
         centre, _ = await go_over_square(rig)
         for _round in range(6):
             rgb, depth = await rig.frame()
@@ -1308,11 +1440,22 @@ async def clear_square(rig, store) -> dict:
             obj = max(inside, key=lambda o: o.height_mm)  # the top of a stack first
             print(f"reset: {len(inside)} object(s) in the square; removing one ({obj.colour}, {obj.height_mm:.0f} mm)")
             picked = False
+            # Where it can go, from views with an empty gripper: this one and the starting view; never where an
+            # earlier object of this reset went
+            size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
+            sq_now = frame_square(rgb, depth, q, k)
+            spots = (drop_spots_in_frame(rgb, depth, q, k, size, sq_now, near_xy=centre)
+                     + drop_spots_in_frame(*first, k, size, sq_now, near_xy=centre))
+            spots = sorted((sp for sp in spots if all(math.hypot(sp[0][0] - d[0], sp[0][1] - d[1]) > 80.0 for d in dropped)),
+                           key=lambda sp: math.hypot(sp[0][0] - centre[0], sp[0][1] - centre[1]))
+            doc.setdefault("drop_spots", []).append([sp[2] for sp in spots[:4]])
             if width_mm(obj, rig.fx) <= MAX_OPEN_MM or ring_geometry(obj) is not None:
                 for _try in range(2):
                     try:
                         height, grip = await ppa.pick(rig, None, ObjTracker(rig, obj, rgb))
-                        doc.setdefault("dropped_at", []).append(list(await drop_somewhere(rig, height, grip)))
+                        xy = await drop_at(rig, height, grip, spots[:4])
+                        dropped.append(xy)
+                        doc.setdefault("dropped_at", []).append([round(xy[0], 1), round(xy[1], 1)])
                         picked = True
                         doc["removed"] += 1
                         break
