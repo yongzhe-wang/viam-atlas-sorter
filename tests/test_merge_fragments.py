@@ -70,6 +70,24 @@ def test_depthless_region_on_the_border_is_no_body():
     assert all(o.grip_px is None for o in segment(rgb, d, True).objects)
 
 
+def test_sliver_joins_its_larger_neighbour():
+    # A cylinder's side segmented apart from its top (076): with an unknown name the jaws went for the sliver
+    # {OPENVOCAB "BLUE CYLINDER@076: WRONG (PICKED CYAN H=14)"}
+    rgb = np.zeros((720, 1280, 3), np.uint8)
+    rgb[:] = (150, 110, 70)
+    d = np.full((720, 1280), float(TABLE))
+    d[300:420, 500:620], rgb[300:420, 500:620] = TABLE - 60, (20, 90, 200)  # the object
+    d[330:370, 640:690], rgb[330:370, 640:690] = TABLE - 14, (20, 90, 200)  # its sliver, 20 px away
+    d[330:370, 300:350], rgb[330:370, 300:350] = TABLE - 14, (20, 90, 200)  # a small thing far away: stays
+    d[440:480, 540:590], rgb[440:480, 540:590] = TABLE - 14, (220, 30, 30)  # a small red thing just below: stays
+    off = segment(rgb, d, False).objects
+    on = segment(rgb, d, True).objects
+    assert len(off) == 4 and len(on) == 3, ([o.bbox for o in off], [o.bbox for o in on])
+    big = max(on, key=lambda o: o.mask.sum())
+    assert big.n_fragments == 2 and big.bbox[2] >= 689 and big.grip_px is None, big.bbox
+    assert [o.id for o in on] == [0, 1, 2]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

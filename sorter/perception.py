@@ -401,6 +401,7 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
             objs.append(o)
     if MERGE_FRAGMENTS:
         objs, excluded = _merge_fragments(objs, excluded, rgb, valid, ascale, (H, W))
+        objs = _absorb_slivers(objs, excluded, ascale, (H, W))
     for k, (o, _) in enumerate(excluded):
         o.id = -1 - k  # negative ids never collide with targets
     intruders += find_intruders(rgb, valid, model, ascale)
@@ -504,6 +505,48 @@ def _merge_fragments(objs: list, excluded: list, rgb: np.ndarray, valid: np.ndar
     for k, o in enumerate(objs2):
         o.id = k
     return objs2, excl2
+
+
+# A standing cylinder's side can segment apart from its top (076: a 19x8 mm sliver beside the blue cylinder). A known name
+# is matched by label, but for an unknown one the sliver's crop may beat the object and the jaws go for the sliver.
+# {OPENVOCAB "BLUE CYLINDER@076: WRONG (PICKED CYAN H=14)"; 076 "FRAGMENT 19X8 MM H=14 AREA_PX=913"}
+# [CONFIDENCE: INFERRED 70% — every absorption on the 89 scan frames checked by eye]
+MERGE_SLIVER_MAX_PX = 2500  # at most this big (at the 380 mm reference depth; a 30 mm cube is ~5000 px)
+# ... and this close to the larger object. On 89 frames the distances are 6, 10, 18, 22, 27 px (shaft to handle, cylinder
+# side to top, cup pieces: all one object by eye), then 70 and more. {SLIVERS_DIST "27.3PX 044 GREY" "70.0PX 000 GREY"}
+MERGE_SLIVER_GAP_PX = 30
+MERGE_SLIVER_RATIO = 3.0  # which is at least this many times its area
+
+
+def _absorb_slivers(objs: list, excluded: list, ascale: float, shape: tuple) -> list:
+    """Objects minus small pieces of a larger, taller neighbour of a similar colour (mask and bbox join the neighbour's)."""
+    H, W = shape
+    others = objs + [o for o, _ in excluded]
+    gone = set()
+    for o in sorted(objs, key=lambda x: x.mask.sum()):
+        area = int(o.mask.sum())
+        if area > MERGE_SLIVER_MAX_PX * ascale:
+            continue
+        u0, v0, u1, v1 = o.bbox
+        g = MERGE_SLIVER_GAP_PX
+        sl = (slice(max(v0 - g, 0), min(v1 + g + 1, H)), slice(max(u0 - g, 0), min(u1 + g + 1, W)))
+        near = ndimage.binary_dilation(o.mask[sl], iterations=g)
+        for b in others:
+            if b is o or id(b) in gone or b.mask.sum() < MERGE_SLIVER_RATIO * area or b.height_mm <= o.height_mm:
+                continue
+            if not (_colour_alike(o.colour, b.colour) and b.mask[sl][near].any()):
+                continue
+            b.mask = b.mask | o.mask
+            b.bbox = (min(b.bbox[0], u0), min(b.bbox[1], v0), max(b.bbox[2], u1), max(b.bbox[3], v1))
+            b.n_fragments += o.n_fragments
+            gone.add(id(o))
+            break
+    return [o for k, o in enumerate(o for o in objs if id(o) not in gone) if not setattr(o, "id", k)]
+
+
+def _colour_alike(a: str, b: str) -> bool:
+    """Same hue family, allowing the neighbours the shading of one object spans (the blue cylinder: top blue, side cyan)."""
+    return a == b or {a, b} in ({"blue", "cyan"}, {"cyan", "green"}, {"yellow", "orange"}, {"orange", "red"}, {"grey", "white"}, {"grey", "black"})
 
 
 def _merged_obj(mask: np.ndarray, parts: list, rgb: np.ndarray, shape: tuple) -> Obj:
