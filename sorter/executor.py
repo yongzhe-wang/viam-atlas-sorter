@@ -1213,7 +1213,8 @@ def look_poses(xy) -> list:
 
 
 CAND_MERGE_MM = 60.0  # two sightings this close, from different views, are one candidate
-CAND_LOOKS = 3  # close looks at the best candidates, at most
+# 3 of 22 candidates missed a red lollipop that best() accepts on the same frame {USER 2026-10-30 "THE ROBOT NEED TO SEARCH FURTHER"}
+CAND_LOOKS = 6  # close looks at the best candidates, at most (~2 s each, only when nothing was accepted yet)
 EXCLUDED_MM = 60.0  # an object this close to where a failed pick was is that object
 
 
