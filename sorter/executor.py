@@ -33,7 +33,7 @@ from scipy.spatial import ConvexHull
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import pick_place_auto as ppa  # noqa: E402  arm library (Rig, pick, place_in_square, place_at, ...)
 
-from sorter import clip_embed, drop_square, grasp, perception  # noqa: E402
+from sorter import clip_embed, drop_bucket, drop_square, grasp, perception  # noqa: E402
 from sorter.grasp import REACH_MARGIN_MM, grasp_px, ring_geometry, ring_world  # noqa: E402
 
 COLOUR_TOL = 60.0  # RGB distance that still counts as the object at close range (grey/black/white objects)
@@ -1611,6 +1611,24 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         height, grip, tracker = await grasp_with_primitives(rig, found, esc, times, doc, text, store)
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         doc["grip"] = grip_record(rig, tracker.primitive, height, grip)
+        # The bucket, when there is one (SORTER_TARGET=bucket): known from the found frame or the map, or, with no square
+        # known either, looked for while carrying; no bucket anywhere falls through to the square
+        bk = drop_bucket.known_bucket(found, live_map(rig), intr(rig)) if drop_bucket.enabled() else None
+        if bk is None and drop_bucket.enabled() and not found.get("square") and not square_sightings(rig):
+            bk = await drop_bucket.look_for_bucket(rig, intr(rig), [(*ppa.HOME_XY, ppa.ALIGN_Z)] + [(x, y, SWEEP_Z) for x, y in SWEEP_XY])
+        if bk is not None:
+            put = await drop_bucket.place_in_bucket(rig, height, grip, times, bk)
+            times["at"] = "check"
+            rgb, _ = await rig.frame()
+            doc.update(img_after=jpeg(rgb), success=True, status="done", drop="bucket",
+                       bucket_xy=list(bk["xy"]), square_path=f"bucket {bk.get('source')}",
+                       check=f"released over the bucket mouth, {put['off_mm']:.0f} mm from its centre, at z {put['z']:.0f}")
+            grasp.forget_escalation(text)
+            emb = embedding_of(found, obj)
+            if emb is not None:
+                doc["embedding"] = emb
+            rig.picked_obj = obj
+            return doc
         size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
         ring = held_ring(rig, obj, found["pose"])
         centre_off = None if ring else held_centre(rig, obj, found["pose"], tracker)
