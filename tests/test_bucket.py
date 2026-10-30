@@ -73,6 +73,19 @@ def test_small_orange_thing_is_no_bucket():
     assert B.find_bucket(rgb, d, POSE, K) is None
 
 
+def test_oblique_bucket_is_cut_but_not_located():
+    # An ellipse, not a circle: find_mask still returns the region to cut out, find_bucket returns None (no crash)
+    rgb, d = scene(block=False)
+    rgb[:] = (190, 150, 110)
+    d[:] = TABLE
+    vv, uu = np.ogrid[:720, :1280]
+    ell = ((uu - 640) / 380.0) ** 2 + ((vv - 360) / 150.0) ** 2 <= 1.0
+    rgb[ell], d[ell] = (240, 110, 30), TABLE - 175.0
+    hit = B.find_mask(rgb)
+    assert hit is not None and hit["center_px"] is None and hit["mask"][360, 640]
+    assert B.find_bucket(rgb, d, POSE, K) is None
+
+
 def test_map_contains():
     e = {"xy": [335.0, 18.0], "radius_mm": 98.0}
     assert B.contains(e, (340.0, 20.0)) and not B.contains(e, (450.0, 18.0)) and not B.contains(None, (0, 0))

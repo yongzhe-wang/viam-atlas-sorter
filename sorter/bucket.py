@@ -145,8 +145,8 @@ def find_bucket(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict) -> d
     from sorter import perception
 
     hit = find_mask(rgb)
-    if hit is None:
-        return None
+    if hit is None or hit["center_px"] is None:
+        return None  # no bucket, or one seen too obliquely to fit its rim (still cut out of segmentation)
     d = depth.astype(float).copy()
     d[hit["mask"]] = 0
     a, b, c = perception.fit_table(d)
