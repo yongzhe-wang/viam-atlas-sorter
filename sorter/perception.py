@@ -461,6 +461,9 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None, pose: dict = No
         objs = _absorb_slivers(objs, excluded, ascale, (H, W))
     if LOW_OBJECTS:
         objs, excluded = _find_low_objects(objs, excluded, rgb, d, valid, height, ascale)
+    if bk is not None:
+        objs = [o for o in objs if not _part_of_bucket(o, bk["mask"])]
+        excluded = [(o, why) for o, why in excluded if not _part_of_bucket(o, bk["mask"])]
     for k, (o, _) in enumerate(excluded):
         o.id = -1 - k  # negative ids never collide with targets
     return Segmentation(table_depth_mm=table_depth, objects=objs, excluded=excluded,
@@ -680,6 +683,40 @@ TOUCH_REST_FRAC = 0.5
 # 20 mm wide band of low pixels. {T_BL SHAFT "TH 21" ALL PIXELS, "14" ABOVE 0.6; CANDY PACK "47" / "32"}
 # [CONFIDENCE: CONFIRMED 70% — four real shafts 14-15, every real lower object 18+]
 TOUCH_FRINGE_FRAC = 0.6
+
+
+# ---- what is left of the bucket after its cut ------------------------------------------------------------------------
+# The cut takes the orange the colour test sees. Its shaded outer wall and handle (80-100 mm), the sliver at its foot (7-10 mm,
+# bucket-coloured), the pumpkin face and what lies inside it stay: all came out as targets, and the wall as a graspable 75 x
+# 180 mm one, so the arm could go down onto the rim. An arc hugging the rim, or anything with the bucket all around it, is
+# the bucket. A real object against it stays: a block is not long, a knife along the rim is neither that tall nor that low.
+# {T_CYL "BLACK H 89 (214, 64, 336, 361) REC=NONE"; NOW "ORANGE H 9"; T_BL "RED H 45" = THE KNIFE IN THE BUCKET; HIGH "CYAN H31
+# NEAR 0.73" = A REAL BLOCK AGAINST IT} [CONFIDENCE: CONFIRMED 80% — every removal on the real frames checked by eye]
+BUCKET_NEAR_PX = 30  # "against the bucket": this close to its mask
+BUCKET_HUG_SHARE = 0.6  # share of the object against the bucket (real objects in tilted views: up to 0.51)
+BUCKET_ARC_ASPECT = 2.5  # length / width of an arc along the rim (the arcs here: 2.9 and up; a block: 1.5)
+BUCKET_WALL_MM = 70.0  # an arc this tall is its wall: nothing that lies down stands this high
+BUCKET_FOOT_MM = 15.0  # an arc this low, in the bucket's colours, is the sliver at its foot
+BUCKET_COLOUR_SHARE = 0.5  # red + orange in that sliver (the slivers here: 0.65-0.89)
+BUCKET_INSIDE_SHARE = 0.6  # of the ring around an object that is bucket: it lies in the bucket
+_BUCKET_STEP = 4  # worked out on this coarser grid: this runs on every look
+
+
+def _part_of_bucket(o, bucket_mask: np.ndarray) -> bool:
+    """Is this object what the bucket's cut left behind (wall, handle, foot, or something lying inside it)?"""
+    k = _BUCKET_STEP
+    m, b = o.mask[::k, ::k], bucket_mask[::k, ::k]
+    if not m.any():
+        return False
+    ring = ndimage.binary_dilation(m, iterations=12 // k) & ~m
+    if ring.any() and float(b[ring].mean()) >= BUCKET_INSIDE_SHARE:
+        return True
+    if float((ndimage.distance_transform_edt(~b)[m] * k <= BUCKET_NEAR_PX).mean()) < BUCKET_HUG_SHARE:
+        return False
+    if o.length_px < BUCKET_ARC_ASPECT * max(o.width_px, 1.0):
+        return False
+    bucket_colour = o.colours.get("red", 0.0) + o.colours.get("orange", 0.0)
+    return o.height_mm >= BUCKET_WALL_MM or (o.height_mm < BUCKET_FOOT_MM and bucket_colour >= BUCKET_COLOUR_SHARE)
 
 
 def _split_touching(lab: np.ndarray, n: int, height: np.ndarray, px_mm: float, min_area: float, first: int = 1,

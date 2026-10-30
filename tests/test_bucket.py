@@ -43,6 +43,24 @@ def test_found_and_located_at_the_rim():
     assert abs(b["rim_height_mm"] - 175.0) < 8 and abs(b["radius_mm"] - 230 * rim_depth / K["fx"]) < 4, b
 
 
+def test_what_the_cut_leaves_of_the_bucket_is_no_target():
+    # The shaded outer wall (dark, 90 mm, an arc along the rim) came out as a graspable target beside the rim; a real block against
+    # the bucket stays {T_CYL "BLACK H 89 (214, 64, 336, 361) REC=NONE"; HIGH "CYAN H31 NEAR 0.73"} [CONFIDENCE: CONFIRMED 80% — real frames]
+    rgb, d = scene(block=False)
+    vv, uu = np.mgrid[:720, :1280]
+    dist, ang = np.hypot(uu - 680, vv - 280), np.degrees(np.arctan2(vv - 280, uu - 680))
+    wall = (dist > 248) & (dist < 278) & (np.abs(ang) < 40)
+    rgb[wall], d[wall] = (40, 40, 40), TABLE - 90.0
+    rgb[250:320, 370:430], d[250:320, 370:430] = (30, 120, 220), TABLE - 31.0
+    saved = B.TARGET
+    B.TARGET = "bucket"
+    try:
+        seg = P.segment_full(rgb, d, align=P.IDENTITY)
+    finally:
+        B.TARGET = saved
+    assert [(o.bbox[0], o.colour) for o in seg.objects] == [(370, "blue")], [(o.bbox, o.height_mm) for o in seg.objects]
+
+
 def test_cut_out_of_segmentation():
     rgb, d = scene()
     saved = B.TARGET

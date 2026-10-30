@@ -519,6 +519,7 @@ class GraspByDescription(Generic, EasyResource):
         rt.clip_embed.embed_text("warm up")
         self.store.library_matrix()
         self.library = self.store.library_stats()
+        getattr(rt.clip_embed, "warm_names", lambda _: None)(self.store)  # the first unknown query compares with all of them
 
     async def _warmup(self) -> None:
         """Run _warm_sync in the background right after start; retry every WARM_RETRY_S until it succeeds."""

@@ -142,7 +142,7 @@ async def main():
     s._get_rig, s._intrinsics = get_rig, intrinsics
     assert await wait_for(lambda: s.warm), s.warm_error
 
-    r = await s.do_command({"teach": "m&m bag"})
+    r = await s.do_command({"teach": "m&m's bag"})
     assert r["accepted"] is False and "SORTER_TEACH" in r["error"] and not W.moves, r
     st = await s.do_command({"status": True})
     assert st["teach"]["enabled"] is False
@@ -151,18 +151,18 @@ async def main():
     os.environ["SORTER_TEACH"] = "1"
     for bad in ("", "blue", "the thing"):
         assert (await s.do_command({"teach": bad}))["accepted"] is False, bad
-    assert (await s.do_command({"teach": "m&m bag", "point": [0.01, 0.01]}))["status"] == "not_found"
+    assert (await s.do_command({"teach": "m&m's bag", "point": [0.01, 0.01]}))["status"] == "not_found"
     assert not W.moves
     print("2. no name, a colour for a name, a click on nothing: refused without moving")
 
     r = await s.do_command({"teach": "M&M bag", "wait": True})
-    assert r["accepted"] and r["status"] == "done" and r["label"] == "m&m bag", r
+    assert r["accepted"] and r["status"] == "done" and r["label"] == "m&m's bag", r
     assert r["views_added"] == 4 and r["views_skipped"] == 0, r["frames"]
     assert [f["z"] for f in r["frames"]] == [400, 400, 400, 580], r["frames"]
     assert r["searchable_s"] is not None and r["top_score"] > 0.99, r
     assert min(z for _, _, z in W.moves) >= 400.0, W.moves
     assert (W.x, W.y, W.z) == (*ppa.HOME_XY, ppa.ALIGN_Z), "ends at the observe pose"
-    assert ["m&m bag"] in s.store.list_labels()
+    assert ["m&m's bag"] in s.store.list_labels()
     views = s.store._read_offline("views")
     assert {v["source"] for v in views} == {"teach"} and all(v["colour"] and v["height_mm"] > 20 for v in views), views[0]
     assert all(len(v["embedding"]) == 512 and "jpeg" in v for v in views)
@@ -170,13 +170,13 @@ async def main():
     print(f"3. taught: 4 views (z {sorted({z for _, _, z in W.moves})}), arm back at observe, searchable, heights {[v['height_mm'] for v in views]}")
 
     W.moves.clear()
-    r = await s.do_command({"teach": "m&m bag", "wait": True})
+    r = await s.do_command({"teach": "m&m's bag", "wait": True})
     assert r["views_added"] == 0 and r["views_skipped"] == 4 and all(f["skipped"] == "already known" for f in r["frames"]), r
     print("4. the same again: every view a repeat, none stored")
 
-    r = await s.do_command({"teach": "chocolate", "alias_of": "m&m bag", "wait": True})
-    assert r["label"] == "m&m bag" and r["alias_of"] == "m&m bag" and r["views_added"] == 1, r  # the view that holds the name
-    assert ["m&m bag", "chocolate"] in s.store.list_labels(), s.store.list_labels()
+    r = await s.do_command({"teach": "chocolate", "alias_of": "m&m's bag", "wait": True})
+    assert r["label"] == "m&m's bag" and r["alias_of"] == "m&m's bag" and r["views_added"] == 1, r  # the view that holds the name
+    assert ["m&m's bag", "chocolate"] in s.store.list_labels(), s.store.list_labels()
     r = await s.do_command({"preview": "chocolate"})
     assert r["via"] != "error", r
     r = await s.do_command({"teach": "chocolate", "alias_of": "nothing we know", "wait": True})
@@ -259,7 +259,7 @@ async def main():
         n = len(s.store._read_offline("views"))
         obj.recognised = None
         r = await s.do_command({"grasp": "m&m", "wait": True})
-        assert r["learned"]["label"] == "m&m" and r["learned"]["view"], r
+        assert r["learned"]["label"] == "m&m's" and r["learned"]["view"], r
         outcome.update(margin=0.0, doc={"embedding": unit(3)})
         r = await s.do_command({"grasp": "something new", "wait": True})
         assert "not clear" in r["learned"]["skipped"], r

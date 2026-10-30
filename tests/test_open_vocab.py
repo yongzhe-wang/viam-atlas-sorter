@@ -153,6 +153,17 @@ def test_the_model_cannot_overrule_a_confident_recognition():
         llm_choose.mode, llm_choose.choose = saved
 
 
+def test_warm_up_embeds_every_name_a_query_compares_with():
+    # {BEST('BLUE LOLLIPOP') "2399 MS; NAMES CACHED 60"} [CONFIDENCE: CONFIRMED 90% — the first unknown query paid for all of them]
+    asked, saved = [], C._name_emb
+    C._name_emb = asked.append
+    try:
+        C.warm_names(Lib())
+    finally:
+        C._name_emb = saved
+    assert {"red utility knife", "green square", "wooden table"} <= set(asked), asked
+
+
 def test_unrecognised_object_much_more_like_a_library_name_is_vetoed():
     # The silver knife at z 580: not recognised, but its crop is far more like a known name than like "blue lollipop"
     # {NOW.NPZ KNIFE "LIB_GAP +0.089"; BLUE LOLLIPOPS "-0.015" TO "-0.103"} [CONFIDENCE: CONFIRMED 80% — real gaps]

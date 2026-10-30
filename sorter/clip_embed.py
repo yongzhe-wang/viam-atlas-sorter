@@ -321,6 +321,16 @@ def _known(text: str, store) -> bool:
     return store is not None and any(name_matches(text, n) for n in library_names(store))
 
 
+def warm_names(store) -> None:
+    """
+    Embed every library name and generic prompt now: rank() compares each crop with all of them for an unknown query, and the
+    first such query paid ~60 text passes while the arm waited. {BEST('BLUE LOLLIPOP') "2399 MS; NAMES CACHED 60", THEN "112 MS"}
+    [CONFIDENCE: CONFIRMED 90% — measured on the local library; a name taught later is embedded when first needed]
+    """
+    for n in [*OPEN_NEGATIVES, *(n for ns in library_names(store) for n in ns)]:
+        _name_emb(n)
+
+
 def _names_exactly(text: str, store) -> bool:
     """The query is a whole label or alias, or contains one ("green cube", "the green cube please"), not just part of one."""
     q = _words(text)
