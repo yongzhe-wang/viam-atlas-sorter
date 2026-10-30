@@ -384,6 +384,9 @@ def find_square(rgb: np.ndarray):
 FINGER_ROW = 600  # image rows below this always hold the fingers / held object (invalid depth)
 
 
+STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "arm_state.json"
+
+
 def pile_on() -> bool:
     """
     SORTER_PILE (default on): the square is never "full": objects go on top of each other, and nothing is cleared between.
