@@ -86,6 +86,7 @@ TOL_PX = 7.0
 # hangs into the bottom-right (it hid the hole twice on 2026-10-29); then one J^-1 step to the real target
 CARRY_OFFSET_PX = (-276.0, -232.0)
 GRAB_TRIES = 3  # first grab + 2 retries
+HOLD_DWELL_S = 0.4  # after a grab that holds: wait this long at the object, then grab again before the lift
 # Final approach is open loop: pose, yaw and identity are fixed at standoff (ALIGN_Z, ~350 mm depth: whole object
 # and valid depth in view), then one straight descent. The close-range servo (depth blind < ~280 mm, colour-only
 # tracking) followed parts of objects: the screwdriver's blue end cap, then the blue block (clips_sd2/sd3).
@@ -1494,6 +1495,15 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         times["at"] = "grab"
         grabbed = await rig.grab()
         print(f"  grab {attempt}/{GRAB_TRIES} returned", grabbed)
+        if grabbed:
+            # Stay at the object a moment, then squeeze again: the jaws settle on it before the lift pulls
+            # {USER 2026-10-30 "THE HOLD NEED TO BE TIGHTER WHEN YOU REACHT HE OBJKECT STAY FOR SOME TIME TO MAKE SURE FIRMLY GRAPS"}
+            # [CONFIDENCE: CONFIRMED 90% — user's instruction; the second grab's own answer is not used]
+            await asyncio.sleep(HOLD_DWELL_S)
+            try:
+                await rig.grab()
+            except Exception as e:  # the first grab holds; a failed re-squeeze changes nothing
+                print(f"  re-squeeze failed: {type(e).__name__}: {e}")
         p = await rig.pose()
         if grabbed:
             rig.picked_at = (p.x, p.y, rig.theta)

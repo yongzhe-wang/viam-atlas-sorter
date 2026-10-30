@@ -110,7 +110,7 @@ async def main():
 
     q = smooth.minjerk([0.0], [90.0], 10)
     assert abs(q[-1][0] - 90.0) < 1e-9 and q[0][0] < 1.0 and all(b[0] >= a[0] for a, b in zip(q, q[1:]))
-    assert abs(smooth.quintic_time(90.0) - max(1.875 * 90 / 150, (5.77 * 90 / 220) ** 0.5)) < 1e-9
+    assert abs(smooth.quintic_time(90.0) - max(1.875 * 90 / smooth.V_DEG_S, (5.77 * 90 / smooth.A_DEG_S2) ** 0.5)) < 1e-9
     print(f"4. quintic: 90 deg in {smooth.quintic_time(90.0):.2f} s, minimum-jerk samples monotonic")
 
     # The picture after a move: the camera's stamp decides, never longer than SETTLE_S, no stamp -> the old wait
