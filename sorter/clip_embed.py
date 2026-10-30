@@ -62,6 +62,18 @@ EXACT_NAME_BONUS = 0.05
 # [CONFIDENCE: SINGLE-SRC 60% — one frame, 6 objects; re-tune on the scanned set]
 MIN_SCORE = 0.22
 AMBIGUOUS_MARGIN = 0.02  # top-1 minus top-2 below this: let the user confirm in the dashboard
+# Open vocabulary: a query naming nothing in the library. The library may then only say what an object clearly is:
+# recognised as X, it is vetoed only if its crop is more like "a photo of a X" than like the query by OPEN_SET_DELTA
+# (a similar known object is often the nearest view, so "recognised as X" alone refused the blue block as "blue
+# cylinder"). Absolute CLIP scores do not separate right from wrong (right: median 0.372, wrong: 0.421), so the query
+# must also beat every generic prompt by OPEN_NEG_MARGIN. Tuned with each label held out of the library (65 cases):
+# true targets have s_X - s_query <= -0.015, other objects mostly >= 0.069; delta 0-0.02 gives the same result.
+# {USER VIA VIAM CENTERAL 2026-10-30 "EXPAND THIS TO OPEN VOCAB, SO THAT ANY OBJECT CAN BE GRASPED"}
+# {GRID "DELTA 0.01 NM 0.03: RIGHT 58 WRONG 1 REFUSED 6; ABSENT TUNE 0/0; HELD-OUT QUERIES 1/1"}
+# [CONFIDENCE: INFERRED 75% — held-out labels of the same 14 objects; no truly new object measured yet]
+OPEN_SET_DELTA = 0.01
+OPEN_NEG_MARGIN = 0.03
+OPEN_NEGATIVES = ("table", "wooden table", "piece of paper", "object", "thing on a table", "cable", "hand")
 
 _model = _preprocess = _tokenizer = None
 
@@ -269,17 +281,37 @@ def library_names(store) -> list:
     return store.list_labels()
 
 
-def rank(objs: list, text: str, store=None, recognised: list = None) -> list:
+def _known(text: str, store) -> bool:
+    """Does the query name something in the library (a label or alias, by word containment)?"""
+    return store is not None and any(name_matches(text, n) for n in library_names(store))
+
+
+def _names_exactly(text: str, store) -> bool:
+    """The query is a whole label or alias, or contains one ("green cube", "the green cube please"), not just part of one."""
+    q = _words(text)
+    return any(_words(name) and _words(name) <= q for names in library_names(store) for name in names)
+
+
+def _searchable(res: dict) -> dict:
+    """A refusal of a query the library partly knows: its own object of that kind may be in another view."""
+    return {**res, "searchable": res["obj"] is None}
+
+
+def rank(objs: list, text: str, store=None, recognised: list = None, known: bool = None) -> list:
     """
     [(Obj, score)] best first for a free-text description.
 
     score = CLIP(crop, "a photo of a {query}") + colour term + "long" term + library term.
-    Library term (store given): +LABEL_BONUS if the object is recognised as something the query names,
-    -LABEL_PENALTY if it is confidently recognised as something else. Sets obj.recognised / .recognised_names.
+    Library term (store given, query known to the library): +LABEL_BONUS if the object is recognised as something
+    the query names, -LABEL_PENALTY if it is confidently recognised as something else. An unknown query has no library
+    term: the library has no opinion on an object it never saw (best() applies the open-set gate instead).
+    Sets obj.recognised / .recognised_names / .open_gate ({"x_gap", "neg_gap"}, unknown queries only).
     `recognised`: recognise_all() output for these objects; their embeddings and labels are reused.
+    known: _known(text, store) if the caller already has it.
     """
     if not objs:
         return []
+    known = _known(text, store) if known is None else known
     q = clean_query(text)
     words = set(q.split())
     pre = {id(r["obj"]): r for r in recognised or []}
@@ -306,11 +338,14 @@ def rank(objs: list, text: str, store=None, recognised: list = None) -> list:
             else:
                 lab, names, _ = recognise(emb, store, colour=o.colour, height_mm=o.height_mm)
             o.recognised, o.recognised_names = lab, names
-            if lab is not None:
+            if known and lab is not None:
                 score += LABEL_BONUS if name_matches(q, names) else -LABEL_PENALTY
                 # Exact name beats a name that merely contains the query (see EXACT_NAME_BONUS)
                 if _words(q) and any(_words(q) == _words(n) for n in names):
                     score += EXACT_NAME_BONUS
+            elif not known:
+                o.open_gate = {"x_gap": float(emb @ _name_emb(lab)) - float(s) if lab else None,
+                               "neg_gap": float(s) - max(float(emb @ _name_emb(n)) for n in OPEN_NEGATIVES)}
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
 
@@ -332,8 +367,17 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
         # Partly visible (edge-cut) objects are never grasp candidates: their geometry is incomplete
         recognised = [r for r in recognised or [] if not r.get("partial")]
         objs = [r["obj"] for r in recognised]
-    known = store is not None and any(name_matches(text, n) for n in library_names(store))
-    r = rank(objs, text, store, recognised)
+    known = _known(text, store)
+    r = rank(objs, text, store, recognised, known=known)
+    # The query only overlaps a longer name ("utility knife" in "red utility knife", "cylinder") and nothing in view is
+    # recognised as such a name: it may be another object of that kind the library never saw, so the open-set gate decides
+    # instead of a flat "not recognised". A refusal stays searchable: the library's own one may be elsewhere.
+    # {OPENVOCAB "UTILITY KNIFE@081: REFUSED (NO 'UTILITY KNIFE' RECOGNISED ON THE TABLE)", SILVER KNIFE HELD OUT}
+    # [CONFIDENCE: CONFIRMED 80% — openvocab eval; exact names (every demo query) never take this path]
+    overlap_only = known and r and not _names_exactly(text, store) and not any(
+        o.recognised is not None and name_matches(text, o.recognised_names) for o, _ in r)
+    if overlap_only:
+        r = rank(objs, text, store, recognised, known=False)
     if not r:
         return {"obj": None, "score": 0.0, "margin": 0.0, "ambiguous": False, "reason": "no objects on the table",
                 "recognised": None, "searchable": known}
@@ -341,6 +385,9 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
     out = {"obj": None, "score": s, "margin": margin, "ambiguous": False, "reason": "", "recognised": o.recognised,
            "searchable": False}
     qcol = set(clean_query(text).split()) & COLOURS
+    if store is not None and (not known or overlap_only):
+        res = _best_open(r, text, qcol, out)
+        return _searchable(res) if known else res
     # The library knows this query ("candy" is an alias of the KIND bar): then only an object recognised as it
     # may be picked. Without this, "candy" with the bar out of view picked an unrecognised cup fragment.
     named = o.recognised is not None and name_matches(text, o.recognised_names)
@@ -358,3 +405,34 @@ def best(objs: list, text: str, store=None, recognised: list = None) -> dict:
         out.update(obj=o, ambiguous=margin < AMBIGUOUS_MARGIN)
     out["searchable"] = out["obj"] is None and known
     return out
+
+
+def _best_open(ranked: list, text: str, qcol: set, out: dict) -> dict:
+    """
+    best() for a query the library does not know: any object may be it, unless it is clearly something else.
+
+    Candidates: has the query's colour, not vetoed by the open-set test (OPEN_SET_DELTA), beats the generic prompts
+    (OPEN_NEG_MARGIN), at least MIN_SCORE. The margin to the next candidate (not to a vetoed object) sets "ambiguous".
+    A refusal is not searchable: nothing tells us the object exists at all.
+    """
+    cands = []
+    for o, s in ranked:
+        g = o.open_gate
+        vetoed = g["x_gap"] is not None and g["x_gap"] > OPEN_SET_DELTA
+        if (not qcol or colour_present(qcol, o)) and not vetoed and g["neg_gap"] >= OPEN_NEG_MARGIN and s >= MIN_SCORE:
+            cands.append((o, s))
+    if cands:
+        margin = cands[0][1] - cands[1][1] if len(cands) > 1 else 1.0
+        return {**out, "obj": cands[0][0], "score": cands[0][1], "margin": margin, "ambiguous": margin < AMBIGUOUS_MARGIN,
+                "recognised": cands[0][0].recognised}
+    # Why not: the reason of the highest-ranked object of the query's colour (or of the highest overall)
+    o, s = next(((o, s) for o, s in ranked if qcol and colour_present(qcol, o)), ranked[0])
+    if qcol and not colour_present(qcol, o):
+        reason = f"no {'/'.join(sorted(qcol))} object found"
+    elif o.open_gate["x_gap"] is not None and o.open_gate["x_gap"] > OPEN_SET_DELTA:
+        reason = f"best candidate is recognised as {o.recognised!r}"
+    elif o.open_gate["neg_gap"] < OPEN_NEG_MARGIN:
+        reason = f"nothing here looks like {clean_query(text)!r}"
+    else:
+        reason = f"best match only {s:.2f}"
+    return {**out, "reason": reason, "searchable": False}

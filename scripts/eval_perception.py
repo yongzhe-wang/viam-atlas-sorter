@@ -14,6 +14,7 @@ Usage (data in data/eval/, gitignored):
   eval_perception.py sweep                   AGENT1's high sweep frames (kind sweep_test): timing, map, queries
   eval_perception.py square                  drop square per frame (whole or border-cut) vs full-view truth
   eval_perception.py recog                   library recognition, leave-one-frame-out, per label + confusions
+  eval_perception.py openvocab               labels held out of the library, plus absent things; prints the gate
 Env for capture: VIAM_MACHINE_ADDRESS, VIAM_API_KEY_ID, VIAM_API_KEY.
 """
 import asyncio
@@ -278,6 +279,134 @@ def recog() -> None:
     print(f"recognition (leave-one-frame-out): {tot[0]}/{tot[1]} = {tot[0] / max(tot[1], 1):.1%}")
 
 
+# Open-vocabulary eval: a colourless noun per label (several labels may fit it, so its WRONG count is an upper bound)
+OPEN_NOUN = {"blue block": "block", "yellow block": "block", "yellow cylinder": "cylinder", "blue cylinder": "cylinder",
+             "green cylinder": "cylinder", "kind bar": "snack bar", "granola bar": "snack bar", "red screwdriver": "screwdriver",
+             "blue screwdriver": "screwdriver", "black tape": "tape", "green cube": "cube", "computer mouse": "mouse",
+             "red knife": "knife", "utility knife": "knife"}
+OPEN_ABSENT = ("banana", "red ball", "scissors", "mug")  # must be refused; the gate's thresholds were tuned on these
+OPEN_ABSENT_UNSEEN = ("apple", "spoon", "phone", "water bottle", "pencil", "orange", "hammer", "toothbrush")  # not tuned on
+
+
+def openvocab() -> None:
+    """
+    Open vocabulary, offline: treat each library label as an object the system has never seen.
+
+    For label L the library loses every view of L and of the test frame, then best() is asked for L on real arm-scan
+    frames: full name / colourless noun / no library at all. The right object is the one whose crop matches L's stored
+    view in that frame. Wrong picks are the dangerous outcome, refusals are only unhelpful. Then absent things are
+    asked for on the same frames, with the full library and with L held out (a really unknown object on the table).
+    GATE: full name right >= 55 of 65, WRONG <= 3, the tuned absent queries never picked.
+    """
+    import collections
+
+    scan = EVAL.parent / "scan"
+    rows = [json.loads(line) for line in (EVAL.parent / "views.jsonl").read_text().splitlines() if line.strip()]
+    rows = [r for r in rows if r.get("embedding")]
+    E = np.asarray([r["embedding"] for r in rows], float)
+    E /= np.linalg.norm(E, axis=1, keepdims=True)
+
+    class Lib:
+        """Store stand-in: the library without one label and without one frame's views."""
+
+        def __init__(self, label, frame):
+            self.keep = np.array([r["label"] != label and r.get("frame") != frame for r in rows])
+
+        def search_views(self, emb, k=8, label=None):
+            s = (1 + E @ (np.asarray(emb, float) / np.linalg.norm(emb))) / 2
+            s[~self.keep] = -1
+            return [{**{a: b for a, b in rows[i].items() if a != "embedding"}, "score": float(s[i])}
+                    for i in np.argsort(-s)[:k] if s[i] >= 0]
+
+        def list_labels(self):
+            seen = {}
+            for r, k in zip(rows, self.keep):
+                if k:
+                    seen.setdefault(r["label"], {r["label"]}).update(r.get("aliases") or [])
+            return [sorted(v) for v in seen.values()]
+
+    cases, frames = collections.defaultdict(list), {}
+    for i, r in enumerate(rows):
+        if str(r.get("frame", "")).isdigit() and (scan / f"{r['frame']}_depth.npy").exists():
+            cases[r["label"]].append(i)
+
+    def frame(fr):
+        if fr not in frames:
+            rgb = np.asarray(Image.open(scan / f"{fr}.jpg").convert("RGB"))
+            objs = perception.segment_full(rgb, np.load(scan / f"{fr}_depth.npy")).objects
+            frames[fr] = (objs, clip_embed.embed_images([o.crop for o in objs]) if objs else [])
+        return frames[fr]
+
+    def recs(objs, embs, lib):
+        """recognise_all() output for these objects under this library (the crops are embedded once per frame)."""
+        out = []
+        for o, e in zip(objs, embs):
+            lab, names, sc = clip_embed.recognise(e, lib, colour=o.colour, height_mm=o.height_mm)
+            out.append({"obj": o, "label": lab, "names": names, "score": sc, "emb": e})
+        return out
+
+    tally = {c: collections.Counter() for c in ("full name", "noun only", "no library")}
+    per, not_right, right_s, wrong_s, ambiguous = {}, [], [], [], collections.Counter()
+    absent = {"tuned": collections.Counter(), "unseen": collections.Counter()}
+    picks, asked = collections.Counter(), collections.Counter()
+    seen_full = set()
+    for label, idx in sorted(cases.items()):
+        step = max(1, len(idx) // 5)
+        for i in idx[::step][:5]:
+            fr = rows[i]["frame"]
+            objs, embs = frame(fr)
+            if not len(objs):
+                continue
+            match = embs @ E[i]
+            if match.max() < 0.97:  # segmentation differs from the scan's: cannot tell which object is the target
+                continue
+            target = objs[int(match.argmax())]
+            held = Lib(label, fr)
+            rh = recs(objs, embs, held)
+            for cond, q, st in (("full name", label, held), ("noun only", OPEN_NOUN.get(label, label), held), ("no library", label, None)):
+                b = clip_embed.best(objs, q, st, recognised=rh)
+                out = "refused" if b["obj"] is None else "right" if b["obj"] is target else "WRONG"
+                tally[cond][out] += 1
+                per.setdefault(label, {}).setdefault(cond, collections.Counter())[out] += 1
+                if cond == "full name":
+                    if out != "right":
+                        not_right.append(f"{label}@{fr}: {out}" + (f" ({b['reason']})" if b["reason"] else f" (picked {b['obj'].colour} h={b['obj'].height_mm:.0f})"))
+                    if b["obj"] is not None:
+                        (right_s if out == "right" else wrong_s).append(b["score"])
+                        ambiguous[(out, bool(b["ambiguous"]))] += 1
+            libs = [("held out", held, rh)]
+            if fr not in seen_full:  # the full-library condition once per frame
+                seen_full.add(fr)
+                full = Lib(None, fr)
+                libs.append(("full", full, recs(objs, embs, full)))
+            for name, lib, rr in libs:
+                for group, qs in (("tuned", OPEN_ABSENT), ("unseen", OPEN_ABSENT_UNSEEN)):
+                    for q in qs:
+                        b = clip_embed.best(objs, q, lib, recognised=rr)
+                        asked[(group, name)] += 1
+                        if b["obj"] is not None:
+                            absent[group][name] += 1
+                            picks[(q, name, b["obj"].colour, round(b["obj"].height_mm), fr)] += 1
+    for c, t in tally.items():
+        print(f"{c:11s} right {t['right']:3d}  WRONG {t['WRONG']:3d}  refused {t['refused']:3d}  of {t['right'] + t['WRONG'] + t['refused']}")
+    print("per label [right/WRONG/refused] full name | noun only | no library")
+    for lab, d in per.items():
+        print(f"  {lab:18s}", " | ".join(f"{d[c]['right']}/{d[c]['WRONG']}/{d[c]['refused']}" for c in tally))
+    print("full name, not right:", "; ".join(not_right) or "none")
+    print("full name picks by (outcome, ambiguous):", dict(ambiguous))
+    if right_s:
+        print(f"score when right: median {np.median(right_s):.3f} min {min(right_s):.3f}")
+    if wrong_s:
+        print(f"score when WRONG: median {np.median(wrong_s):.3f} max {max(wrong_s):.3f}")
+    for group in absent:
+        print(f"absent {group}: picked " + ", ".join(f"{absent[group][n]}/{asked[(group, n)]} ({n})" for n in ("full", "held out")))
+    if picks:
+        print("absent picks (query, library, picked colour, height, frame):", dict(picks))
+    t = tally["full name"]
+    ok = t["right"] >= 55 and t["WRONG"] <= 3 and not sum(absent["tuned"].values())
+    print(f"GATE {'PASS' if ok else 'FAIL'}: full name right {t['right']} >= 55, WRONG {t['WRONG']} <= 3, tuned absent picks {sum(absent['tuned'].values())} == 0")
+
+
 def square() -> None:
     """
     The drop square on every arm-scan frame that sees it: each view alone, and all views folded in time order.
@@ -345,6 +474,8 @@ if __name__ == "__main__":
         square()
     elif cmd == "recog":
         recog()
+    elif cmd == "openvocab":
+        openvocab()
     elif cmd == "report":
         # report [--store] [--absent "green square" ...]
         rest = sys.argv[2:]
