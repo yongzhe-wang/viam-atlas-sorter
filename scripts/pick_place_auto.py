@@ -95,6 +95,11 @@ SERVO_MODEL_J = True
 # A servo that has not converged by now will not: give up and let the caller retry from a fresh look. The black
 # tape's servo probed for 65.5 s before failing. {VIAM CENTERAL 2026-10-29 "BLOCK SERVO 最多 N 轮就 GIVE UP，在 10 S 内结束"}
 SERVO_MAX_S = 12.0
+# The error grew this many times over the last round (and past SERVO_LOST_MIN_PX): the finder is following something else.
+# The green block's refine went from a small error to 177 px on the next frame, moved after it and pushed the block onto a bag.
+# {VIAM CENTERAL 2026-10-30 "某一轮误差突然跳到 > 3 倍，就当作跟丢，停下来，不要朝那个方向移动去推东西"}
+SERVO_LOST_FACTOR = 3.0
+SERVO_LOST_MIN_PX = 40.0
 MODEL_STEP_CAP_MM = 200.0  # one model step may cross most of the view; goto() still enforces MAX_STEP_MM
 
 
@@ -935,6 +940,7 @@ class Rig:
         {VIAM CENTERAL 2026-10-30 "小于 (JAW 张开 − 物体宽度)/2 − 5 MM 就不再迭代"}
         """
         J, probing, prev = None, not SERVO_MODEL_J, None  # prev: error before an uncapped model step
+        last_err = None  # the previous round's error: a jump past SERVO_LOST_FACTOR of it is a lost target
         t_end = time.monotonic() + SERVO_MAX_S
         for it in range(8):
             if time.monotonic() > t_end:
@@ -957,6 +963,9 @@ class Rig:
             print(f"  {label} iter {it}: px=({hit[0]:.0f},{hit[1]:.0f}) want=({tu:.0f},{tv:.0f}) depth={plane:.0f} err={err:.0f}px")
             self.record(label, rgb, iter=it, px=[round(hit[0]), round(hit[1])], want=[round(tu), round(tv)],
                         err_px=round(err, 1), depth_mm=round(float(plane)))
+            if last_err is not None and err > max(SERVO_LOST_FACTOR * last_err, SERVO_LOST_MIN_PX):
+                raise RuntimeError(f"{label}: lost the target (error {last_err:.0f} -> {err:.0f} px): not moving after it")
+            last_err = err
             # A model step that did not cut the error to < 30% means the model is off here: probe instead
             if tol_mm is not None:
                 # Image u is the jaws' closing direction at any wrist angle: the camera turns with them
@@ -1009,7 +1018,13 @@ class Rig:
                 move *= cap / n
             # Only a full (uncapped) model step is expected to land; a capped one says nothing about the model
             prev = err if n <= cap else None
-            await self.goto(p.x + move[0], p.y + move[1], p.z)
+            nx, ny = p.x + move[0], p.y + move[1]
+            # Where the target leads must be a pose the arm may take: never chase it into the base or out of reach
+            if math.hypot(nx, ny) < 120.0:
+                raise TooClose(f"{label}: {too_close_msg(nx, ny)} (the refine would move the arm there)")
+            if not allowed(nx, ny) or math.hypot(nx, ny) > 650.0:
+                raise RuntimeError(f"{label}: the target leads out of reach, flange ({nx:.0f},{ny:.0f}): not following it")
+            await self.goto(nx, ny, p.z)
         raise RuntimeError(f"{label}: did not converge (8 iterations or {SERVO_MAX_S:.0f} s)")
 
     async def align_wrist(self, finder=find_block) -> bool:

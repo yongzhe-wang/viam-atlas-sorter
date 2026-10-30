@@ -1234,10 +1234,12 @@ def view_candidates(seg, delivered, excluded: list, text: str, store, recs: list
         print(f"  candidates failed: {e}")
         return []
     out = []
+    near = ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM
     for c in ranked:
         u, v, _ = grasp_px(c["obj"], pose, k)
         xy = perception.world_xy(pose, k, u, v, c["obj"].top_depth_mm)
-        if not near_any(xy, excluded, EXCLUDED_MM):
+        # Too close to the base to grasp: never a candidate to look at or go for {VIAM CENTERAL "并且可达（>= REACH）"}
+        if math.hypot(*xy) >= near and not near_any(xy, excluded, EXCLUDED_MM):
             out.append({"xy": (float(xy[0]), float(xy[1])), "score": float(c["score"]), "why": c.get("why")})
     return out
 
