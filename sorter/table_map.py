@@ -220,7 +220,8 @@ def _same_pose(a: dict, b: dict) -> bool:
 
 DEPTH_CELL_PX = 16  # negative evidence reads depth validity per 16x16 px cell, kept in every observation
 # Fields apply_observation() reads from a record (observe_frame() writes all of them)
-REC_KEYS = ("ts", "source", "pose", "intr", "shape", "table_depth_mm", "detections", "square", "intruders", "depth_valid")
+# ("square" may be absent: a None field is dropped when a record comes back through a Viam Struct, AGENT 2 c1e51c2)
+REC_KEYS = ("ts", "source", "pose", "intr", "shape", "table_depth_mm", "detections", "intruders", "depth_valid")
 
 
 def _valid_grid(depth: np.ndarray) -> dict:
@@ -234,8 +235,9 @@ def _valid_grid(depth: np.ndarray) -> dict:
 def _grid(rec: dict) -> np.ndarray:
     """The observation's depth-validity grid back as a bool array (rows x cols)."""
     g = rec["depth_valid"]
+    rows, cols = int(g["rows"]), int(g["cols"])  # ints come back as floats through a Viam Struct (DoCommand export)
     bits = np.unpackbits(np.frombuffer(base64.b64decode(g["bits"]), np.uint8))
-    return bits[:g["rows"] * g["cols"]].reshape(g["rows"], g["cols"]).astype(bool)
+    return bits[:rows * cols].reshape(rows, cols).astype(bool)
 
 
 def _expected_visible(e: dict, rec: dict, grid: np.ndarray, xy=None) -> bool:
@@ -325,7 +327,9 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
     touched = set()
 
     def det(d):
-        return {**d, "emb": np.frombuffer(base64.b64decode(d["emb16"]), np.float16).astype(np.float32)}
+        # Defaults for fields a Viam Struct round trip drops when None/empty (an unrecognised object has no label)
+        return {"label": None, "names": [], "colours": {}, "partial": False, **d,
+                "emb": np.frombuffer(base64.b64decode(d["emb16"]), np.float16).astype(np.float32)}
 
     def new_entry(d, partial):
         e = {"id": tmap["next_id"], "label": d["label"], "names": list(d["names"]), "xy": list(d["xy"]), "n_seen": 0,
@@ -341,7 +345,7 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
         e["frame_ids"] = (e["frame_ids"] + [source + "@" + str(round(now, 1))])[-20:]
         touched.add(e["id"])
 
-    for d in (det(d) for d in rec["detections"] if not d["partial"]):
+    for d in (det(d) for d in rec["detections"] if not d.get("partial")):
         e = next((e for e in objs if e["id"] not in touched
                   and _same(d, {**e, "emb": None if e["emb"] is None else np.asarray(e["emb"])})), None)
         if e is None and d["label"] and d["score"] >= MOVE_CONF:
@@ -371,7 +375,7 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
     # - an entry nearby: still there (reset misses, no xy update)
     # - recognised, and the label has no entry, or its entry should be visible here but is not: the object moved
     #   to this edge spot; keep it as a "partial" entry (approximate xy) so the executor knows where to look
-    for d in (det(d) for d in rec["detections"] if d["partial"]):
+    for d in (det(d) for d in rec["detections"] if d.get("partial")):
         e = next((e for e in objs if e["id"] not in touched and math.dist(e["xy"], d["xy"]) <= 1.5 * MERGE_XY_MM
                   and abs(e["height_mm"] - d["height_mm"]) <= MERGE_DH_MM
                   and (not d["label"] or not e["label"] or e["label"] == d["label"])), None)
@@ -398,7 +402,7 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
         dropped = [e for e in objs if e.get("misses", 0) >= MISSES_TO_DROP]
         tmap["objects"] = [e for e in objs if e.get("misses", 0) < MISSES_TO_DROP]
 
-    obs, sq = rec["square"], tmap.get("square")
+    obs, sq = rec.get("square"), tmap.get("square")
     if obs and "hull_xy" in obs:
         # Every view of the square, whole or border-cut, refines one rectangle (drop_square: sides, yaw, size)
         new = drop_square.update(sq, obs, now)
@@ -414,11 +418,12 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
     _mark_in_square(tmap)
     tmap["ts"] = now
     # detections without their embeddings, for the dashboard (AGENT 2); the full record is the observation itself
-    light = [{k: v for k, v in d.items() if k != "emb16"} for d in rec["detections"]]
+    light = [{k: v for k, v in {"label": None, "names": [], "colours": {}, "partial": False, **d}.items() if k != "emb16"}
+             for d in rec["detections"]]  # same defaults as det(): a round-tripped record shows the same last_update
     tmap["last_update"] = {"ts": now, "pose": dict(pose), "source": source, "skipped": False,
                            "ms": round((time.perf_counter() - t0) * 1000), "detected": len(rec["detections"]),
                            "dropped": [e["label"] or f"unknown#{e['id']}" for e in dropped],
-                           "hand_in_view": hand, "detections": light, "square": rec["square"],
+                           "hand_in_view": hand, "detections": light, "square": rec.get("square"),
                            "intruders": rec["intruders"]}
     return tmap
 

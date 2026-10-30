@@ -88,6 +88,25 @@ def test_replay_equals_live():
     assert _core(TM.rebuild_map(log, since_ts=1002.0)) == _core(TM.fold_observations(log[1:]))
 
 
+def test_replay_after_struct_round_trip():
+    # Records exported through a Viam DoCommand lose None fields and get floats for ints (AGENT 2 c1e51c2 / e3606e0)
+    def struct(x):
+        if isinstance(x, dict):
+            return {k: struct(v) for k, v in x.items() if v is not None}
+        if isinstance(x, list):
+            return [struct(v) for v in x]
+        return float(x) if isinstance(x, int) and not isinstance(x, bool) else x
+
+    live, log = TM.empty_map(), []
+    for i, u0 in enumerate((600, 900)):
+        rgb, depth = frame(u0)
+        recs, seg = recognised(rgb, depth, label=None if i else "green cube")  # one unrecognised: label None
+        live = TM.update_map(live, rgb, depth, POSE, recognised=recs, seg=seg, now=1000.0 + 2 * i)
+        log.append(struct(json.loads(json.dumps(live["last_update"]["observation"]))))
+    assert "square" not in log[0] and "label" not in log[1]["detections"][0]
+    assert _core(TM.fold_observations(log)) == _core(live)
+
+
 def test_light_record_refused():
     live = update(None)
     rec = {k: v for k, v in live["last_update"]["observation"].items() if k != "depth_valid"}
