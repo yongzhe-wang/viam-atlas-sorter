@@ -241,7 +241,9 @@ def record_sightings(store, recs: list, pose: dict, intr: dict = None, source: s
         if r["label"] is None or r["score"] < SIGHTING_MIN_CONF:
             continue
         o = r["obj"]
-        xy = perception.world_xy(pose, intr or perception.INTRINSICS, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+        from sorter import camera_model
+
+        xy = camera_model.world_xy_full(pose, intr or perception.INTRINSICS, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
         store.log_sighting({"label": r["label"], "xy": [round(xy[0], 1), round(xy[1], 1)],
                             "height_mm": round(o.height_mm, 1), "conf": round(r["score"], 3), "source": source,
                             "pose": {k: pose[k] for k in ("x", "y", "z", "theta") if k in pose}, "ts": time.time()})

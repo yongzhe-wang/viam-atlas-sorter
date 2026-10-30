@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
-from sorter import bucket, clip_embed, drop_square, perception
+from sorter import bucket, camera_model, clip_embed, drop_square, perception
 
 MERGE_XY_MM = 40.0  # two sightings this close on the table can be the same object
 MERGE_DH_MM = 15.0  # ... if their heights agree
@@ -44,7 +44,7 @@ def _detections(frames: list, store) -> tuple:
             squares.append({**drop_square.observe(sq, f["pose"], intr), "frame": f["id"]})
         for r in clip_embed.recognise_all(f["rgb"], f["depth"], store):
             o = r["obj"]
-            xy = perception.world_xy(f["pose"], intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+            xy = camera_model.world_xy_full(f["pose"], intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
             mm_px = o.top_depth_mm / intr["fx"]
             out.append({"label": r["label"], "names": r["names"], "xy": xy, "height_mm": o.height_mm,
                         "score": r["score"], "colour": o.colour, "colours": dict(getattr(o, "colours", {}) or {}),
@@ -255,11 +255,19 @@ def _expected_visible(e: dict, rec: dict, grid: np.ndarray, xy=None) -> bool:
     cx, cy = xy or e["xy"]
     r = 0.5 * max(e.get("size_mm") or [0.0, 0.0])
     m = FOOT_MARGIN_PX
+    tilted = camera_model.is_tilted(pose)
+
+    def px_of(x, y):
+        # Straight down: the camera distance of the top is the table's minus the height. Tilted: project the 3-D point.
+        if tilted:
+            return camera_model.project(pose, intr, (x, y, e.get("height_mm", 0.0)))[:2]
+        return perception.project_xy(pose, intr, (x, y), z)
+
     for px, py in ((cx, cy), (cx - r, cy - r), (cx - r, cy + r), (cx + r, cy - r), (cx + r, cy + r)):
-        pu, pv = perception.project_xy(pose, intr, (px, py), z)
+        pu, pv = px_of(px, py)
         if not (m <= pu < W - m and m <= pv < H - m):
             return False
-    u, v = perception.project_xy(pose, intr, (cx, cy), z)
+    u, v = px_of(cx, cy)
     if any(u0 <= u < u1 and v0 <= v < v1 for u0, v0, u1, v1 in perception.FINGER_BOXES):
         return False
     row, col = int(v) // DEPTH_CELL_PX, int(u) // DEPTH_CELL_PX
@@ -282,13 +290,13 @@ def observe_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = N
     {hull_xy, real, cut, partial, xy, size_mm} | None, intruders: [bbox], depth_valid}.
     """
     intr = {**perception.INTRINSICS, **(intr or {})}
-    seg = seg if seg is not None else perception.segment_full(rgb, depth)
+    seg = seg if seg is not None else perception.segment_full(rgb, depth, pose=pose, intr=intr)
     recs = recognised if recognised is not None else clip_embed.recognise_all(rgb, depth, store, seg=seg,
                                                                                include_partial=True)
     dets = []
     for r in recs:
         o = r["obj"]
-        xy = perception.world_xy(pose, intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+        xy = camera_model.world_xy_full(pose, intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
         mm_px = o.top_depth_mm / intr["fx"]
         dets.append({"label": r["label"], "names": list(r["names"]), "score": round(float(r["score"]), 4),
                      "xy": [round(float(xy[0]), 2), round(float(xy[1]), 2)], "height_mm": round(float(o.height_mm), 2),
@@ -305,7 +313,7 @@ def observe_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = N
         cu, cv = seg.bucket["center_px"]
         bk = bucket.locate(seg.bucket, depth.astype(float), float(a * cu + b * cv + c), pose, intr)
     return {"ts": float(time.time() if now is None else now), "source": source,
-            "pose": {k: float(pose[k]) for k in ("x", "y", "z", "theta") if k in pose},
+            "pose": {k: float(pose[k]) for k in ("x", "y", "z", "o_x", "o_y", "o_z", "theta") if k in pose},  # o_*: tilted wrist
             "intr": {k: float(intr[k]) for k in ("fx", "fy", "cx", "cy")},
             "shape": [int(depth.shape[0]), int(depth.shape[1])], "table_depth_mm": round(float(seg.table_depth_mm), 2),
             "detections": dets, "square": square, "bucket": bk, "intruders": [[int(c) for c in i["bbox"]] for i in seg.intruders],

@@ -116,8 +116,6 @@ def locate(hit: dict, depth: np.ndarray, table_depth_mm: float, pose: dict, intr
     then it is the table's depth minus the known rim height. xy is at that depth: at table depth the same pixels would be ~50%
     further from the camera axis.
     """
-    from sorter import perception
-
     if hit.get("center_px") is None:
         return None  # no circle fitted (tilted view): cut out, but not located
     cu, cv, r = *hit["center_px"], hit["radius_px"]
@@ -130,14 +128,43 @@ def locate(hit: dict, depth: np.ndarray, table_depth_mm: float, pose: dict, intr
         near = float(np.percentile(ring, 20))
         if 100.0 <= table_depth_mm - near <= 260.0:
             rim_height, measured = table_depth_mm - near, True
+    from sorter import camera_model
+
+    if camera_model.is_tilted(pose):
+        # Tilted: the rim's own points in world coordinates, a circle through them (three 25-degree views agreed within
+        # 5 mm with the straight-down centre). {TILT "(330.7, 17.0) (334.8, 15.5) (329.9, 20.3)" VS "(335.4, 17.8)"}
+        return _locate_tilted(hit, depth, pose, intr)
     rim_depth = table_depth_mm - rim_height
     radius = r * rim_depth / float(intr["fx"])
     if not RADIUS_RANGE_MM[0] <= radius <= RADIUS_RANGE_MM[1]:
         return None
-    xy = perception.world_xy(pose, intr, cu, cv, rim_depth)
+    xy = camera_model.world_xy_full(pose, intr, cu, cv, rim_depth)
     return {"xy": [round(float(xy[0]), 1), round(float(xy[1]), 1)], "radius_mm": round(float(radius), 1),
             "rim_height_mm": round(float(rim_height), 1), "partial": bool(hit["arc"] < ARC_FULL),
             "confidence": round(float(hit["arc"] * hit["inliers"]) * (1.0 if measured else 0.9), 2)}
+
+
+def _locate_tilted(hit: dict, depth: np.ndarray, pose: dict, intr: dict) -> dict:
+    """locate() for a tilted wrist: orange pixels with depth that stand at rim height, a circle fitted to them on the table."""
+    from sorter import camera_model
+
+    H, W = depth.shape
+    vv, uu = np.mgrid[0:H:4, 0:W:4]
+    sel = hit["mask"][::4, ::4] & (depth[::4, ::4] > 0)
+    if sel.sum() < 30:
+        return None
+    pts = camera_model.camera_to_world(pose, intr, uu[sel], vv[sel], depth[::4, ::4][sel])
+    rim = pts[pts[:, 2] > 0.6 * RIM_HEIGHT_MM]
+    if len(rim) < 30:
+        return None
+    A = np.column_stack([2 * rim[:, 0], 2 * rim[:, 1], np.ones(len(rim))])
+    sol, *_ = np.linalg.lstsq(A, (rim[:, :2] ** 2).sum(1), rcond=None)
+    radius = math.sqrt(max(sol[2] + sol[0] ** 2 + sol[1] ** 2, 1.0))
+    if not RADIUS_RANGE_MM[0] <= radius <= RADIUS_RANGE_MM[1]:
+        return None
+    return {"xy": [round(float(sol[0]), 1), round(float(sol[1]), 1)], "radius_mm": round(radius, 1),
+            "rim_height_mm": round(float(np.median(rim[:, 2])), 1), "partial": bool(hit["arc"] < ARC_FULL),
+            "confidence": round(float(hit["arc"] * hit["inliers"]) * 0.9, 2)}
 
 
 def find_bucket(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict) -> dict:

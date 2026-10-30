@@ -105,3 +105,32 @@ def visible_cells(depth: np.ndarray, pose_full, intr: dict, table_plane=None, ce
         cells, counts = np.unique(np.stack([ix[sel], iy[sel]], axis=1), axis=0, return_counts=True) if sel.any() else (np.zeros((0, 2), int), np.zeros(0))
         out[name] = [[int(a), int(b)] for (a, b), n in zip(cells, counts) if n >= min_hits]
     return out
+
+
+def is_tilted(pose_full) -> bool:
+    """Not looking straight down (an orientation vector given and not (0, 0, -1)): only then do these differ from perception's."""
+    p = _pose(pose_full)
+    return math.hypot(p["o_x"], p["o_y"]) > 1e-3
+
+
+def project(pose_full, intr: dict, xyz) -> tuple:
+    """(u, v, depth) where the world point xyz appears: the inverse of camera_to_world (depth along the optical axis)."""
+    p = _pose(pose_full)
+    R = tool_rotation(p)
+    centre = np.array([p["x"] - perception.TOOL_AXIS_MM[0], p["y"] - perception.TOOL_AXIS_MM[1], p["z"]])
+    cam = _R_CT.T @ (R.T @ (np.asarray(xyz, float) - centre) - _T_CAM)
+    return float(intr["fx"] * cam[0] / cam[2] + intr["cx"]), float(intr["fy"] * cam[1] / cam[2] + intr["cy"]), float(cam[2])
+
+
+# The arm's own base seen from a tilted wrist is a tall blob, an "intruder" that pauses the arm. A blob whose points lie
+# mostly within ARM_BASE_RADIUS_MM of the base (the arm frame's origin) is the arm itself. {VIAM CENTERAL 2026-10-30 "离 (0,0)
+# ≤ 180 MM … 算 ARM 自己，不算手"; TILT_Y+ "BLOB 165 MM TALL" AT THE BOTTOM LEFT} [CONFIDENCE: CONFIRMED 75% — that frame]
+ARM_BASE_RADIUS_MM = 180.0
+
+
+def arm_part(pose_full, intr: dict, us: np.ndarray, vs: np.ndarray, depths: np.ndarray) -> bool:
+    """Do most of these pixels (with their depths) lie on the arm's base?"""
+    if len(us) == 0:
+        return False
+    pts = camera_to_world(pose_full, intr, us, vs, depths)
+    return bool((np.hypot(pts[..., 0], pts[..., 1]) <= ARM_BASE_RADIUS_MM).mean() >= 0.5)

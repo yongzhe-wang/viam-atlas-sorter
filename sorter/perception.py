@@ -225,6 +225,16 @@ def fit_table_3d(depth: np.ndarray, intr: dict = None) -> tuple:
     return n, k, height, (float(a), float(b), float(c))
 
 
+def _on_arm(sd: tuple, m_d: np.ndarray, d: np.ndarray, pose: dict, intr: dict) -> bool:
+    """A blob (depth-grid slice and mask) whose valid pixels mostly lie on the arm's base, sampled to at most ~400 pixels."""
+    from sorter import camera_model
+
+    vs, us = np.nonzero(m_d & (d[sd] > 0))
+    step = max(1, len(vs) // 400)
+    vs, us = vs[::step] + sd[0].start, us[::step] + sd[1].start
+    return camera_model.arm_part(pose, intr or INTRINSICS, us, vs, d[vs, us])
+
+
 def to_depth_grid(mask: np.ndarray, model: tuple = None) -> np.ndarray:
     """A colour-grid mask on the depth grid (aligned: the same pixels; unaligned: its inverse mapping, a little dilated)."""
     if model is None or model == IDENTITY:
@@ -393,11 +403,13 @@ def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple, scale: floa
     return out
 
 
-def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation:
+def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None, pose: dict = None, intr: dict = None) -> Segmentation:
     """
     Objects, intruders and table depth from one colour + depth frame (both 1280x720).
 
     `align`: depth -> colour model; None = IDENTITY (align_color_depth on), checked once per process.
+    `pose` (with o_x/o_y/o_z when the wrist is tilted) and `intr`: given for a tilted view, a tall blob on the arm's own base
+    is not an intruder (camera_model.arm_part). Without a pose, or looking straight down, nothing changes.
     """
     d = depth.astype(float)
     valid = (d > 0) & (d < 2000)
@@ -414,6 +426,8 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         valid_for_intruders = valid | cut
         valid = valid & ~cut
     near_bucket = ndimage.binary_dilation(bk["mask"], iterations=BUCKET_NEAR_PX) if bk is not None else None
+    from sorter import camera_model  # (imports perception: not at module level)
+    tilted = pose is not None and camera_model.is_tilted(pose)
     a, b, c = fit_table(d)
     vv, uu = np.mgrid[0:d.shape[0], 0:d.shape[1]]
     if _linear_fit_share(d, (a, b, c)) < TILT_FIT_SHARE:
@@ -470,6 +484,8 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
             # The bucket's handle (a black wire loop standing up) and its shaded wall (reads as skin) are the bucket, not a hand
             # {AFTER_BB "BLOB 86 MM TALL, SKIN 64%" = HANDLE + WALL BESIDE THE CUT} [CONFIDENCE: CONFIRMED 80% — three frames]
             if near_bucket is not None and near_bucket[sc][m_s].mean() >= BUCKET_PART_SHARE:
+                continue
+            if tilted and _on_arm(sd, m_d, d, pose, intr):
                 continue
             # Never a target; an intruder only if it reaches into the workspace (else static scenery)
             if _reaches_inside(bbox, (H, W)):

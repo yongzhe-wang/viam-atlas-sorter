@@ -44,7 +44,9 @@ def observe(hit: dict, pose: dict, intr: dict) -> dict:
     find_drop_square() hit -> the observation record's square: the hole's hull in table xy and which hull edges are
     tape (real) rather than the image border. xy / size_mm / partial / cut describe the visible part (display only).
     """
-    hull = [perception.world_xy(pose, intr, u, v, d) for u, v, d in hit["hull_px"]]
+    from sorter import camera_model  # (imports perception, which this module's callers import first)
+
+    hull = [camera_model.world_xy_full(pose, intr, u, v, d) for u, v, d in hit["hull_px"]]
     xs, ys = [p[0] for p in hull], [p[1] for p in hull]
     return {"hull_xy": [[round(float(x), 2), round(float(y), 2)] for x, y in hull],
             "real": [not c for c in hit["hull_cut"]], "cut": list(hit.get("cut", [])), "partial": bool(hit.get("partial")),
