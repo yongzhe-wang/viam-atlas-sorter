@@ -13,6 +13,7 @@ Usage (data in data/eval/, gitignored):
   eval_perception.py demo                    rehearsal queries (docs/demo_queries.md) on arm-scan frames
   eval_perception.py sweep                   AGENT1's high sweep frames (kind sweep_test): timing, map, queries
   eval_perception.py square                  drop square per frame (whole or border-cut) vs full-view truth
+  eval_perception.py recog                   library recognition, leave-one-frame-out, per label + confusions
 Env for capture: VIAM_MACHINE_ADDRESS, VIAM_API_KEY_ID, VIAM_API_KEY.
 """
 import asyncio
@@ -234,6 +235,48 @@ def report(use_store: bool, absent: list) -> None:
         print(f"top-1 ({m}): {hits[m]}/{n_q} = {hits[m] / max(n_q, 1):.0%}")
 
 
+def recog() -> None:
+    """
+    Library recognition, leave-one-frame-out: every view with a frame is recognised (clip_embed.recognise, the real
+    colour / height rules) against the views of all other frames. Prints accuracy per label and the confusions.
+
+    WHY: the height filter decides which labels can win at all (a lying cylinder is 30 mm tall, a standing one 60),
+    so any change to it is checked here on every labelled sighting, not only on the demo queries.
+    """
+    rows = [json.loads(line) for line in (EVAL.parent / "views.jsonl").read_text().splitlines() if line.strip()]
+    rows = [r for r in rows if r.get("embedding")]
+    E = np.asarray([r["embedding"] for r in rows], float)
+    E /= np.linalg.norm(E, axis=1, keepdims=True)
+
+    class _Others:
+        """search_views over the views of other frames only (Store scale: (1 + cos) / 2)."""
+
+        def __init__(self, frame):
+            self.keep = np.array([r.get("frame") != frame for r in rows])
+
+        def search_views(self, emb, k=8, label=None):
+            s = (1 + E @ (np.asarray(emb, float) / np.linalg.norm(emb))) / 2
+            s[~self.keep] = -1
+            return [{**{k2: v for k2, v in rows[i].items() if k2 != "embedding"}, "score": float(s[i])}
+                    for i in np.argsort(-s)[:k] if s[i] >= 0]
+
+    per, wrong = {}, {}
+    for i, r in enumerate(rows):
+        if not r.get("frame"):
+            continue
+        lab, _, _ = clip_embed.recognise(E[i], _Others(r["frame"]), colour=r.get("colour"), height_mm=r.get("height_mm"))
+        ok = per.setdefault(r["label"], [0, 0])
+        ok[0] += lab == r["label"]
+        ok[1] += 1
+        if lab != r["label"]:
+            wrong[(r["label"], lab)] = wrong.get((r["label"], lab), 0) + 1
+    tot = [sum(v[0] for v in per.values()), sum(v[1] for v in per.values())]
+    for lab, (a, n) in sorted(per.items()):
+        print(f"  {lab:18s} {a:3d}/{n:<3d}")
+    print("  confusions:", ", ".join(f"{a} -> {b}: {n}" for (a, b), n in sorted(wrong.items(), key=lambda t: -t[1])) or "none")
+    print(f"recognition (leave-one-frame-out): {tot[0]}/{tot[1]} = {tot[0] / max(tot[1], 1):.1%}")
+
+
 def square() -> None:
     """
     The drop square on every arm-scan frame that sees it: each view alone, and all views folded in time order.
@@ -299,6 +342,8 @@ if __name__ == "__main__":
         sweep()
     elif cmd == "square":
         square()
+    elif cmd == "recog":
+        recog()
     elif cmd == "report":
         # report [--store] [--absent "green square" ...]
         rest = sys.argv[2:]

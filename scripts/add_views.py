@@ -8,6 +8,8 @@ by height and called "green cube" or nothing on sfhack4. Views of the new pose c
                         colour and table xy; an optional "jpeg_b64" per record gives the view a thumbnail
   --frames DIR          module idle frames (data/camera/module_frame.jpg + .json copies): the crop is cut from the
                         <= 640 px jpeg by its box and embedded here; height and colour come from the .json
+  --npz DIR             full frames with depth (*.npz: rgb, depth, pose [x, y, z, theta], intr [fx, fy, cx, cy]),
+                        segmented here exactly like the arm scan (same crop, height, colour, rect_fill, table xy)
 Detections are picked by table xy (--near X,Y within --radius; frames: by --box-colour only), colour and a height
 range; aliases are copied from the label's existing views. A detection already added is skipped (data/scan/
 added_views.json), so re-running never duplicates. --dry-run lists what would be added.
@@ -83,6 +85,27 @@ def from_frames(folder: Path, a) -> list:
     return [(key, e, _jpeg(c), m) for (key, c, m), e in zip(items, embs)]
 
 
+def from_npz(folder: Path, a) -> list:
+    """[(key, embedding, jpeg, meta)] for the matching whole objects of saved depth frames (segmented and embedded here)."""
+    items = []
+    for f in sorted(folder.glob("*.npz")):
+        z = np.load(f, allow_pickle=False)
+        pose = dict(zip(("x", "y", "z", "theta"), (float(v) for v in z["pose"])))
+        intr = dict(zip(("fx", "fy", "cx", "cy"), (float(v) for v in z["intr"])))
+        for o in perception.segment_full(z["rgb"], z["depth"]).objects:  # edge-cut objects are excluded there
+            xy = perception.world_xy(pose, intr, *(o.top_centroid_px or o.centroid_px), o.top_depth_mm)
+            if not _wanted(xy, o.colour, o.height_mm, a):
+                continue
+            mm = o.top_depth_mm / intr["fx"]
+            items.append((f"npz:{f.stem}:{o.id}", o.crop,
+                          {"source": "npz", "frame": f.stem, "pose": pose, "colour": o.colour,
+                           "height_mm": round(float(o.height_mm), 1), "rect_fill": round(float(o.rect_fill), 3),
+                           "xy": [round(float(xy[0]), 1), round(float(xy[1]), 1)],
+                           "size_mm": [round(o.length_px * mm, 1), round(o.width_px * mm, 1)]}))
+    embs = clip_embed.embed_images([c for _, c, _ in items]) if items else []
+    return [(key, e, _jpeg(c), m) for (key, c, m), e in zip(items, embs)]
+
+
 def _wanted(xy, colour, h, a) -> bool:
     if a.colour and not clip_embed.colour_ok({a.colour}, colour):
         return False
@@ -96,13 +119,15 @@ if __name__ == "__main__":
     ap.add_argument("--label", required=True, help="library label, e.g. 'green cylinder' (aliases copied from it)")
     ap.add_argument("--observations", type=Path)
     ap.add_argument("--frames", type=Path)
+    ap.add_argument("--npz", type=Path)
     ap.add_argument("--near", type=lambda s: tuple(float(x) for x in s.split(",")))
     ap.add_argument("--radius", type=float, default=40.0)
     ap.add_argument("--colour")
     ap.add_argument("--h", type=lambda s: tuple(float(x) for x in s.split(",")), help="height range mm, e.g. 20,40")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
-    found = (from_observations(a.observations, a) if a.observations else []) + (from_frames(a.frames, a) if a.frames else [])
+    found = ((from_observations(a.observations, a) if a.observations else []) + (from_frames(a.frames, a) if a.frames else [])
+             + (from_npz(a.npz, a) if a.npz else []))
     done = json.loads(DONE.read_text()) if DONE.exists() else {}
     new = [f for f in found if f[0] not in done]
     store = Store()

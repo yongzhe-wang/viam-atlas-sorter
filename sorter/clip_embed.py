@@ -41,6 +41,12 @@ SHAPE_BONUS = 0.02  # "long"/"stick" vs footprint aspect; the only shape cue tha
 # [CONFIDENCE: CONFIRMED 75% — 10 clean groups, 100 sightings; see label_scan held-out test]
 KNN_MIN = 0.88  # a view at least this close counts as "same object"
 VIEW_DH_MM = 15.0  # ... and its height within this of the object's
+# Objects that rest in two poses: a cylinder is ~30 mm tall lying (its diameter) and 59-61 mm standing (its length).
+# A view of these labels also admits an object at the other pose's height: the green cylinder slid off during a
+# carry, lay at 30 mm and every standing view (60-62 mm) was filtered out, leaving only the green cube's (29-33 mm).
+# {VIAM CENTERAL 2026-10-29 "CYLINDER 类同时接受直径高度和长度高度（29 和 61 MM 都算）"; LYING NPZ "GREEN H= 30.4 … 61X28MM";
+#  STANDING FOOTPRINT 076 "BLUE H=62 FOOTPRINT 31X28 MM"} [CONFIDENCE: CONFIRMED 80% — eval_perception recog/demo]
+POSE_HEIGHTS_MM = {"green cylinder": (30.0, 61.0), "yellow cylinder": (30.0, 59.0), "blue cylinder": (30.0, 61.0)}
 # Vote weight by view source: phone close-ups are oblique, the wrist camera looks straight down
 SOURCE_WEIGHT = {"phone": 0.5}
 LABEL_BONUS = 0.15  # object recognised as something the query names
@@ -158,7 +164,8 @@ def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm:
 
     Views closer than KNN_MIN vote with their score (phone views at reduced weight), but only if their stored
     colour and height (when present) agree with the object's: CLIP alone confuses same-shape objects of a
-    different colour or height. names = the winning label plus every alias seen.
+    different colour or height. A label with two resting poses (POSE_HEIGHTS_MM) accepts either pose's height.
+    names = the winning label plus every alias seen.
     """
     votes, names = {}, {}
     for v in store.search_views(emb, k=k):
@@ -166,7 +173,8 @@ def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm:
             continue
         if colour and v.get("colour") and not (colour_ok({colour}, v["colour"]) or colour_ok({v["colour"]}, colour)):
             continue
-        if height_mm is not None and v.get("height_mm") is not None and abs(v["height_mm"] - height_mm) > VIEW_DH_MM:
+        if height_mm is not None and v.get("height_mm") is not None and not any(
+                abs(h - height_mm) <= VIEW_DH_MM for h in (v["height_mm"], *POSE_HEIGHTS_MM.get(v["label"], ()))):
             continue
         votes[v["label"]] = votes.get(v["label"], 0.0) + v["score"] * SOURCE_WEIGHT.get(v.get("source"), 1.0)
         names.setdefault(v["label"], {v["label"]}).update(v.get("aliases") or [])

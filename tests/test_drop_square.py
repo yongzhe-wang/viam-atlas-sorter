@@ -129,6 +129,26 @@ def test_objects_on_and_across_the_tape():
     assert cut and cut.get("partial") and cut["cut"] == ["top"], cut and cut.get("cut")
 
 
+def test_cable_and_fenced_patch():
+    # The robot's cable in front of the lens crosses the square: dark, and depth sees the table behind it
+    # {SQUARE_CENTERED.NPZ "PX (500,300) V=27 DEPTH=375"}; and a bright patch fenced by dark objects, no tape, is no square
+    from sorter import perception as P
+
+    rgb, d = scene()
+    for k in range(-30, 31):  # 60 px dark band from the top-left table corner through the interior's corner
+        for t in range(0, 700):
+            u, v = 250 + t + k, -100 + t
+            if 0 <= v < 720 and 0 <= u < 1280:
+                rgb[v, u] = (20, 22, 25)
+    hit = P.find_drop_square(rgb, d)
+    assert hit is not None, "the cable must not hide the square"
+    rgb2, d2 = np.zeros((720, 1280, 3), np.uint8), np.full((720, 1280), 380, np.uint16)
+    rgb2[:] = (150, 110, 70)
+    rgb2[200:560, 400:880] = (20, 22, 25)  # dark frame (an object) ...
+    rgb2[260:500, 460:820] = (225, 230, 235)  # ... around a bright patch
+    assert P.find_drop_square(rgb2, d2) is None
+
+
 def test_legacy_entry():
     old = {"xy": [369.9, 84.0], "size_mm": [114.0, 175.0], "partial": False, "seen_ts": 5.0}
     s = D.from_legacy(old)
