@@ -1040,7 +1040,7 @@ async def look_here(rig, text: str, store, source: str = "demo") -> dict:
         return drop_square.contains(sq, perception.world_xy(pose, k, gu, gv, o.top_depth_mm))
     objs = [o for o in seg.objects if not o.touches_edge and not delivered(o)]
     ids = {id(o) for o in objs}
-    found = (clip_embed.best(objs, text, store, recognised=[r for r in recs if id(r["obj"]) in ids])
+    found = (clip_embed.best(objs, text, store, recognised=[r for r in recs if id(r["obj"]) in ids], rgb=rgb)
              if objs else {"obj": None, "reason": "nothing seen", "searchable": True})
     found.update(rgb=rgb, depth=depth, pose=pose, square=square_from_frame(rgb, depth, pose, intr(rig)))
     return found
@@ -1278,8 +1278,13 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
                                           skip_current=skip_current)
             doc["find_path"], doc["find_views"] = found.get("path"), found.get("views")
         obj = found.get("obj")
+        doc["decided_by"] = found.get("decided_by", "clip")  # "llm" when the LLM fallback made the choice
+        if found.get("llm"):
+            doc["llm"] = found["llm"]
         if obj is None:
-            doc.update(status="not_found", fail_phase="find", fail_reason=found.get("reason"))
+            # obj None + ambiguous: the LLM saw several matches (sorter/llm_choose.py) and named none
+            doc.update(status="ambiguous" if found.get("ambiguous") else "not_found", fail_phase="find",
+                       fail_reason=found.get("reason"))
             return doc
         frame_ts = float(found.get("ts") or time.time())  # a search's frame was just taken
         doc.update(label=found.get("recognised") or found.get("label") or obj.colour or "object", colour=obj.colour,

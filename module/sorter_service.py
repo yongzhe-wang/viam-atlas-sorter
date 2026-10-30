@@ -745,8 +745,10 @@ class GraspByDescription(Generic, EasyResource):
             return None, None, raw
         rt = _runtime()
         t0 = time.monotonic()
-        if "recognised" in inspect.signature(rt.clip_embed.best).parameters:
-            pick = await asyncio.to_thread(rt.clip_embed.best, None, text, self.store, recognised=raw["recs"])
+        params = inspect.signature(rt.clip_embed.best).parameters
+        if "recognised" in params:
+            extra = {"rgb": raw["rgb"]} if "rgb" in params else {}  # lets the LLM fallback see the frame
+            pick = await asyncio.to_thread(rt.clip_embed.best, None, text, self.store, recognised=raw["recs"], **extra)
         else:
             pick = await asyncio.to_thread(rt.clip_embed.best, raw["objs"], text, self.store)
         return pick, _ms(t0), raw
@@ -754,6 +756,8 @@ class GraspByDescription(Generic, EasyResource):
     @staticmethod
     def _refusal(pick: dict, text: str) -> Optional[tuple]:
         """(status, reason) when the decision is not to pick anything, else None."""
+        if pick.get("obj") is None and pick.get("ambiguous"):  # the LLM fallback saw several matches
+            return "ambiguous", f"several objects match {text!r}: {pick.get('reason')}; be more specific"
         if pick.get("obj") is None:
             return "not_found", f"no {text!r} on the table" + (f" ({pick['reason']})" if pick.get("reason") else "")
         if pick.get("ambiguous"):
@@ -1070,7 +1074,18 @@ class GraspByDescription(Generic, EasyResource):
                 "library": dict(self.library), "warm": self.warm, "warm_ms": self.warm_ms,
                 "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats(),
                 "map": self.live.summary() if self.live is not None else {"live": False},
-                "observations": self.store.observation_stats(), "build": _build_info()}
+                "observations": self.store.observation_stats(), "build": _build_info(),
+                "llm": self._llm_status()}
+
+    @staticmethod
+    def _llm_status() -> dict:
+        """LLM fallback state for {"status": true}: mode, whether a key is set, last call's outcome."""
+        try:
+            from sorter import llm_choose
+        except Exception as e:
+            return {"mode": "unavailable", "error": str(e)[:100]}
+        return {"mode": llm_choose.mode(), "key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
+                "last": dict(llm_choose.LAST)}
 
     async def do_command(self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None,
                          **kwargs) -> Mapping[str, ValueTypes]:

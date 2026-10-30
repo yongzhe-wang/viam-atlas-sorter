@@ -174,6 +174,28 @@ status), so redeploys never lose run data. `{"status": true}` reports `"library"
 after a deploy. With `MONGODB_URI` set, the library is read from Atlas instead (run `atlas_setup.py` and flush
 the views from the scanning machine first).
 
+## LLM fallback for object choice (optional, off by default)
+
+CLIP decides which object your words mean, and it struggles with relations and comparisons ("the smaller
+cube", "the one left of the cup", "something to write with"). With the LLM fallback on, when CLIP refuses or
+is unsure, the service draws a numbered box on every object perception found and asks Claude which number
+you meant. Perception still supplies the grasp geometry; the model only picks a number.
+
+Set these in the module's environment (Viam app: CONFIGURE → the module → env), not in the attributes:
+
+| Env var | Meaning |
+|---|---|
+| `SORTER_LLM` | `off` (default), `fallback` (only when CLIP refuses or is ambiguous) or `always` (every decision) |
+| `ANTHROPIC_API_KEY` | required when enabled |
+| `SORTER_LLM_MODEL` | default `claude-sonnet-5-5`; `claude-haiku-5-5` is faster |
+| `SORTER_LLM_TIMEOUT_S` | default 8 |
+
+- Each call adds roughly 1–5 s and needs internet. If the call fails (no key, offline, timeout, odd answer),
+  CLIP's own decision stands, so the robot behaves exactly as before.
+- `{"status": true}` shows `"llm": {"mode", "key_set", "last"}`. Each logged attempt records `decided_by`
+  (`clip` or `llm`) and the model's verdict and reason under `llm`.
+- Offline tests (no network or robot): `python scripts/test_llm_choose.py`.
+
 ## Atlas (optional)
 
 ```bash
