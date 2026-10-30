@@ -526,19 +526,21 @@ def raised_in_hole(depth: np.ndarray, hole: np.ndarray) -> int:
     return int((hole & (depth > 0) & (plane - depth > perception.MIN_HEIGHT_MM)).sum())
 
 
-def frame_square(rgb: np.ndarray, depth: np.ndarray, pose: dict, k: dict):
+def frame_square(rgb: np.ndarray, depth: np.ndarray, pose: dict, k: dict, prev: dict = None):
     """
-    The drop square from this one frame (AGENT3's drop_square on perception.find_drop_square, which tells raised
-    objects from tape by depth): {xy, size_mm, yaw_deg, corners, partial, confidence, ...} or None; never fails.
+    The drop square from this frame (AGENT3's drop_square on perception.find_drop_square, which tells raised
+    objects and dark occluders from tape): {xy, size_mm, yaw_deg, corners, partial, confidence, ...}, or `prev`
+    when this frame shows none; never fails. With `prev` (an estimate from other views) the views are merged
+    (drop_square.update): sides hidden in one view (the arm's cable across the lens) are seen in another.
     """
     if depth is None:
-        return None
+        return prev
     try:
         hit = perception.find_drop_square(rgb, depth)
-        return drop_square.update(None, drop_square.observe(hit, pose, k), time.time()) if hit else None
+        return drop_square.update(prev, drop_square.observe(hit, pose, k), time.time()) if hit else prev
     except Exception as e:
         print(f"  square estimate failed: {e}")
-        return None
+        return prev
 
 
 def square_mask(sq: dict, pose: dict, k: dict, shape: tuple, depth_mm: float) -> np.ndarray:
@@ -549,19 +551,20 @@ def square_mask(sq: dict, pose: dict, k: dict, shape: tuple, depth_mm: float) ->
     return np.asarray(img, dtype=bool)
 
 
-def objects_in_hole(rgb: np.ndarray, depth: np.ndarray, pose: dict = None, k: dict = None) -> tuple:
+def objects_in_hole(rgb: np.ndarray, depth: np.ndarray, pose: dict = None, k: dict = None, sq: dict = None) -> tuple:
     """
     (hole visible?, [Obj inside the hole], segmentation, interior mask) from a frame taken above the square at
     z >= 400. Inside = in_hole(). Must be looked at from ALIGN_Z: below ~280 mm depth is blind and a block in
     the square is invisible. Edge-cut objects are counted too (a full square can push one to the border).
     With the frame's pose and intrinsics the interior is drop_square's full estimate (frame_square), whatever
     lies in it: a silver knife reads as tape (52-69% of its pixels, AGENT3) and split the colour-based hole, so a
-    reset failed with "square: not visible". Without them, or with no full estimate, the colour-based hole_mask.
+    reset failed with "square: not visible". `sq`: an estimate merged over several views (go_over_square), used
+    when this frame alone sees the square only in part. Without any, the colour-based hole_mask.
     """
     seg = perception.segment_full(rgb, depth) if depth is not None else None
     hole = None
     if pose is not None and k is not None and depth is not None:
-        sq = frame_square(rgb, depth, pose, k)
+        sq = frame_square(rgb, depth, pose, k, prev=sq)
         if sq is not None and not sq.get("partial"):
             hole = square_mask(sq, pose, k, rgb.shape, float(np.median(table_plane(depth))))
     if hole is None:
@@ -694,7 +697,7 @@ def width_mm(obj, fx: float) -> float:
 # [CONFIDENCE: CONFIRMED 85% — one blocked frame vs 92 clear ones; a hand blocks depth too: the 15% rule]
 BLOCKED_DARK_FLAT_PX = 25000
 BLOCKED_DEPTH_FRAC = 0.15  # invalid or < 280 mm depth over the upper image (a hand right in front of the lens)
-BLOCKED_WAIT_S = 60.0
+BLOCKED_WAIT_S = 15.0  # then go on: views from other wrist angles get around a cable (go_over_square)
 BLOCKED_STATUS = "camera blocked (cable/hand in front of the lens)"
 
 
@@ -1379,25 +1382,47 @@ async def wipe(rig) -> None:
     await rig.open()
 
 
+WRIST_LOOK_DEG = 35.0  # extra views of a partly hidden square: the camera (83 mm off the wrist axis) moves round it
+
+
 async def go_over_square(rig) -> tuple:
     """
     Empty gripper: leave the arm at ALIGN_Z, theta 0, with the square's full interior centred in view (the pose
-    perception.look_flange_xy gives for its centre); returns (centre table xy, frame pose). Raises SquareNotFound.
+    perception.look_flange_xy gives for its centre); returns (centre table xy, frame pose, square estimate).
+    Raises SquareNotFound.
 
     WHY (2026-10-29): a reset failed with "square: not visible": search_square + a servo on find_square, which
     reads the silver knife in the square as tape (AGENT3: 52-69% of its pixels) and pulls the square into the
     fingertip rows. Now as for the place (62e3a76): drop_square's estimate from the current frame, then the recent
     sightings, then the observe pose before any z 580 pose; each estimate gets one move to centre it, and a second
-    look must show the full interior there (not partial, centre within 15 mm).
+    look must show the full interior there (not partial, centre within 15 mm). Still partial there (the arm's cable
+    across the lens hid a side, square_centered.npz: conf 0.6): views with the wrist at +-WRIST_LOOK_DEG from the same
+    pose are merged in (drop_square.update); if still partial, an estimate with one axis measured on both sides
+    (confidence >= 0.6) is accepted for the reset, which only counts what is on the interior.
+    {AGENT3 2026-10-29 "在 LOOK POSE 附近 ... 换个 Θ 再拍一帧 ... 用 DROP_SQUARE.UPDATE 把两帧合并"}
     {VIAM CENTERAL 2026-10-29 "请改成用 AGENT3 的 DROP_SQUARE 估计或 LIVE MAP 的 SQUARE，跟 PLACE 那边用同一套"}
     [CONFIDENCE: INFERRED 75% — offline on frame 084 and a fake rig; not run on the arm]
     """
     k = intr(rig)
 
-    async def look():
+    async def look(prev=None):
         rgb, depth = await clear_frame(rig)
         q = pose_dict(await rig.pose())
-        return frame_square(rgb, depth, q, k), q
+        return frame_square(rgb, depth, q, k, prev=prev), q
+
+    async def around(sq, fx, fy):
+        # Merge views from other wrist angles at the same look pose, then back to theta 0 for the reset
+        for dt in (WRIST_LOOK_DEG, -WRIST_LOOK_DEG):
+            if not sq.get("partial"):
+                break
+            try:
+                await rig.goto(fx, fy, ppa.ALIGN_Z, theta=dt)
+            except ppa.MoveRefused as e:
+                print(f"  square: wrist {dt:+.0f} view refused: {e}")
+                continue
+            sq, _ = await look(prev=sq)
+        await rig.goto(fx, fy, ppa.ALIGN_Z, theta=0.0)
+        return sq
 
     async def centre_on(xy):
         # Up to two moves: centre the estimate, then confirm a full, stable view of the interior there
@@ -1415,8 +1440,18 @@ async def go_over_square(rig) -> tuple:
             sq, q = await look()
             if sq is None:
                 return None
-            if not sq.get("partial") and math.hypot(sq["xy"][0] - xy[0], sq["xy"][1] - xy[1]) <= 15.0:
-                return tuple(sq["xy"]), q
+            if math.hypot(sq["xy"][0] - xy[0], sq["xy"][1] - xy[1]) <= 15.0:
+                if not sq.get("partial"):
+                    return tuple(sq["xy"]), q, sq
+                # Centred but a side hidden: other wrist angles, merged
+                sq = await around(sq, fx, fy)
+                q = pose_dict(await rig.pose())
+                if not sq.get("partial"):
+                    return tuple(sq["xy"]), q, sq
+                if sq.get("confidence", 0.0) >= 0.6 and any(sq.get("size_seen") or []):
+                    print(f"  square: partial after merged views (conf {sq['confidence']}), one axis measured: using it")
+                    return tuple(sq["xy"]), q, sq
+                return None
             xy = sq["xy"]
         return None
 
@@ -1464,12 +1499,12 @@ async def clear_square(rig, store) -> dict:
         # The view the reset starts from (normally the observe pose, empty gripper): more table to drop on
         rgb0, depth0 = await rig.frame()
         first = (rgb0, depth0, pose_dict(await rig.pose()))
-        centre, _ = await go_over_square(rig)
+        centre, _, sq_est = await go_over_square(rig)
         for _round in range(6):
             rgb, depth = await clear_frame(rig)
             q = pose_dict(await rig.pose())
             rig.record("reset", rgb)
-            seen, inside, seg, hole = objects_in_hole(rgb, depth, q, k)
+            seen, inside, seg, hole = objects_in_hole(rgb, depth, q, k, sq=sq_est)
             if seg is not None:
                 publish_frame(store, rgb, seg, "reset")
             if not seen:
@@ -1487,7 +1522,7 @@ async def clear_square(rig, store) -> dict:
                 await ppa.travel(rig, *centre, theta=0.0)  # wipe starts with the jaws over the centre
                 await wipe(rig)
                 doc["wipes"] += 1
-                centre, _ = await go_over_square(rig)
+                centre, _, sq_est = await go_over_square(rig)
                 continue
             obj = max(inside, key=lambda o: o.height_mm)  # the top of a stack first
             print(f"reset: {len(inside)} object(s) in the square; removing one ({obj.colour}, {obj.height_mm:.0f} mm)")
@@ -1521,7 +1556,7 @@ async def clear_square(rig, store) -> dict:
                 await wipe(rig)
                 doc["wipes"] += 1
             # Back over the square to look again (the paper may have been pushed)
-            centre, _ = await go_over_square(rig)
+            centre, _, sq_est = await go_over_square(rig)
         if not doc["success"]:
             doc.update(fail_phase="verify", fail_reason="objects still in the square")
         doc["img_after"] = jpeg((await rig.frame())[0])
