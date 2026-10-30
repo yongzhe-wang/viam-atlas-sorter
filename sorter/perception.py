@@ -21,6 +21,8 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 
+from sorter import bucket as _bucket
+
 MIN_HEIGHT_MM = 8.0  # objects stand at least this far above the fitted table plane
 MAX_OBJ_HEIGHT_MM = 100.0  # taller is not a graspable object (blocks are < 80 mm): hand or arm
 MIN_AREA_PX = 800  # ~12x12 mm at the 378 mm observe depth (about 2.4 px/mm)
@@ -128,6 +130,7 @@ class Segmentation:
     align: tuple  # depth -> colour model that was used (IDENTITY or UNALIGNED)
     plane: tuple  # (a, b, c): table depth = a*u + b*v + c on the depth grid
     cables: list = field(default_factory=list)  # SPLIT_BLOBS: [{"bbox", "length_mm", "width_mm"}] depth grid, never targets
+    bucket: dict = None  # bucket.find_mask() hit (centre/radius px, arc, mask) when the drop target is a bucket in view
 
 
 def fit_table(depth: np.ndarray) -> tuple:
@@ -153,6 +156,18 @@ def fit_table(depth: np.ndarray) -> tuple:
         res = d - (a * uu + b * vv + c)
         inl = valid & (np.abs(res) < band)
     return float(a), float(b), float(c)
+
+
+def to_depth_grid(mask: np.ndarray, model: tuple = None) -> np.ndarray:
+    """A colour-grid mask on the depth grid (aligned: the same pixels; unaligned: its inverse mapping, a little dilated)."""
+    if model is None or model == IDENTITY:
+        return mask
+    s, tu, tv = model
+    H, W = mask.shape
+    vv, uu = np.mgrid[0:H, 0:W]
+    cu = np.clip(np.round(s * (uu - W / 2) + W / 2 + tu).astype(int), 0, W - 1)
+    cv = np.clip(np.round(s * (vv - H / 2) + H / 2 + tv).astype(int), 0, H - 1)
+    return ndimage.binary_dilation(mask[cv, cu], iterations=3)
 
 
 def to_colour(img: np.ndarray, model: tuple) -> np.ndarray:
@@ -319,6 +334,18 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
     """
     d = depth.astype(float)
     valid = (d > 0) & (d < 2000)
+    # The drop bucket (SORTER_TARGET=bucket) is cut out first: ~180 mm tall, it read as a tall blob and its rim as a blind-range
+    # hole (both intruders: the arm paused), and filling half the view it can pull the table fit. What lies in it is delivered,
+    # so it goes too. {BUCKET OBSERVE "OBJS [] … INTR ['BLOB 119 MM TALL, SKIN 0%', 'BLIND-RANGE HOLE, SKIN 34%']"}
+    # [CONFIDENCE: CONFIRMED 80% — the two bucket frames; scan frames unchanged (no orange region that size)]
+    bk = None
+    if _bucket.TARGET == "bucket":
+        bk = _bucket.find_mask(rgb)
+    if bk is not None:
+        cut = to_depth_grid(bk["mask"], align if align is not None else _ALIGN["model"])  # None until checked: aligned
+        d = np.where(cut, 0.0, d)
+        valid_for_intruders = valid | cut
+        valid = valid & ~cut
     a, b, c = fit_table(d)
     vv, uu = np.mgrid[0:d.shape[0], 0:d.shape[1]]
     height = np.where(valid, a * uu + b * vv + c - d, 0.0)
@@ -411,9 +438,9 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         objs, excluded = _find_low_objects(objs, excluded, rgb, d, valid, height, ascale)
     for k, (o, _) in enumerate(excluded):
         o.id = -1 - k  # negative ids never collide with targets
-    intruders += find_intruders(rgb, valid, model, ascale)
+    intruders += find_intruders(rgb, valid_for_intruders if bk is not None else valid, model, ascale)
     return Segmentation(table_depth_mm=table_depth, objects=objs, excluded=excluded,
-                        intruders=intruders, align=model, plane=(a, b, c), cables=cables)
+                        intruders=intruders, align=model, plane=(a, b, c), cables=cables, bucket=bk)
 
 
 # ---- low objects: too flat for the depth threshold, found by colour and confirmed by depth ------------------
