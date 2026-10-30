@@ -136,8 +136,17 @@ async def back_to_observe(rig) -> None:
     """
     try:
         await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
+        return
     except Exception as e:
-        print(f"  could not return to the observe pose: {e}")
+        print(f"  could not return to the observe pose: {e}; clearing the arm's error and rising first")
+    # A collision stop refuses every move until cleared; then straight up before anything sideways
+    try:
+        await rig.clear_error()
+        await rig.rise(ppa.ALIGN_Z)
+        await ppa.travel(rig, *ppa.HOME_XY, theta=0.0)
+    except Exception as e:
+        print(f"  still not back at the observe pose: {e}")
+        STATE["error"] = f"arm stuck away from the observe pose: {e}"
 
 
 def square_from_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intrinsics: dict):
@@ -185,6 +194,9 @@ def record_sightings(store, rgb, depth, seg, pose: dict, intrinsics: dict, sourc
 RING_HOLE_FRAC = 0.2  # share of an object's hole-filled mask that is hole: a ring (tape roll), grasped by its wall
 
 
+RING_MAX_R_MM = 75.0  # a "ring" wider than this is a merged blob, not a tape roll (outer radius ~59 mm)
+
+
 def ring_geometry(o, wall_mm: float = None):
     """
     ((cu, cv) ring centre px, radius px of the middle of the wall) if `o` is ring-like, else None.
@@ -204,7 +216,11 @@ def ring_geometry(o, wall_mm: float = None):
     if wall_mm is not None:
         r = wall_mm * perception.INTRINSICS["fx"] / max(o.top_depth_mm, 1.0)
     else:
-        r = 0.5 * (math.sqrt(filled.sum() / math.pi) + math.sqrt(hole.sum() / math.pi))
+        r_out = math.sqrt(filled.sum() / math.pi)
+        # Too big for a ring: the mask merged the ring with something (the reset aimed 99 mm off the tape's centre)
+        if r_out * o.top_depth_mm / perception.INTRINSICS["fx"] > RING_MAX_R_MM:
+            return None
+        r = 0.5 * (r_out + math.sqrt(hole.sum() / math.pi))
     return (u0 + float(us.mean()), v0 + float(vs.mean())), r
 
 
@@ -1136,7 +1152,8 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         # already accepted the whole object: identity is fixed there (tracker.ref); pick() refines and checks
         # continuity before the descent
         await approach(rig, found, tracker)
-        height, grip = await ppa.pick(rig, times, tracker, check=lambda: still_target(rig, text, store, tracker))
+        height, grip = await ppa.pick(rig, times, tracker, check=lambda: still_target(rig, text, store, tracker),
+                                      align=False)
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
         ring = held_ring(rig, obj, found["pose"])
@@ -1465,37 +1482,6 @@ async def drop_at(rig, height: float, grip: float, spots: list) -> tuple:
     raise RuntimeError("no free spot to drop the object (frame spots and discard area); still holding it")
 
 
-async def wipe(rig) -> None:
-    """
-    Push whatever is in the hole out sideways with the closed gripper (fallback when picking fails).
-
-    One slow straight pass along world y (sideways to the arm: never toward the base or away into the room),
-    fingertips WIPE_CLEAR_MM above the measured table, toward the side whose depth shows fewer objects.
-    Starts with the arm centred over the hole (after the square servo). Not yet run on hardware.
-    """
-    p = await rig.pose()
-    z1, table, _ = await rig.measure()
-    rgb, depth = await rig.frame()
-    near = (depth > 0) & (depth < table - 8)
-    w = near.shape[1]
-    # Image +u is world -y (measured on sfhack4), so the image's right half is the -y side
-    left_busy, right_busy = int(near[:, : w // 3].sum()), int(near[:, 2 * w // 3:].sum())
-    direction = 1.0 if left_busy <= right_busy else -1.0  # +y = toward the image's left
-    z_wipe = max(z1 - (table - ppa.TIP_BELOW_CAM - WIPE_CLEAR_MM), rig.floor_z)
-    start, end = p.y - direction * 90.0, p.y + direction * 180.0
-    print(f"  wipe: y {start:.0f} -> {end:.0f} at z={z_wipe:.0f}")
-    await ppa.travel(rig, p.x, start)
-    await rig.grab()  # close the jaws into a flat pusher; returns False with nothing inside, as expected
-    await rig.wait_clear()
-    await rig.descend(z_wipe)
-    y = start
-    while (end - y) * direction > 0:
-        y = y + direction * min(WIPE_STEP_MM, abs(end - y))
-        await rig.goto(p.x, y, z_wipe)
-    await rig.lift()
-    await rig.open()
-
-
 WRIST_LOOK_DEG = 35.0  # extra views of a partly hidden square: the camera (83 mm off the wrist axis) moves round it
 
 
@@ -1599,6 +1585,11 @@ async def go_over_square(rig) -> tuple:
 
 
 RESET_PICK_TRIES = 3  # pick attempts per object in a reset, each from a fresh look
+SQUARE_NOT_CLEARED = "square not cleared — please clear by hand"
+
+
+class SquareNotCleared(RuntimeError):
+    """The reset could not empty the square without risk; a person has to (nothing is held)."""
 
 
 async def clear_square(rig, store) -> dict:
@@ -1638,14 +1629,8 @@ async def clear_square(rig, store) -> dict:
                 doc.update(success=True, status="done", square_xy=[round(centre[0], 1), round(centre[1], 1)])
                 break
             if not inside:
-                print(f"reset: no object segmented but {raised} raised px on the interior: wiping")
-                if doc["wipes"] >= 2:
-                    raise RuntimeError(f"square still not empty after 2 wipes ({raised} raised px)")
-                await ppa.travel(rig, *centre, theta=0.0)  # wipe starts with the jaws over the centre
-                await wipe(rig)
-                doc["wipes"] += 1
-                centre, _, sq_est = await go_over_square(rig)
-                continue
+                # Something stands there but is not a pickable object: a person clears it (no wipe, see below)
+                raise SquareNotCleared(f"{raised} raised px on the square but no object to pick")
             obj = max(inside, key=lambda o: o.height_mm)  # the top of a stack first
             print(f"reset: {len(inside)} object(s) in the square; removing one ({obj.colour}, {obj.height_mm:.0f} mm)")
             picked, gone = False, False
@@ -1667,7 +1652,7 @@ async def clear_square(rig, store) -> dict:
                     try:
                         tracker = ObjTracker(rig, obj, rgb)
                         await approach(rig, {"obj": obj, "rgb": rgb, "depth": depth, "pose": q}, tracker)
-                        height, grip = await ppa.pick(rig, None, tracker)
+                        height, grip = await ppa.pick(rig, None, tracker, align=False)
                     except (ppa.PickFailed, RuntimeError) as e:
                         if await rig.holding():
                             raise  # something in the jaws: recover() puts it back, never a silent retry
@@ -1690,16 +1675,18 @@ async def clear_square(rig, store) -> dict:
                     doc["removed"] += 1
                     break
             if not picked and not gone:
-                if doc["wipes"] >= 2:
-                    raise RuntimeError("square still not empty after 2 wipes")
-                await ppa.travel(rig, *centre, theta=0.0)
-                await wipe(rig)
-                doc["wipes"] += 1
+                # No wipe during the demo: sweeping at z 171 across the table hit the tape roll / paper edge and
+                # stopped the arm on overcurrent (2026-10-29). A person clears the square instead.
+                # {VIAM CENTERAL 2026-10-29 "DEMO 期间禁用 WIPE ... STATUS 设成 'SQUARE NOT CLEARED — PLEASE CLEAR BY HAND'"}
+                raise SquareNotCleared(f"could not pick the {obj.colour} object after {RESET_PICK_TRIES} tries")
             # Back over the square to look again (the paper may have been pushed)
             centre, _, sq_est = await go_over_square(rig)
         if not doc["success"]:
             doc.update(fail_phase="verify", fail_reason="objects still in the square")
         doc["img_after"] = jpeg((await rig.frame())[0])
+    except SquareNotCleared as e:
+        doc.update(status="not_cleared", fail_phase="reset", fail_reason=f"{SQUARE_NOT_CLEARED}: {e}")
+        await recover(rig, doc)
     except Exception as e:
         doc.update(fail_phase=doc.get("fail_phase") or "reset", fail_reason=f"{type(e).__name__}: {e}")
         await recover(rig, doc)

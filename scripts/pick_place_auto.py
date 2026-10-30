@@ -653,7 +653,8 @@ class Rig:
             raise RuntimeError(f"refusing xy=({x:.0f},{y:.0f}) outside safe reach")
         p = await self.pose()
         if math.dist((p.x, p.y, p.z), (x, y, z)) > MAX_STEP_MM:
-            raise RuntimeError("refusing step larger than MAX_STEP_MM")
+            raise RuntimeError(f"refusing step larger than MAX_STEP_MM: ({p.x:.0f},{p.y:.0f},{p.z:.0f}) -> "
+                               f"({x:.0f},{y:.0f},{z:.0f})")
         if theta is not None:
             self.theta = theta
         target = Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=-1, theta=self.theta)
@@ -745,8 +746,20 @@ class Rig:
 
     async def lift(self, settle: bool = True) -> None:
         """Straight up to ALIGN_Z; the safe response to any failure."""
+        await self.rise(ALIGN_Z, settle=settle)
+
+    async def rise(self, z: float, settle: bool = True) -> None:
+        """
+        Straight up to z at the current xy, in steps the MAX_STEP_MM guard accepts (a rise from near the table to
+        ALIGN_Z can be longer than one step). Never sideways: after a collision the reset could not get back
+        ("refusing step larger than MAX_STEP_MM") and stayed at z 186 over the table.
+        {VIAM CENTERAL 2026-10-29 "RECOVER / BACK_TO_OBSERVE 从低位回去时，必须先竖直升到 ALIGN_Z"}
+        """
         p = await self.pose()
-        await self.goto(p.x, p.y, ALIGN_Z, settle=settle)
+        cur = p.z
+        while cur < z - 0.5:
+            cur = min(z, cur + MAX_STEP_MM - 10.0)
+            await self.goto(p.x, p.y, cur, settle=settle and cur >= z - 0.5)
 
     async def servo(self, finder, use_top: bool, label: str, plane_at=None, offset=(0.0, 0.0),
                     blind_step: bool = True) -> None:
@@ -935,7 +948,7 @@ def mark(times: dict, phase: str, t0: float) -> float:
     return now
 
 
-async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None) -> tuple:
+async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None, align: bool = True) -> tuple:
     """
     Steps 1-2: align over the block, measure it, descend and grab. Returns (block height, grip depth).
 
@@ -948,6 +961,9 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     fingertips and only continuity can be judged. Before (2026-10-29) one full check ran before each descent
     and refused the blue screwdriver it was centred on: at theta -50 only its handle was in view.
     Descent: one straight move from ALIGN_Z to the grasp height measured there (CLOSE_SERVO False).
+    align=False: the caller already turned the wrist (executor.approach): keep that angle, no align_wrist, no
+    re-servo after it. The reset's wrist re-align turned the camera away and the tracker jumped to another object.
+    {VIAM CENTERAL 2026-10-29 "确认 RESET 真的走了 APPROACH 的一次 MOVE + OPEN-LOOP，不要再进 ALIGN"}
     """
     times = {} if times is None else times
     finder = finder or find_block
@@ -956,9 +972,9 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     rig.picked_at = None  # set again only by this pick's successful grab
     await rig.open()
     p = await rig.pose()
-    await rig.goto(p.x, p.y, ALIGN_Z, theta=0.0)
+    await rig.goto(p.x, p.y, ALIGN_Z, theta=None if not align else 0.0)
 
-    print("1/5 find + align over block")
+    print("1/5 find + align over block" if align else "1/5 refine over the target (wrist already turned)")
     await rig.servo(finder, True, "block")
     if verify is not None:
         # Centred at theta 0: the frame where the whole object is visible, so recognition is fair
@@ -967,7 +983,7 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         if not ok:
             raise PickFailed(f"lost the target, refusing to grab something else: {why}")
     # Already turned (e.g. approach() applied the yaw with its move): no second servo needed
-    if await rig.align_wrist(finder):
+    if align and await rig.align_wrist(finder):
         await rig.servo(finder, True, "block")
     t = mark(times, "servo", t)
 
@@ -1404,7 +1420,7 @@ async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = A
     cur = p.z
     if cur < min(z, ALIGN_Z) - 1:
         cur = min(z, ALIGN_Z)
-        await rig.goto(p.x, p.y, cur, settle=False)
+        await rig.rise(cur, settle=False)
     if z < cur - 1:
         cur = z
         await rig.goto(p.x, p.y, cur, settle=False)
