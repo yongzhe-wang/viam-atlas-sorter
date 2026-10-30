@@ -667,8 +667,7 @@ def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None):
         sa, sb = sq["size_mm"]
         if ring:
             # Ring centre relative to the jaws, turned from the grasp theta back to the release theta 0
-            r = math.radians(perception.THETA_SIGN * (0.0 - ring["theta"]))
-            off = np.array(perception._rot(r, *ring["offset"]))
+            off = np.array(ring_offset_at(ring, 0.0))
             R = ring["r_out"] + OCC_MARGIN_MM
             box = None
         else:
@@ -710,40 +709,66 @@ def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None):
     return choose
 
 
-def placed_ok(rig, rgb: np.ndarray, depth: np.ndarray, text: str, store) -> tuple:
-    """
-    (hole seen?, success?, why, segmentation) right after a place, from the retreat pose above the release point.
+def ring_offset_at(ring: dict, theta: float) -> tuple:
+    """Table-xy offset from the jaws to a held ring's centre with the wrist at `theta` (held_ring at its grasp theta)."""
+    r = math.radians(perception.THETA_SIGN * (theta - ring["theta"]))
+    return perception._rot(r, *ring["offset"])
 
-    Success = the object at the release point (grasp point within RELEASE_MATCH_MM of the jaw axis) has its grasp
-    point on the white interior and is the target: best() over it accepts it, or it is not recognised as anything
-    else. Other objects in the square do not matter, and a long object hanging over the border passes by its
-    grasped section. Before: "wrong object in the hole" for the blue screwdriver (handle in, shaft out, the yellow
-    block also inside).
+
+def placed_ok(rig, rgb: np.ndarray, depth: np.ndarray, text: str, store, expect: dict = None) -> tuple:
+    """
+    (square seen?, success?, why, segmentation) right after a place, from the retreat pose above the release point.
+
+    Success = an object stands where the placed one should (its reference point within RELEASE_MATCH_MM of
+    `expect["xy"]`, the jaws' release point by default), that point is in the square, and it is the target: best()
+    over it accepts it, or it is not recognised as anything else. Other objects in the square do not matter, and a
+    long object hanging over the border passes by its grasped section. Reference point: a ring's centre (ring_world),
+    else the grasp point. A ring is released with the jaws on its wall, ~a radius from its centre, and its fresh
+    grasp point may be on the far side: the black tape sat centred in the square and the check said "nothing at
+    the release point" (2026-10-29), so for a ring `expect` is its centre and the radius widens the match.
+    In the square: drop_square's estimate from this frame (contains), else the colour hole_mask.
     {VIAM CENTERAL 2026-10-29 "SUCCESS WHEN THE TARGET IS IN THE HOLE (BY RECOGNITION PLUS POSITION), REGARDLESS OF OTHER OBJECTS"}
-    [CONFIDENCE: SINGLE-SRC 80% — rule from the coordinator; recognition of the placed object not yet seen on the arm]
+    [CONFIDENCE: SINGLE-SRC 80% — rule from the coordinator; ring case checked on real frames with the tape placed]
     """
     seg = perception.segment_full(rgb, depth) if depth is not None else None
-    hole = hole_mask(rgb, depth)
-    if hole is None or seg is None:
-        return False, False, "hole not visible", seg
+    if seg is None:
+        return False, False, "no depth", seg
     pose = pose_dict(rig.last_pose) if rig.last_pose is not None else dict(rig.at)
     k = intr(rig)
-    table = float(np.median(table_plane(depth)[hole]))
-    au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
-    best_o, best_d = None, RELEASE_MATCH_MM * rig.fx / table
+    sq = frame_square(rgb, depth, pose, k)
+    hole = None if sq is not None else hole_mask(rgb, depth)
+    if sq is None and hole is None:
+        return False, False, "square not visible", seg
+    table = float(np.median(table_plane(depth)))
+
+    def in_square(xy, u, v) -> bool:
+        if sq is not None:
+            return drop_square.contains(sq, xy, margin=0.0)
+        return 0 <= int(v) < hole.shape[0] and 0 <= int(u) < hole.shape[1] and bool(hole[int(v), int(u)])
+
+    if expect is None:
+        au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
+        expect = {"xy": perception.world_xy(pose, k, au, av, table)}
+    tol = RELEASE_MATCH_MM + expect.get("r", 0.0)
+    best_o, best_d = None, tol
     for o in list(seg.objects) + [o for o, _ in seg.excluded]:
-        gu, gv, _ = grasp_px(o, pose, k)
-        inside = 0 <= int(gv) < hole.shape[0] and 0 <= int(gu) < hole.shape[1] and hole[int(gv), int(gu)]
-        d = math.hypot(gu - au, gv - av)
-        if inside and d < best_d:
+        rw = ring_world(o, pose, k)
+        if rw is not None:
+            ref = rw[0]
+            u, v = perception.project_xy(pose, k, ref, table)
+        else:
+            u, v, _ = grasp_px(o, pose, k)
+            ref = perception.world_xy(pose, k, u, v, o.top_depth_mm)
+        d = math.hypot(ref[0] - expect["xy"][0], ref[1] - expect["xy"][1])
+        if d < best_d and in_square(ref, u, v):
             best_o, best_d = o, d
     if best_o is None:
         return True, False, "nothing at the release point in the square", seg
     found = clip_embed.best([best_o], text, store)
     if found.get("obj") is not None:
-        return True, True, "target in the square", seg
+        return True, True, f"target in the square ({best_d:.0f} mm from where it was put)", seg
     if found.get("recognised") is None:
-        return True, True, "placed in the square (not re-recognised)", seg
+        return True, True, f"placed in the square, not re-recognised ({best_d:.0f} mm from where it was put)", seg
     return True, False, f"the object in the square is recognised as {found['recognised']!r}", seg
 
 
@@ -1115,7 +1140,12 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         rig.record("check", rgb)
         # Released at a free spot, not necessarily the centre: the square's position comes from this view
         square_from_frame(rgb, depth, pose_dict(q), intr(rig))
-        seen, right, why, seg = placed_ok(rig, rgb, depth, text, store)
+        # Where the object itself should be: the release point, or for a ring its centre beside the jaws
+        expect = None
+        if ring:
+            ox, oy = ring_offset_at(ring, q.theta)
+            expect = {"xy": (q.x + ox, q.y + oy), "r": ring["r_out"]}
+        seen, right, why, seg = placed_ok(rig, rgb, depth, text, store, expect)
         if seg is not None:
             publish_frame(store, rgb, seg, "place")
         doc["img_after"] = jpeg(rgb)
