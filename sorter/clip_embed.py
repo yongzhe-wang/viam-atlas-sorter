@@ -457,6 +457,9 @@ def _llm_override(out: dict, objs: list, text: str, rgb) -> dict:
     out["decided_by"] = "llm"
     if v["status"] == "ok":
         o = objs[v["index"]]
+        if _known_as_other(o, text):  # the model may not overrule the library either (HARD_VETO_CONF)
+            out.update(obj=None, ambiguous=False, reason=f"the model chose an object recognised as {o.recognised!r}")
+            return out
         out.update(obj=o, ambiguous=False, reason="", recognised=getattr(o, "recognised", None), searchable=False)
     elif v["status"] == "ambiguous":
         out.update(obj=None, ambiguous=True, reason=v["reason"] or "several objects match", searchable=False)
@@ -493,6 +496,12 @@ def _best_open(ranked: list, text: str, qcol: set, out: dict) -> dict:
     else:
         reason = f"best match only {s:.2f}"
     return {**out, "reason": reason, "searchable": False}
+
+
+def _known_as_other(o, text: str) -> bool:
+    """Recognised with HARD_VETO_CONF as something the query does not name: never accepted, by CLIP or by the model."""
+    return (getattr(o, "recognised", None) is not None and getattr(o, "recognised_conf", 0.0) >= HARD_VETO_CONF
+            and not name_matches(text, getattr(o, "recognised_names", []) or [o.recognised]))
 
 
 def _open_veto(o) -> str:

@@ -133,6 +133,26 @@ def test_known_object_is_never_another_name():
     assert not c[0]["likely"] and "never another name" in c[0]["why"], c
 
 
+def test_the_model_cannot_overrule_a_confident_recognition():
+    # SORTER_LLM=always lets the model decide every known-name query; its choice must not bring back an object the library
+    # surely recognises as something else (an unknown query never reaches the model: _best_open decides alone)
+    from sorter import llm_choose
+
+    saved = llm_choose.mode, llm_choose.choose
+    llm_choose.mode = lambda: "always"
+    llm_choose.choose = lambda rgb, objs, q: {"status": "ok", "index": 0, "reason": "", "ms": 1}
+    try:
+        sure = rec(crop(green_cube=0.50, blue_cylinder=0.30), "blue cylinder", ["blue cylinder"], colour="green",
+                   conf=C.HARD_VETO_CONF)
+        b = C.best(None, "green cube", Lib(), recognised=[sure], rgb=np.zeros((4, 4, 3), np.uint8))
+        assert b["obj"] is None and b["reason"] == "the model chose an object recognised as 'blue cylinder'", b
+        unsure = rec(crop(green_cube=0.50, blue_cylinder=0.30), "blue cylinder", ["blue cylinder"], colour="green", conf=0.9)
+        b = C.best(None, "green cube", Lib(), recognised=[unsure], rgb=np.zeros((4, 4, 3), np.uint8))
+        assert b["obj"] is unsure["obj"] and b["decided_by"] == "llm", b
+    finally:
+        llm_choose.mode, llm_choose.choose = saved
+
+
 def test_unrecognised_object_much_more_like_a_library_name_is_vetoed():
     # The silver knife at z 580: not recognised, but its crop is far more like a known name than like "blue lollipop"
     # {NOW.NPZ KNIFE "LIB_GAP +0.089"; BLUE LOLLIPOPS "-0.015" TO "-0.103"} [CONFIDENCE: CONFIRMED 80% — real gaps]
