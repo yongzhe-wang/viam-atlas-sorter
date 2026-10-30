@@ -13,6 +13,7 @@ Contract: docs/EXEC_PLAN.md (Obj, segment). segment_full() also returns intruder
 """
 import json
 import math
+import os
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,6 +111,11 @@ class Obj:
     rect_fill: float = 1.0  # top face hull / min-area rectangle: square/rectangle ~1.0, disc ~0.81
     top_centroid_px: tuple = ()  # centroid of the top face: above the object's axis from any view angle
     colours: dict = field(default_factory=dict)  # share of each saturated colour family in the mask (>= 2%)
+    # Merged see-through object (MERGE_FRAGMENTS) only: where to grip it (centre of the opaque piece with valid depth
+    # nearest the object's centre) and that piece's camera distance; None: use the object's own geometry
+    grip_px: tuple = None
+    grip_depth_mm: float = None
+    n_fragments: int = 1
 
 
 @dataclass
@@ -393,11 +399,133 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         else:
             o.id = len(objs)
             objs.append(o)
+    if MERGE_FRAGMENTS:
+        objs, excluded = _merge_fragments(objs, excluded, rgb, valid, ascale, (H, W))
     for k, (o, _) in enumerate(excluded):
         o.id = -1 - k  # negative ids never collide with targets
     intruders += find_intruders(rgb, valid, model, ascale)
     return Segmentation(table_depth_mm=table_depth, objects=objs, excluded=excluded,
                         intruders=intruders, align=model, plane=(a, b, c))
+
+
+# ---- see-through objects: fragments of one object joined by its depth-less body ---------------------------
+# A clear bottle has depth only on its cap and label; the clear body reads no depth at all, and that invalid region is
+# the object's whole silhouette. Thin invalid rims (parallax shadows, ~20 px) and the table edge / floor (touching the
+# image border) are not bodies. {BOTTLE CENTERED.NPZ "1 GREY H=45 BBOX=(633, 85, 706, 156)" "2 GREY H=63 BBOX=(587, 222,
+# 774, 385)"; DEPTH_VIS: INVALID REGION = BOTTLE SILHOUETTE} [CONFIDENCE: SINGLE-SRC 70% — one real see-through object]
+MERGE_FRAGMENTS = os.environ.get("SORTER_MERGE_FRAGMENTS") == "1"  # off by default (VIAM CENTERAL: behind a flag)
+MERGE_CORE_R = 4  # opening radius on the quarter-resolution grid (16 px): keeps only thick depth-less bodies
+MERGE_CORE_MIN_PX = 6000  # the body's own area, full-resolution pixels at the 380 mm reference depth
+# Share of a fragment's surroundings (8 px ring) with no depth: bottle cap 0.65, label 0.84; the wrapper beside it 0.45
+# (its parallax rim), a cable 0.15. {MERGE DEBUG "FRAG (633, 85, 706, 156) … INVALID SHARE 0.65"}
+# [CONFIDENCE: SINGLE-SRC 65% — one see-through object measured]
+MERGE_RING_MIN = 0.55
+MERGE_RING_TOUCH = 0.05  # ... and this share must be a thick body, not just rims
+MERGE_SOLIDITY_MIN = 0.85  # merged mask / its convex hull: one object is nearly convex, two joined ones are not
+
+
+def _merge_fragments(objs: list, excluded: list, rgb: np.ndarray, valid: np.ndarray, ascale: float, shape: tuple) -> tuple:
+    """
+    (objects, excluded) with the fragments of each see-through object replaced by one Obj covering all of it.
+
+    Thick depth-less bodies and the fragments they surround form a graph: a label splits a bottle's body in two, and
+    cap - body - label - body is one connected group. A fragment joins only if most of its surroundings have no depth
+    (a neighbouring opaque object touches a body on one side only).
+    """
+    from scipy.spatial import ConvexHull
+
+    H, W = shape
+    q = 4
+    inv = ~valid[::q, ::q]
+    disk = np.hypot(*np.mgrid[-MERGE_CORE_R:MERGE_CORE_R + 1, -MERGE_CORE_R:MERGE_CORE_R + 1]) <= MERGE_CORE_R
+    lab, n = ndimage.label(ndimage.binary_opening(inv, structure=disk))
+    bodies = []
+    for i in range(1, n + 1):
+        core = lab == i
+        if core.sum() * q * q < MERGE_CORE_MIN_PX * ascale:
+            continue
+        if core[0].any() or core[-1].any() or core[:, 0].any() or core[:, -1].any():
+            continue  # table edge, floor, or something cut by the frame: not a body we can see whole
+        # The body: the core plus the invalid pixels the opening shaved off it, back on the full grid
+        grown = ndimage.binary_dilation(core, iterations=MERGE_CORE_R + 1, mask=inv)
+        body = np.kron(grown, np.ones((q, q), bool))[:H, :W] & ~valid
+        if skin_fraction(rgb, body) < 0.5:  # a hand is find_intruders' business
+            bodies.append(body)
+    if not bodies:
+        return objs, excluded
+    frags = [(o, None) for o in objs] + list(excluded)
+    # Union-find over bodies (0..b-1) and fragments (b..)
+    b = len(bodies)
+    parent = list(range(b + len(frags)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    joined = set()
+    for k, (o, _) in enumerate(frags):
+        u0, v0, u1, v1 = o.bbox
+        sl = (slice(max(v0 - 12, 0), min(v1 + 13, H)), slice(max(u0 - 12, 0), min(u1 + 13, W)))
+        m = o.mask[sl]
+        ring = ndimage.binary_dilation(m, iterations=8) & ~m
+        if not ring.any() or (~valid[sl])[ring].mean() < MERGE_RING_MIN:
+            continue
+        for j, body in enumerate(bodies):
+            if body[sl][ring].mean() >= MERGE_RING_TOUCH:
+                parent[find(b + k)] = find(j)
+                joined.add(k)
+    groups = {}
+    for j in range(b):
+        groups.setdefault(find(j), [[], []])[0].append(j)
+    for k in joined:
+        groups.setdefault(find(b + k), [[], []])[1].append(k)
+    used, merged = set(), []
+    for body_ids, parts in groups.values():
+        if not parts:
+            continue  # no opaque piece: nothing to grip, and it may be a reflection or a dark patch
+        union = np.zeros((H, W), bool)
+        for j in body_ids:
+            union |= bodies[j]
+        for k in parts:
+            union |= frags[k][0].mask
+        union = ndimage.binary_fill_holes(ndimage.binary_closing(union, iterations=6))
+        vs, us = np.nonzero(union & ~ndimage.binary_erosion(union))
+        if union.sum() / ConvexHull(np.column_stack([us, vs]).astype(float)).volume < MERGE_SOLIDITY_MIN:
+            continue
+        o = _merged_obj(union, [frags[k] for k in parts], rgb, shape)
+        used.update(parts)
+        merged.append((o, "touches the image edge" if o.touches_edge else None))
+    if not merged:
+        return objs, excluded
+    keep = [f for k, f in enumerate(frags) if k not in used] + merged
+    objs2, excl2 = [o for o, why in keep if why is None], [(o, why) for o, why in keep if why is not None]
+    for k, o in enumerate(objs2):
+        o.id = k
+    return objs2, excl2
+
+
+def _merged_obj(mask: np.ndarray, parts: list, rgb: np.ndarray, shape: tuple) -> Obj:
+    """One Obj for the whole silhouette: geometry and crop of all of it, height of its highest piece, grip on an opaque piece."""
+    H, W = shape
+    vs, us = np.nonzero(mask)
+    u0, v0, u1, v1 = int(us.min()), int(vs.min()), int(us.max()), int(vs.max())
+    mu, mv = int((u1 - u0) * CROP_MARGIN) + 4, int((v1 - v0) * CROP_MARGIN) + 4
+    sl = (slice(v0, v1 + 1), slice(u0, u1 + 1))
+    cen, yaw, L, Wd = _geometry(mask[sl], (u0, v0))
+    pieces = [o for o, _ in parts]
+    grip = min(pieces, key=lambda o: math.dist(o.top_centroid_px or o.centroid_px, cen))
+    e = EDGE_MARGIN_PX
+    return Obj(id=0, bbox=(u0, v0, u1, v1), centroid_px=cen, yaw_deg=yaw, length_px=L, width_px=Wd,
+               height_mm=max(o.height_mm for o in pieces), top_depth_mm=min(o.top_depth_mm for o in pieces), mask=mask,
+               crop=rgb[max(0, v0 - mv):min(H, v1 + mv + 1), max(0, u0 - mu):min(W, u1 + mu + 1)].copy(),
+               touches_edge=u0 <= e or v0 <= e or u1 >= W - 1 - e or v1 >= H - 1 - e,
+               # top_centroid_px is what grasp_px() and the table map use: the grip, since the body has no depth to stand on
+               colour=colour_name(rgb[sl], mask[sl])[0], rect_fill=rect_fill(mask[sl]),
+               top_centroid_px=tuple(grip.top_centroid_px or grip.centroid_px),
+               colours=colour_fractions(rgb[sl], mask[sl]), grip_px=tuple(grip.top_centroid_px or grip.centroid_px),
+               grip_depth_mm=grip.top_depth_mm, n_fragments=len(pieces))
 
 
 # ---- pixel <-> table geometry (wrist camera looking straight down) ----------------------------------------

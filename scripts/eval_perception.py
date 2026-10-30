@@ -285,7 +285,7 @@ OPEN_NOUN = {"blue block": "block", "yellow block": "block", "yellow cylinder": 
              "blue screwdriver": "screwdriver", "black tape": "tape", "green cube": "cube", "computer mouse": "mouse",
              "red knife": "knife", "utility knife": "knife"}
 OPEN_ABSENT = ("banana", "red ball", "scissors", "mug")  # must be refused; the gate's thresholds were tuned on these
-OPEN_ABSENT_UNSEEN = ("apple", "spoon", "phone", "water bottle", "pencil", "orange", "hammer", "toothbrush")  # not tuned on
+OPEN_ABSENT_UNSEEN = ("apple", "spoon", "phone", "pencil", "orange", "hammer", "toothbrush")  # not tuned on (a real water bottle joined the table)
 
 
 def openvocab() -> None:
