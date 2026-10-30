@@ -252,7 +252,7 @@ def recog() -> None:
         """search_views over the views of other frames only (Store scale: (1 + cos) / 2)."""
 
         def __init__(self, frame):
-            self.keep = np.array([r.get("frame") != frame for r in rows])
+            self.keep = np.array([(r.get("frame") or r.get("obs_ts")) != frame for r in rows])
 
         def search_views(self, emb, k=8, label=None):
             s = (1 + E @ (np.asarray(emb, float) / np.linalg.norm(emb))) / 2
@@ -262,9 +262,10 @@ def recog() -> None:
 
     per, wrong = {}, {}
     for i, r in enumerate(rows):
-        if not r.get("frame"):
+        frame = r.get("frame") or r.get("obs_ts")  # views from the observation log have the record's ts instead
+        if not frame:
             continue
-        lab, _, _ = clip_embed.recognise(E[i], _Others(r["frame"]), colour=r.get("colour"), height_mm=r.get("height_mm"))
+        lab, _, _ = clip_embed.recognise(E[i], _Others(frame), colour=r.get("colour"), height_mm=r.get("height_mm"))
         ok = per.setdefault(r["label"], [0, 0])
         ok[0] += lab == r["label"]
         ok[1] += 1

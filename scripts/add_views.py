@@ -124,12 +124,24 @@ if __name__ == "__main__":
     ap.add_argument("--radius", type=float, default=40.0)
     ap.add_argument("--colour")
     ap.add_argument("--h", type=lambda s: tuple(float(x) for x in s.split(",")), help="height range mm, e.g. 20,40")
+    ap.add_argument("--per-pose", type=int, default=0,
+                    help="at most this many detections per camera pose (10 mm grid): the idle loop logs the same view "
+                         "hundreds of times, and near-duplicates only outvote the other views")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     found = ((from_observations(a.observations, a) if a.observations else []) + (from_frames(a.frames, a) if a.frames else [])
              + (from_npz(a.npz, a) if a.npz else []))
     done = json.loads(DONE.read_text()) if DONE.exists() else {}
     new = [f for f in found if f[0] not in done]
+    if a.per_pose:
+        kept, per = [], {}
+        for f in new:
+            p = f[3].get("pose") or {}
+            cell = tuple(round(float(p.get(k, 0.0)) / 10) for k in ("x", "y", "z", "theta"))
+            if per.get(cell, 0) < a.per_pose:
+                per[cell] = per.get(cell, 0) + 1
+                kept.append(f)
+        new = kept
     store = Store()
     aliases = next((v.get("aliases") for v in store.search_views(np.ones(512, np.float32), k=10000, label=a.label)
                     if v.get("aliases")), [])
