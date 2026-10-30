@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
-from sorter import clip_embed, drop_square, perception
+from sorter import bucket, clip_embed, drop_square, perception
 
 MERGE_XY_MM = 40.0  # two sightings this close on the table can be the same object
 MERGE_DH_MM = 15.0  # ... if their heights agree
@@ -154,9 +154,10 @@ def _mark_in_square(tmap: dict) -> None:
     view the visible part is too small, so the estimated rectangle (drop_square) is used.
     {VIAM CENTERAL 2026-10-29 ""OBJECTS IN THE SQUARE" USES THE ESTIMATED FULL INTERIOR EVEN WHEN PARTIAL"}
     """
-    sq = tmap.get("square")
+    sq, bk = tmap.get("square"), tmap.get("bucket")
     for e in tmap["objects"]:
-        e["in_square"] = drop_square.contains(sq, e["xy"])
+        # The drop target is the bucket when one is on the map (SORTER_TARGET=bucket): delivered = inside its mouth
+        e["in_square"] = bucket.contains(bk, e["xy"]) if bk and bucket.TARGET == "bucket" else drop_square.contains(sq, e["xy"])
 
 
 # ---- dynamic map: every frame the arm takes updates it ------------------------------------------------------
@@ -298,11 +299,16 @@ def observe_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = N
                      "emb16": base64.b64encode(np.asarray(r["emb"], np.float16).tobytes()).decode()})
     sq = perception.find_drop_square(rgb, depth, plane=seg.plane)
     square = drop_square.observe(sq, pose, intr) if sq else None
+    bk = None
+    if seg.bucket is not None:
+        a, b, c = seg.plane
+        cu, cv = seg.bucket["center_px"]
+        bk = bucket.locate(seg.bucket, depth.astype(float), float(a * cu + b * cv + c), pose, intr)
     return {"ts": float(time.time() if now is None else now), "source": source,
             "pose": {k: float(pose[k]) for k in ("x", "y", "z", "theta") if k in pose},
             "intr": {k: float(intr[k]) for k in ("fx", "fy", "cx", "cy")},
             "shape": [int(depth.shape[0]), int(depth.shape[1])], "table_depth_mm": round(float(seg.table_depth_mm), 2),
-            "detections": dets, "square": square, "intruders": [[int(c) for c in i["bbox"]] for i in seg.intruders],
+            "detections": dets, "square": square, "bucket": bk, "intruders": [[int(c) for c in i["bbox"]] for i in seg.intruders],
             "depth_valid": _valid_grid(depth)}
 
 
@@ -415,6 +421,8 @@ def apply_observation(tmap: dict, rec: dict) -> dict:
         if sq["misses"] >= MISSES_TO_DROP:
             tmap.pop("square")
 
+    if rec.get("bucket"):  # each view of the bucket moves the map's entry (it is carried around the table)
+        tmap["bucket"] = bucket.update(tmap.get("bucket"), rec["bucket"], now)
     _mark_in_square(tmap)
     tmap["ts"] = now
     # detections without their embeddings, for the dashboard (AGENT 2); the full record is the observation itself
