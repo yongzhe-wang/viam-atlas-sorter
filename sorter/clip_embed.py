@@ -482,7 +482,10 @@ HEIGHT_MISFIT_PENALTY = 0.04
 # Must match what the arm can do: sorter.grasp.MAX_OPEN_MM (not imported: grasp pulls in the arm's script)
 GRASP_MAX_WIDTH_MM = 78.0
 GRASP_MIN_HEIGHT_MM = 10.0  # the descent refuses less: pick_place_auto "implausible block height"
-GRASP_MIN_SIZE_MM = 8.0  # narrower than this is a fragment, not an object
+# Narrower or shorter than this is a fragment, not an object: the smallest things gripped here are 24 mm wide; a 21x13 mm
+# piece of a cylinder's side took the category bonus and came first for "snack" {SCENE2 "YELLOW H10.6 21X13"}
+GRASP_MIN_WIDTH_MM = 15.0
+GRASP_MIN_LENGTH_MM = 25.0
 
 
 def graspable(o, fx: float = 909.93) -> tuple:
@@ -498,7 +501,7 @@ def graspable(o, fx: float = 909.93) -> tuple:
     width, length = o.width_px * mm, o.length_px * mm
     if width > GRASP_MAX_WIDTH_MM:
         return False, f"too wide ({width:.0f} mm)"
-    if width < GRASP_MIN_SIZE_MM:
+    if width < GRASP_MIN_WIDTH_MM or length < GRASP_MIN_LENGTH_MM:
         return False, f"a fragment ({length:.0f}x{width:.0f} mm)"
     return True, ""
 

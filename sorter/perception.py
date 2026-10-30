@@ -116,6 +116,7 @@ class Obj:
     grip_px: tuple = None
     grip_depth_mm: float = None
     n_fragments: int = 1
+    flat: bool = False  # LOW_OBJECTS: 3-12 mm above the table, found by colour and confirmed by depth (a sweet bag)
 
 
 @dataclass
@@ -406,11 +407,111 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
     if MERGE_FRAGMENTS:
         objs, excluded = _merge_fragments(objs, excluded, rgb, valid, ascale, (H, W))
         objs = _absorb_slivers(objs, excluded, ascale, (H, W))
+    if LOW_OBJECTS:
+        objs, excluded = _find_low_objects(objs, excluded, rgb, d, valid, height, ascale)
     for k, (o, _) in enumerate(excluded):
         o.id = -1 - k  # negative ids never collide with targets
     intruders += find_intruders(rgb, valid, model, ascale)
     return Segmentation(table_depth_mm=table_depth, objects=objs, excluded=excluded,
                         intruders=intruders, align=model, plane=(a, b, c), cables=cables)
+
+
+# ---- low objects: too flat for the depth threshold, found by colour and confirmed by depth ------------------
+# A sweet bag stands 6.5 mm above the table: below MIN_HEIGHT_MM except on its creases, so it came out in pieces or not at
+# all. The paper square curls up to several mm too, so depth alone cannot go lower: a low object must also differ from the
+# table in colour, and tape and white paper never count. {SCENE2 OBSERVE "BAG HEIGHT P10/50/90 [-0.1, 5.2, 7.3]" "TABLE
+# [-2.3, -1.4, -0.3]" "PAPER [-1.6, -0.5, 0.9]"} [CONFIDENCE: CONFIRMED 70% — one real bag; every detection on 106 frames checked]
+LOW_OBJECTS = os.environ.get("SORTER_LOW_OBJECTS") == "1"  # off by default (VIAM CENTERAL: behind a flag)
+LOW_MIN_MM = 2.5  # above the table's own level (the plane fit sits ~1.3 mm off); table noise is ~1 mm
+LOW_MAX_MM = 12.0  # taller ones are the normal path's
+LOW_DE_MIN = 12.0  # colour distance from the table, Lab with lightness at half weight (grain and sun change lightness)
+LOW_MIN_AREA_PX = 3000  # ~23x23 mm at the reference depth
+LOW_MIN_WIDTH_MM = 15.0  # a cable on the table is 7-10 mm
+LOW_MIN_RECT = 0.6
+
+
+def _lab(rgb: np.ndarray) -> np.ndarray:
+    """sRGB (uint8) to CIE Lab."""
+    c = rgb.astype(float) / 255.0
+    c = np.where(c > 0.04045, ((c + 0.055) / 1.055) ** 2.4, c / 12.92)
+    xyz = c @ np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]]).T / np.array([0.9505, 1.0, 1.089])
+    f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16.0 / 116.0)
+    return np.stack([116.0 * f[..., 1] - 16.0, 500.0 * (f[..., 0] - f[..., 1]), 200.0 * (f[..., 1] - f[..., 2])], axis=-1)
+
+
+def _find_low_objects(objs: list, excluded: list, rgb: np.ndarray, d: np.ndarray, valid: np.ndarray, height: np.ndarray, ascale: float) -> tuple:
+    """(objects, excluded) plus flat objects; an existing low piece of one (its creases) is replaced by the whole of it."""
+    H, W = d.shape
+    q = 2
+    rgb2, h2, v2 = rgb[::q, ::q], height[::q, ::q], valid[::q, ::q]
+    lab = _lab(rgb2)
+    chroma = np.hypot(lab[..., 1], lab[..., 2])
+    table = v2 & (np.abs(h2) < 4.0)
+    tape = (lab[..., 2] < -12.0) & (chroma > 15.0)  # saturated blue
+    paper = (lab[..., 0] > 68.0) & (chroma < 16.0)
+    ref = table & ~tape & ~paper
+    if ref.sum() < 1000:
+        return objs, excluded
+    level = float(np.median(h2[ref]))
+    tone = np.median(lab[ref], axis=0)
+    de = np.sqrt((0.5 * (lab[..., 0] - tone[0])) ** 2 + (lab[..., 1] - tone[1]) ** 2 + (lab[..., 2] - tone[2]) ** 2)
+    rel = h2 - level
+    never = ndimage.binary_dilation(tape | paper, iterations=6)
+    others = np.zeros_like(v2)
+    for o in objs + [e for e, _ in excluded]:
+        if o.height_mm > LOW_MAX_MM:
+            others |= o.mask[::q, ::q]
+    never |= ndimage.binary_dilation(others, iterations=8)
+    fg = v2 & (rel >= LOW_MIN_MM) & (de >= LOW_DE_MIN) & ~never
+    fg = ndimage.binary_opening(fg, iterations=1)
+    fg = ndimage.binary_fill_holes(ndimage.binary_closing(np.pad(fg, 6), iterations=5))[6:-6, 6:-6] & ~never
+    labels, n = ndimage.label(fg)
+    px_mm = INTRINSICS["fx"] / float(np.median(d[valid]))
+    new = []
+    for i, sl in enumerate(ndimage.find_objects(labels), start=1):
+        m2 = labels[sl] == i
+        if m2.sum() * q * q < LOW_MIN_AREA_PX * ascale:
+            continue
+        h = float(np.median(rel[sl][m2 & v2[sl]]))
+        if not LOW_MIN_MM <= h <= LOW_MAX_MM:
+            continue
+        mask = np.zeros((H, W), bool)
+        small = np.zeros(v2.shape, bool)
+        small[sl] = m2
+        up = np.kron(small, np.ones((q, q), bool))[:H, :W]
+        mask[:up.shape[0], :up.shape[1]] = up
+        vs, us = np.nonzero(mask)
+        u0, v0, u1, v1 = int(us.min()), int(vs.min()), int(us.max()), int(vs.max())
+        fsl = (slice(v0, v1 + 1), slice(u0, u1 + 1))
+        cen, yaw, L, Wd = _geometry(mask[fsl], (u0, v0))
+        rf = rect_fill(mask[fsl])
+        if Wd / px_mm < LOW_MIN_WIDTH_MM or rf < LOW_MIN_RECT:
+            continue
+        mu, mv = int((u1 - u0) * CROP_MARGIN) + 4, int((v1 - v0) * CROP_MARGIN) + 4
+        e = EDGE_MARGIN_PX
+        edge = u0 <= e or v0 <= e or u1 >= W - 1 - e or v1 >= H - 1 - e
+        ok = mask & valid
+        top = float(np.median(d[ok])) if ok.any() else float(np.median(d[valid]))
+        new.append(Obj(id=0, bbox=(u0, v0, u1, v1), centroid_px=cen, yaw_deg=yaw, length_px=L, width_px=Wd, height_mm=h,
+                       top_depth_mm=top, mask=mask, crop=rgb[max(0, v0 - mv):min(H, v1 + mv + 1), max(0, u0 - mu):min(W, u1 + mu + 1)].copy(),
+                       touches_edge=edge, colour=colour_name(rgb[fsl], mask[fsl])[0], rect_fill=rf, top_centroid_px=cen,
+                       colours=colour_fractions(rgb[fsl], mask[fsl]), flat=True))
+    if not new:
+        return objs, excluded
+
+    def replaced(o):
+        return o.height_mm <= LOW_MAX_MM and any((o.mask & f.mask).sum() >= 0.3 * o.mask.sum() for f in new)
+
+    objs2 = [o for o in objs if not replaced(o)]
+    excl2 = [(o, why) for o, why in excluded if not replaced(o)]
+    for f in new:
+        if f.touches_edge:
+            excl2.append((f, "touches the image edge"))
+        else:
+            objs2.append(f)
+    for k, o in enumerate(objs2):
+        o.id = k
+    return objs2, excl2
 
 
 # ---- cables: a thin strip that joins a blob to the frame is not part of the object -------------------------
