@@ -25,6 +25,7 @@ RIM_CLEAR_MM = 25.0  # the held object's bottom passes this far above the rim
 MOUTH_MARGIN_MM = 35.0  # the jaws let go this far inside the rim at least: the object falls in, not onto the rim
 FRESH_S = 5.0  # a bucket estimate older than this is looked for again: people move it
 CONFIRM_MM = 30.0  # the frame over the mouth puts it farther than this from the target: move there
+TRUST_CARRY_S = 20.0  # a bucket found this recently in the carry is released over even when what is held hides it
 LOOK_Z = 580.0  # the whole 197 mm bucket fits one view from here
 RELEASE_TRIES = 3  # moves toward a bucket that keeps moving before giving up (still holding)
 HINT_SKIP_MM = 150.0  # a search pose this close to the one over the last-known spot shows the same table: not looked from again
@@ -282,6 +283,13 @@ async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict,
             if ppa.reachable(q.x, q.y, LOOK_Z):
                 await rig.rise(LOOK_Z)
                 seen = await look(rig, k)
+            if seen is None and time.monotonic() - t <= TRUST_CARRY_S:
+                # What is held can hide the bucket from both looks (the M&M bag, flat and wide under the camera): it was
+                # found for this carry seconds ago, so it is let go there instead of carried back to the table
+                # {USER 2026-10-30 "M&M SNACK FAILED … BUCKET: NOT SEEN AGAIN BEFORE THE RELEASE … WHAT HAPPENED"}
+                # [CONFIDENCE: INFERRED 80% — the log: unseen over the mouth and from LOOK_Z right after a carry look found it]
+                print(f"  bucket: hidden by what is held; letting go where it was found {time.monotonic() - t:.0f} s ago")
+                seen = b
             if seen is None:
                 seen = await locate(rig, k, poses, hint=b["xy"])
             if seen is None:
