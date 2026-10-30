@@ -669,6 +669,54 @@ def table_plane(depth: np.ndarray) -> np.ndarray:
     return a * np.arange(w)[None, :] + b * np.arange(h)[:, None] + c
 
 
+SQUARE_REF_MAX_AGE_S = 60.0  # a full square estimate this recent may stand in for a partial carry view
+SQUARE_MATCH_MM = 15.0  # ... when the partial view's centre is this close to it
+
+
+def full_square_ref(rig, found: dict = None):
+    """
+    A full (all four tape sides) square estimate to trust while carrying, or None: the found frame's, else the live
+    map's (partial False, seen < SQUARE_REF_MAX_AGE_S ago; the map starts a new entry when the paper moves).
+
+    WHY (2026-10-29): with the blue block hanging in front of the lens and the red knife across the interior, the
+    carry view never showed a closed interior and three grasps ended "SquareNotFound", though the observe frame
+    held the whole square (drop_square: (319.0, -10.6), 119.8 x 177.8, partial False).
+    {VIAM CENTERAL 2026-10-29 "完整视图的来源允许是本任务开始前 N 秒内 IDLE / OBSERVE 帧给出的完整估计"}
+    """
+    if found is not None and found.get("depth") is not None:
+        sq = frame_square(found["rgb"], found["depth"], found["pose"], intr(rig))
+        if sq is not None and not sq.get("partial"):
+            return sq
+    sq = (live_map(rig) or {}).get("square")
+    if sq and not sq.get("partial") and sq.get("corners") and time.time() - float(sq.get("seen_ts") or 0.0) <= SQUARE_REF_MAX_AGE_S:
+        return sq
+    return None
+
+
+def resolve_square(rgb: np.ndarray, depth: np.ndarray, pose: dict, k: dict, ref_fn=None) -> tuple:
+    """
+    (square estimate to place by, why) from a carry view: this frame's own if full; else the trusted full estimate
+    (ref_fn) when this frame's partial centre is within SQUARE_MATCH_MM of it; else (None, why).
+    """
+    sq = frame_square(rgb, depth, pose, k)
+    if sq is None:
+        return None, "no square in view"
+    if not sq.get("partial"):
+        return sq, "full view of the square"
+    ref = ref_fn() if ref_fn else None
+    if ref is not None:
+        d = math.hypot(sq["xy"][0] - ref["xy"][0], sq["xy"][1] - ref["xy"][1])
+        if d <= SQUARE_MATCH_MM:
+            return ref, f"partial view {d:.0f} mm from the full estimate"
+        return None, f"partial view {d:.0f} mm from the full estimate (> {SQUARE_MATCH_MM:.0f}): the paper moved?"
+    return None, "partial view and no full estimate to match"
+
+
+def square_confirm(rig, ref_fn=None):
+    """ppa.locate_square_carrying's confirm(rgb, depth, pose) -> (square estimate or None, why)."""
+    return lambda rgb, depth, pose: resolve_square(rgb, depth, pose, intr(rig), ref_fn)
+
+
 def held_ring(rig, obj, frame_pose: dict):
     """
     For a ring grasped by its wall: {"offset": ring centre - jaw point (table xy, at the grasp), "theta": grasp
@@ -690,7 +738,7 @@ SPOT_GRID_MM = 5.0  # candidate release points over the interior
 OCC_MARGIN_MM = 8.0  # kept between the footprint / fingers and anything already standing there
 
 
-def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None):
+def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None, ref_fn=None):
     """
     ppa.place_in_square's choose_spot: (flange xy at theta 0 for the release, why), or (None, why) if no point fits.
 
@@ -707,9 +755,9 @@ def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None):
     """
     def choose(rgb: np.ndarray, depth: np.ndarray, pose: dict) -> tuple:
         k = intr(rig)
-        sq = frame_square(rgb, depth, pose, k)
-        if sq is None or sq.get("partial"):
-            raise ppa.SquareNotFound("the square's full interior is not in view at the carry-offset pose")
+        sq, why = resolve_square(rgb, depth, pose, k, ref_fn)
+        if sq is None:
+            raise ppa.SquareNotFound(f"square at the carry-offset pose: {why}")
         plane = table_plane(depth)
         h = plane - depth
         standing = ndimage.binary_opening((depth > 0) & (h > perception.MIN_HEIGHT_MM)
@@ -1185,8 +1233,13 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         # Look first where the found frame saw part of the paper, then the recent sightings; search the observe
         # pose before any z 580 pose (most squares are in that view)
         partial = partial_square_xy(found, rig)
+        ref_fn = lambda: full_square_ref(rig, found)  # noqa: E731
+        ref = ref_fn()
+        if square_xy is None and ref is not None:
+            square_xy, doc["square_path"] = tuple(ref["xy"]), "full estimate"
         centre = await ppa.place_in_square(rig, height, grip, times, square_xy=square_xy,
-                                           choose_spot=square_spot(rig, size, ring),
+                                           choose_spot=square_spot(rig, size, ring, ref_fn),
+                                           confirm=square_confirm(rig, ref_fn),
                                            more_guesses=([partial] if partial else []) + [xy for xy, _ in sightings],
                                            search_poses=[(*ppa.HOME_XY, ppa.ALIGN_Z)]
                                            + [(x, y, SWEEP_Z) for x, y in SWEEP_XY])

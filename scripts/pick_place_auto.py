@@ -1155,7 +1155,7 @@ def carry_look_xy(rig: Rig, xy: tuple) -> tuple:
     return xy[0] + float(d[0]), xy[1] + float(d[1])
 
 
-async def locate_square_carrying(rig: Rig, guesses: list = (), search_poses: list = None) -> tuple:
+async def locate_square_carrying(rig: Rig, guesses: list = (), search_poses: list = None, confirm=None) -> tuple:
     """
     Leave the arm at ALIGN_Z, theta 0, with the square's FULL interior in view and its centre servoed onto the
     carry-offset pixel; returns the flange xy over the hole centre. Raises SquareNotFound (still holding).
@@ -1169,8 +1169,15 @@ async def locate_square_carrying(rig: Rig, guesses: list = (), search_poses: lis
     {VIAM CENTERAL 2026-10-29 "NEVER RELEASE UNLESS THE FULL INTERIOR WAS SEEN WITHIN THIS TASK"}
     [CONFIDENCE: SINGLE-SRC 85% — coordinator's rule; find_square only accepts a tape-ringed hole not touching the border]
     The hole centre is the enclosed region's centroid, the same at any rotation of the paper.
+    confirm(rgb, depth, pose) -> (square estimate or None, why) (the executor's drop_square check) replaces the
+    closed-interior test and its servo: with the blue block hanging in front and a knife across the interior the
+    interior never looked closed and three grasps ended SquareNotFound. The arm then stops at the guess's
+    carry-offset pose with the estimate confirmed; the release spot comes from that frame in table coordinates.
     """
     from sorter.perception import world_xy
+
+    if confirm is not None:
+        return await locate_by_estimate(rig, guesses, search_poses, confirm)
 
     async def confirm() -> tuple:
         # Full interior in view here: refine onto the carry-offset pixel, return the hole centre's flange xy
@@ -1218,8 +1225,47 @@ async def locate_square_carrying(rig: Rig, guesses: list = (), search_poses: lis
     raise SquareNotFound("square: no full view of its interior anywhere on the table")
 
 
+async def locate_by_estimate(rig: Rig, guesses: list, search_poses: list, confirm) -> tuple:
+    """locate_square_carrying with confirm(): guesses, then the early-exit search; returns the square's centre xy."""
+    async def look() -> dict:
+        q = await rig.pose()
+        rgb, depth = await rig.frame()
+        sq, why = confirm(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
+        print(f"  square: {why}")
+        return sq
+
+    async def go(xy) -> bool:
+        lx, ly = carry_look_xy(rig, xy)
+        if not reachable(lx, ly) or math.hypot(lx, ly) < 150.0:
+            return False
+        await travel(rig, lx, ly, theta=0.0)
+        return True
+
+    for xy in guesses:
+        if await go(xy):
+            sq = await look()
+            if sq is not None:
+                return tuple(sq["xy"])
+    poses = list(search_poses or [(x, y, ALIGN_Z) for x, y in SEARCH_XY])
+    poses = [q for q in poses if reachable(*q) and math.hypot(q[0], q[1]) >= 150.0]
+    p = await rig.pose()
+    at = (p.x, p.y)
+    while poses:
+        x, y, z = min(poses, key=lambda q: (q[2] > ALIGN_Z + 1, math.hypot(q[0] - at[0], q[1] - at[1])))
+        poses.remove((x, y, z))
+        at = (x, y)
+        await travel(rig, x, y, theta=0.0, z=z)
+        sq = await look()
+        if sq is not None and await go(sq["xy"]):
+            sq2 = await look()
+            if sq2 is not None:
+                return tuple(sq2["xy"])
+    raise SquareNotFound("square: no view of it that confirms its full interior")
+
+
 async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None,
-                          choose_spot=None, more_guesses: list = (), search_poses: list = None) -> tuple:
+                          choose_spot=None, more_guesses: list = (), search_poses: list = None,
+                          confirm=None) -> tuple:
     """
     Steps 3-4: carry to the square, release in its hole; returns the flange xy over the hole's centre.
 
@@ -1237,7 +1283,7 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     print("3/5 carry to the blue square")
     times["at"] = "carry"
     guesses = [g for g in [square_xy, *more_guesses] if g is not None]
-    centre = await locate_square_carrying(rig, guesses, search_poses)
+    centre = await locate_square_carrying(rig, guesses, search_poses, confirm)
     spot = centre
     if choose_spot is not None:
         q = await rig.pose()
