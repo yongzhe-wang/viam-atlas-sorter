@@ -113,46 +113,6 @@ def is_tilted(pose_full) -> bool:
     return math.hypot(p["o_x"], p["o_y"]) > 1e-3
 
 
-def on_table(pose_full, intr: dict, us, vs, table_depth_mm: float) -> np.ndarray:
-    """
-    True where the ray through colour pixel (u, v), taken to the table's depth, lands on the table (coverage.TABLE_X/Y).
-    WHY: at the table's edge the view is half floor, and a chair back there read as a hand: the arm waited 15 s.
-    {USER 2026-10-30 "THIS NEED TO BE FIXD" (SCREENSHOT: "HAND: THE ARM WAITS" ON THE CHAIR PAST THE TABLE'S EDGE)}
-    [CONFIDENCE: CONFIRMED 90% — those boxes' centres are at world y 534..589, the table ends at y 440]
-    """
-    from sorter import coverage  # (imports pick_place_auto: not at module level)
-    w = camera_to_world(pose_full, intr, us, vs, table_depth_mm)
-    return ((w[..., 0] >= coverage.TABLE_X[0]) & (w[..., 0] <= coverage.TABLE_X[1])
-            & (w[..., 1] >= coverage.TABLE_Y[0]) & (w[..., 1] <= coverage.TABLE_Y[1]))
-
-
-def intruders_on_table(intruders: list, pose_full, intr: dict, table_depth_mm: float) -> list:
-    """
-    Only the intruders with some of their box over the table (a 5 x 5 grid of points in it); scenery past the
-    table's edge is dropped. A box is a bbox or {"bbox": ...}. Unchanged without a pose, or for a tilted view.
-    """
-    if pose_full is None or intr is None or not table_depth_mm or is_tilted(pose_full):
-        return list(intruders)
-    out = []
-    for i in intruders:
-        u0, v0, u1, v1 = i["bbox"] if isinstance(i, dict) else i
-        us, vs = np.meshgrid(np.linspace(u0, u1, 5), np.linspace(v0, v1, 5))
-        # a hand reaching in from the edge has part of its box over the table: kept
-        if on_table(pose_full, intr, us, vs, table_depth_mm).any():
-            out.append(i)
-    return out
-
-
-def table_mask(pose_full, intr: dict, shape: tuple, table_depth_mm: float, step: int = 8) -> np.ndarray:
-    """on_table() for every pixel of a shape (h, w), computed every `step` px and spread back; all True when tilted."""
-    h, w = shape
-    if pose_full is None or is_tilted(pose_full):
-        return np.ones((h, w), bool)
-    vs, us = np.mgrid[0:h:step, 0:w:step]
-    m = on_table(pose_full, intr, us + step / 2, vs + step / 2, table_depth_mm)
-    return np.repeat(np.repeat(m, step, axis=0), step, axis=1)[:h, :w]
-
-
 def project(pose_full, intr: dict, xyz) -> tuple:
     """(u, v, depth) where the world point xyz appears: the inverse of camera_to_world (depth along the optical axis)."""
     p = _pose(pose_full)

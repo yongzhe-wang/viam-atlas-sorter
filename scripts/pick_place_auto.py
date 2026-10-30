@@ -382,89 +382,6 @@ def find_square(rgb: np.ndarray):
 
 
 FINGER_ROW = 600  # image rows below this always hold the fingers / held object (invalid depth)
-INTRUDER_BLIND_PX = 40000  # invalid-depth patch this big = something within ~280 mm (normal frames <= ~13k)
-INTRUDER_TALL_PX = 5000  # valid depth this many px > 100 mm above the table = hand/arm (blocks are < 80 mm)
-
-
-# A hand or arm reaching in is thick in the image; the arm's own cable hanging in front of the lens is a thin strip
-# (reset 2026-10-29: "hand/arm in the workspace: pausing" until the 120 s timeout, the cable down the right side of
-# the view, reset4.jpg). Only blobs this wide count: a 20 mm cable at ~200 mm is ~90 px across at most, a hand at
-# 100-250 mm several hundred.
-# {VIAM CENTERAL 2026-10-29 "在不削弱真人手检测的前提下排除 SELF-CABLE ... 细长暗条带只记一条 WARNING，不暂停"}
-# [CONFIDENCE: INFERRED 70% — cable frames thin by inspection; no real hand frame recorded yet]
-INTRUDER_MIN_HALF_WIDTH_PX = 60
-WAIT_TELL_S = 20.0  # paused this long: the status asks for whatever is in front of the camera to be moved
-
-
-def intruder_why(depth: np.ndarray, near_uv=None, radius: float = 300.0, rgb: np.ndarray = None):
-    """
-    Why a hand or arm seems to be in the workspace around `near_uv` (whole view if None), or None.
-
-    WHY: people reach into the table while the arm works (the block was moved mid-servo on 2026-10-29).
-    At ALIGN_Z a hand 100 mm above the table is closer than the RealSense minimum range, so it shows as a
-    large patch of invalid depth rather than as a tall blob; both signals count, per blob, and only blobs at least
-    2 x INTRUDER_MIN_HALF_WIDTH_PX wide somewhere (thin strips such as the arm's cable are logged, not counted).
-    With `rgb`, a blind blob that is dark in colour is a black object or the cable, not a hand: the black tape roll
-    reads no depth at all (matte black, 64611 px, 219 px wide on square_centered.npz), and the reset paused on it
-    under the jaws until the timeout.
-    {BASELINE 2026-10-29 "LARGEST INVALID BLOB ABOVE ROW 600: 13158 PX"} vs a hand ~200k px at 250 mm
-    [CONFIDENCE: INFERRED 75% — thresholds from 4 baseline frames and geometry, no real hand tested yet]
-    """
-    h, w = depth.shape
-    roi = np.ones((h, w), bool)
-    if near_uv is not None:
-        vv, uu = np.ogrid[:h, :w]
-        roi = (uu - near_uv[0]) ** 2 + (vv - near_uv[1]) ** 2 < radius ** 2
-    roi[FINGER_ROW:] = False
-    valid = depth[depth > 0]
-    hist, edges = np.histogram(valid, bins=np.arange(100, 1500, 4))
-    table = float(edges[np.argmax(hist)] + 2)
-    # The gripper and anything it holds hang in from the bottom edge and are always too close for depth:
-    # drop blind patches touching the bottom row (a held block paused the arm as a "hand" for 120 s)
-    blind_all, _ = ndimage.label(depth == 0)
-    held = np.isin(blind_all, np.unique(blind_all[-1][blind_all[-1] > 0]))
-    blind = (depth == 0) & ~held
-    # The stereo sensor never reads its left edge: that band joined the black tape roll and the KIND bar into one
-    # "hand" (perception.find_intruders drops it too)
-    from sorter.perception import DEPTH_LEFT_INVALID_U
-    blind[:, :DEPTH_LEFT_INVALID_U] = False
-    for name, mask, limit in (("tall", (depth > 0) & (depth < table - 100), INTRUDER_TALL_PX),
-                              ("blind", blind, INTRUDER_BLIND_PX)):
-        lab, n = ndimage.label(mask & roi)
-        if not n:
-            continue
-        areas = ndimage.sum(mask & roi, lab, range(1, n + 1))
-        for i in np.nonzero(areas > limit)[0]:
-            # Half-width = largest distance from the blob's inside to its edge
-            comp = lab == i + 1
-            half = float(ndimage.distance_transform_edt(comp).max())
-            if name == "blind" and rgb is not None:
-                # A black object's blob is largely dark (a ring's hole reads no depth either, but is not dark)
-                dark = float((np.asarray(Image.fromarray(rgb).convert("HSV"))[..., 2][comp] < 70).mean())
-                if dark >= 0.3:  # the tape roll read 46% (its hole is blind but light); skin is never this dark
-                    print(f"  dark blind blob {int(areas[i])} px ({dark:.0%} dark): a black object or cable, not a hand")
-                    continue
-            if half >= INTRUDER_MIN_HALF_WIDTH_PX:
-                return f"{name} blob {int(areas[i])} px, {2 * half:.0f} px wide"
-            print(f"  thin {name} strip {int(areas[i])} px, {2 * half:.0f} px wide in view (cable?): ignored")
-    return None
-
-
-def intruder(depth: np.ndarray, near_uv=None, radius: float = 300.0) -> bool:
-    """True if intruder_why() finds a hand or arm around `near_uv`."""
-    return intruder_why(depth, near_uv, radius) is not None
-
-
-def bbox_near(bbox, uv, radius: float) -> bool:
-    """True if bbox (u0, v0, u1, v1) comes within `radius` px of `uv` (whole image if uv is None)."""
-    if uv is None:
-        return True
-    du = max(bbox[0] - uv[0], 0, uv[0] - bbox[2])
-    dv = max(bbox[1] - uv[1], 0, uv[1] - bbox[3])
-    return math.hypot(du, dv) < radius
-
-
-STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "arm_state.json"
 
 
 def pile_on() -> bool:
@@ -1121,42 +1038,10 @@ class Rig:
 
     async def wait_clear(self, near_uv=None, timeout_s: float = 300.0) -> None:
         """
-        Pause while something reaches into the workspace near `near_uv`; resume after 2 s clear.
-
-        Status "paused_person"; after WAIT_TELL_S "waiting: something in front of the camera", so the dashboard says
-        what to do instead of the task just failing (the reset gave up after 120 s on the arm's own cable).
-        Raises RuntimeError if it does not clear within timeout_s (the caller lifts and reports).
+        One fresh frame at this pose: clear_landing and pile_on read rig.last_depth from it. No hand pause any more
+        {USER 2026-10-30 "JUST REMOVE THIS COMPLETELY" (THE "HAND: THE ARM WAITS" BOXES AND PAUSES)}
         """
-        from sorter.perception import segment_full
-
-        t0, clear_since, paused = time.monotonic(), None, False
-        while True:
-            rgb, depth = await self.frame()
-            why = intruder_why(depth, near_uv, rgb=rgb) if depth is not None else None
-            busy = why is not None
-            if depth is not None and not busy:
-                # AGENT3's detector: skin-coloured blind holes / tall blobs reaching into the workspace
-                # Static tall things (the ~110 mm transparent cups read "blob 112 mm tall, skin 0%") are not
-                # people; only skin-coloured intruders count here (intruder() above still sees tall blobs at the target)
-                busy = any(bbox_near(i["bbox"], near_uv, 300.0) and "skin 0%" not in i["reason"]
-                           for i in segment_full(rgb, depth).intruders)
-            if not busy:
-                clear_since = clear_since or time.monotonic()
-                if not paused or time.monotonic() - clear_since >= 2.0:
-                    if paused:
-                        print("  workspace clear, resuming")
-                    self.status = None
-                    return
-            else:
-                if not paused:
-                    print(f"  hand/arm in the workspace: pausing ({why or 'skin-coloured intruder'})")
-                paused, clear_since = True, None
-                waited = time.monotonic() - t0
-                self.status = "paused_person" if waited < WAIT_TELL_S else "waiting: something in front of the camera"
-            if time.monotonic() - t0 > timeout_s:
-                self.status = None
-                raise RuntimeError("workspace not clear for too long")
-            await asyncio.sleep(0.5)
+        await self.frame()
 
     async def descend(self, z_target: float, settle: bool = True) -> None:
         """

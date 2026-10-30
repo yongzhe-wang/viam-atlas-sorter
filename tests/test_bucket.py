@@ -43,7 +43,7 @@ def test_found_and_located_at_the_rim():
     assert abs(b["rim_height_mm"] - 175.0) < 8 and abs(b["radius_mm"] - 230 * rim_depth / K["fx"]) < 4, b
 
 
-def test_cut_out_of_segmentation_and_no_intruder():
+def test_cut_out_of_segmentation():
     rgb, d = scene()
     saved = B.TARGET
     try:
@@ -53,8 +53,8 @@ def test_cut_out_of_segmentation_and_no_intruder():
         on = P.segment_full(rgb, d, align=P.IDENTITY)
     finally:
         B.TARGET = saved
-    assert off.intruders, "without the cut the bucket is a tall blob"
-    assert not on.intruders and on.bucket is not None
+    # without the cut the bucket is a tall blob: never a target either way (no intruders since 2026-10-30)
+    assert off.bucket is None and not off.intruders and not on.intruders and on.bucket is not None
     assert [o.colour for o in on.objects] == ["blue"], [(o.colour, o.bbox) for o in on.objects]
 
 

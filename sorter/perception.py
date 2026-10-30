@@ -7,9 +7,9 @@ construction.
 
 Flow: depth -> robust table plane fit -> height map -> blobs 8-100 mm tall (depth grid) -> mapped onto the
 colour grid -> Obj (geometry from the colour mask, crop from colour, heights from depth).
-Intruders (hands, arms) are reported separately so the executor can pause; see find_intruders().
+No hand / intruder detection: removed on the user's word ("just remove this completely", 2026-10-30).
 
-Contract: docs/EXEC_PLAN.md (Obj, segment). segment_full() also returns intruders and the alignment used.
+Contract: docs/EXEC_PLAN.md (Obj, segment). segment_full() also returns the alignment used.
 """
 import json
 import math
@@ -60,48 +60,9 @@ TOP_BAND_MM = 8.0
 EDGE_MARGIN_PX = 8  # an object this close to the image border is cut off: excluded, not a target
 # Optional workspace polygon in colour pixels at the observe pose: [[u, v], ...]; absent = whole image
 WORKSPACE_FILE = Path(__file__).resolve().parent.parent / "data" / "workspace.json"
-INTRUDER_MIN_AREA_PX = 6000  # blind-range hole this large could be a hand
-SKIN_FRAC = 0.30  # fraction of skin-coloured pixels that turns a hole or blob into an intruder
-# An intruder must reach this far into the image: a hand reaching for an object does, while static tall
-# scenery cut by the border does not (a laptop hinge at the top edge read 102 mm and paused everything).
-INTRUDER_INNER_MARGIN_PX = 150
 
 
-# A hand reaches over the table, so the table is around it; a thing past the table's edge has the floor around it (far below
-# the table, or no depth at all on a dark carpet). A skin-coloured hole with less than this share of table-level pixels in a
-# ring around it is not a hand. A tall blob needs the floor seen around it as well: a clear jug standing on the table has
-# no depth around its rim either, and a standing object stays an intruder.
-# {VIAM CENTERAL 2026-10-30 "桌子外面地上一个缠了蓝胶带的物体 … 被框成 'HAND: THE ARM WAITS'"; "DEPTH 落在拟合桌面以外的区域
-# （地板，比桌面远很多；或者在桌边多边形之外）不算"; "保持现在的规则（立着的高物体算 INTRUDER）"} [CONFIDENCE: INFERRED 65% —
-# synthetic frames and the 133 real ones (no intruder there changes); no real frame of that floor object yet]
-INTRUDER_RING_PX = 20  # the ring around an intruder, colour pixels
-INTRUDER_TABLE_BAND_MM = 15.0  # table level: within this of the fitted plane
-INTRUDER_RING_TABLE_MIN = 0.25
-FLOOR_BELOW_MM = 100.0  # the floor: this far below the table plane (it is ~750 mm below)
 
-
-def _over_table(m: np.ndarray, table_level: np.ndarray, floor_level: np.ndarray = None) -> bool:
-    """
-    Is the region m (full-image bool, colour grid) over the table: enough table-level pixels in the ring around it?
-    With `floor_level`, it is past the table only if the ring also shows the floor (that share of floor-level pixels).
-    """
-    if table_level is None:
-        return True
-    vs, us = np.nonzero(m)
-    r = INTRUDER_RING_PX
-    v0, v1, u0, u1 = max(vs.min() - r, 0), min(vs.max() + r + 1, m.shape[0]), max(us.min() - r, 0), min(us.max() + r + 1, m.shape[1])
-    sub = m[v0:v1, u0:u1]
-    ring = ndimage.binary_dilation(sub, iterations=r) & ~sub  # inside the image only: the border is no evidence either way
-    if not ring.any() or float(table_level[v0:v1, u0:u1][ring].mean()) >= INTRUDER_RING_TABLE_MIN:
-        return True
-    return floor_level is not None and float(floor_level[v0:v1, u0:u1][ring].mean()) < INTRUDER_RING_TABLE_MIN
-
-
-def _reaches_inside(bbox: tuple, shape: tuple) -> bool:
-    """True if the bbox overlaps the image shrunk by INTRUDER_INNER_MARGIN_PX on every side."""
-    u0, v0, u1, v1 = bbox
-    m, (h, w) = INTRUDER_INNER_MARGIN_PX, shape
-    return u1 > m and u0 < w - m and v1 > m and v0 < h - m
 
 
 def _mask_fingers(img: np.ndarray) -> None:
@@ -156,7 +117,7 @@ class Segmentation:
     table_depth_mm: float  # fitted plane at the image centre
     objects: list  # fully visible, inside the workspace: the only things the arm may target
     excluded: list  # [(Obj, reason)]: cut by the image border or outside the workspace (debug / dashboard)
-    intruders: list  # [{"bbox", "area", "reason"}]: pause the arm while non-empty
+    intruders: list  # always empty: kept so callers that read it need no change
     align: tuple  # depth -> colour model that was used (IDENTITY or UNALIGNED)
     plane: tuple  # (a, b, c): table depth = a*u + b*v + c on the depth grid
     cables: list = field(default_factory=list)  # SPLIT_BLOBS: [{"bbox", "length_mm", "width_mm"}] depth grid, never targets
@@ -194,8 +155,6 @@ def fit_table(depth: np.ndarray) -> tuple:
 # {TILT_Y+ "|RES|<3MM SHARE 0.04" "INTR ['BLOB 149 MM TALL…', 'BLOB 160 MM TALL…']"; SCAN "MIN 0.63"; BUCKET "0.58"}
 # [CONFIDENCE: CONFIRMED 80% — three tilted frames; straight-down frames never take this path]
 TILT_FIT_SHARE = 0.3
-BUCKET_NEAR_PX = 30  # a tall or skin-coloured blob this close to the bucket ...
-BUCKET_PART_SHARE = 0.2  # ... with this share of it there is part of the bucket (handle, shaded wall)
 
 
 def _linear_fit_share(d: np.ndarray, plane: tuple) -> float:
@@ -253,16 +212,6 @@ def fit_table_3d(depth: np.ndarray, intr: dict = None) -> tuple:
     A = np.column_stack([uu[::8, ::8][ok], vv[::8, ::8][ok], np.ones(int(ok.sum()))])
     (a, b, c), *_ = np.linalg.lstsq(A, z[ok], rcond=None)
     return n, k, height, (float(a), float(b), float(c))
-
-
-def _on_arm(sd: tuple, m_d: np.ndarray, d: np.ndarray, pose: dict, intr: dict) -> bool:
-    """A blob (depth-grid slice and mask) whose valid pixels mostly lie on the arm's base, sampled to at most ~400 pixels."""
-    from sorter import camera_model
-
-    vs, us = np.nonzero(m_d & (d[sd] > 0))
-    step = max(1, len(vs) // 400)
-    vs, us = vs[::step] + sd[0].start, us[::step] + sd[1].start
-    return camera_model.arm_part(pose, intr or INTRINSICS, us, vs, d[vs, us])
 
 
 def to_depth_grid(mask: np.ndarray, model: tuple = None) -> np.ndarray:
@@ -401,46 +350,12 @@ def area_scale(table_depth_mm: float) -> float:
     return min(1.0, (REF_TABLE_DEPTH_MM / max(table_depth_mm, 1.0)) ** 2)
 
 
-def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple, scale: float = 1.0, table_level: np.ndarray = None) -> list:
-    """
-    Hands/arms: large invalid-depth regions that are skin-coloured.
-
-    WHY: at the observe pose the camera is ~378 mm above the table and depth is blind closer than ~280 mm,
-    so a hand more than ~100 mm above the table appears as a hole, not as a tall blob. Holes at the depth
-    sensor's left edge and in the gripper zone (fingers, held object) are excluded; a glossy phone screen
-    is also a hole but not skin-coloured. `table_level` (colour grid): a hole without the table around it is the floor
-    past the table's edge (_over_table), not a hand.
-    """
-    hole = ndimage.binary_opening(~valid, iterations=6)
-    hole[:, :DEPTH_LEFT_INVALID_U] = False
-    hole = to_colour(hole, model)
-    _mask_fingers(hole)
-    lab, n = ndimage.label(hole)
-    H = hole.shape[0]
-    out = []
-    for i in range(1, n + 1):
-        m = lab == i
-        area = int(m.sum())
-        if area < INTRUDER_MIN_AREA_PX * scale:
-            continue
-        vs, us = np.nonzero(m)
-        bbox = (int(us.min()), int(vs.min()), int(us.max()), int(vs.max()))
-        # Attached to the bottom edge under the gripper = the held object itself, not a person
-        if bbox[3] >= H - 3 and 450 <= us.mean() <= 1280:
-            continue
-        sk = skin_fraction(rgb, m)
-        if sk >= SKIN_FRAC and _reaches_inside(bbox, m.shape) and _over_table(m, table_level):
-            out.append({"bbox": bbox, "area": area, "reason": f"blind-range hole, skin {sk:.0%}"})
-    return out
-
-
 def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None, pose: dict = None, intr: dict = None) -> Segmentation:
     """
-    Objects, intruders and table depth from one colour + depth frame (both 1280x720).
+    Objects and table depth from one colour + depth frame (both 1280x720).
 
     `align`: depth -> colour model; None = IDENTITY (align_color_depth on), checked once per process.
-    `pose` (with o_x/o_y/o_z when the wrist is tilted) and `intr`: given for a tilted view, a tall blob on the arm's own base
-    is not an intruder (camera_model.arm_part). Without a pose, or looking straight down, nothing changes.
+    `pose` and `intr` are accepted for callers that pass them; nothing reads them since the intruders went.
     """
     d = depth.astype(float)
     valid = (d > 0) & (d < 2000)
@@ -454,11 +369,7 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None, pose: dict = No
     if bk is not None:
         cut = to_depth_grid(bk["mask"], align if align is not None else _ALIGN["model"])  # None until checked: aligned
         d = np.where(cut, 0.0, d)
-        valid_for_intruders = valid | cut
         valid = valid & ~cut
-    near_bucket = ndimage.binary_dilation(bk["mask"], iterations=BUCKET_NEAR_PX) if bk is not None else None
-    from sorter import camera_model  # (imports perception: not at module level)
-    tilted = pose is not None and camera_model.is_tilted(pose)
     a, b, c = fit_table(d)
     vv, uu = np.mgrid[0:d.shape[0], 0:d.shape[1]]
     if _linear_fit_share(d, (a, b, c)) < TILT_FIT_SHARE:
@@ -470,10 +381,6 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None, pose: dict = No
     above = ndimage.binary_opening(valid & (height > MIN_HEIGHT_MM) & (height < 300), iterations=2)
     table = valid & (np.abs(height) < 3)
     model = align if align is not None else _startup_alignment(rgb, above, table)
-    table_level = to_colour(valid & (np.abs(height) < INTRUDER_TABLE_BAND_MM), model)  # for _over_table
-    if bk is not None:
-        table_level |= bk["mask"]  # the bucket stands on the table: a hand over it is over the workspace
-    floor_level = to_colour(valid & (height < -FLOOR_BELOW_MM), model)
 
     # Grow seeds (> MIN_HEIGHT_MM) through low pixels (> GROW_HEIGHT_MM) so one thing is one object
     low = ndimage.binary_opening(valid & (height > GROW_HEIGHT_MM) & (height < 300), iterations=2) | above
@@ -514,24 +421,9 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None, pose: dict = No
         top_h = float(np.percentile(height[sd][m_d], 90))
         vs, us = np.nonzero(m_s)
         bbox = (int(cu0 + us.min()), int(cv0 + vs.min()), int(cu0 + us.max()), int(cv0 + vs.max()))
-        # A tall blob, or a skin-coloured one (a hand resting on the table), is never a target
-        sk = skin_fraction(rgb[sc], m_s)
-        if top_h > MAX_OBJ_HEIGHT_MM or sk >= 0.5:
-            # The bucket's handle (a black wire loop standing up) and its shaded wall (reads as skin) are the bucket, not a hand
-            # {AFTER_BB "BLOB 86 MM TALL, SKIN 64%" = HANDLE + WALL BESIDE THE CUT} [CONFIDENCE: CONFIRMED 80% — three frames]
-            if near_bucket is not None and near_bucket[sc][m_s].mean() >= BUCKET_PART_SHARE:
-                continue
-            if tilted and _on_arm(sd, m_d, d, pose, intr):
-                continue
-            # Standing past the table's edge (a chair, a thing on the floor): no table around it
-            full = np.zeros((H, W), bool)
-            full[sc] = m_s
-            if not _over_table(full, table_level, floor_level):
-                continue
-            # Never a target; an intruder only if it reaches into the workspace (else static scenery)
-            if _reaches_inside(bbox, (H, W)):
-                intruders.append({"bbox": bbox, "area": int(m_s.sum()),
-                                  "reason": f"blob {top_h:.0f} mm tall, skin {sk:.0%}"})
+        # A tall blob, or a skin-coloured one (a hand resting on the table), is never a target; nor is it reported: the
+        # hand pause is gone {USER 2026-10-30 "JUST REMOVE THIS COMPLETELY" ("HAND: THE ARM WAITS")}
+        if top_h > MAX_OBJ_HEIGHT_MM or skin_fraction(rgb[sc], m_s) >= 0.5:
             continue
         u0, v0, u1, v1 = bbox
         mu, mv = int((u1 - u0) * CROP_MARGIN) + 4, int((v1 - v0) * CROP_MARGIN) + 4
@@ -571,7 +463,6 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None, pose: dict = No
         objs, excluded = _find_low_objects(objs, excluded, rgb, d, valid, height, ascale)
     for k, (o, _) in enumerate(excluded):
         o.id = -1 - k  # negative ids never collide with targets
-    intruders += find_intruders(rgb, valid_for_intruders if bk is not None else valid, model, ascale, table_level)
     return Segmentation(table_depth_mm=table_depth, objects=objs, excluded=excluded,
                         intruders=intruders, align=model, plane=(a, b, c), cables=cables, bucket=bk)
 
@@ -899,7 +790,7 @@ def _merge_fragments(objs: list, excluded: list, rgb: np.ndarray, valid: np.ndar
         # The body: the core plus the invalid pixels the opening shaved off it, back on the full grid
         grown = ndimage.binary_dilation(core, iterations=MERGE_CORE_R + 1, mask=inv)
         body = np.kron(grown, np.ones((q, q), bool))[:H, :W] & ~valid
-        if skin_fraction(rgb, body) < 0.5:  # a hand is find_intruders' business
+        if skin_fraction(rgb, body) < 0.5:  # skin-coloured: a hand, never a low object
             bodies.append(body)
     if not bodies:
         return objs, excluded
@@ -1268,7 +1159,7 @@ def _hole_hull(lab: np.ndarray, i: int, sl: tuple, plane: tuple) -> tuple:
 
 
 def segment(rgb: np.ndarray, depth: np.ndarray) -> tuple:
-    """(table_depth_mm, objects), the EXEC_PLAN contract. Use segment_full() for intruders and alignment."""
+    """(table_depth_mm, objects), the EXEC_PLAN contract. Use segment_full() for the alignment."""
     s = segment_full(rgb, depth)
     return s.table_depth_mm, s.objects
 

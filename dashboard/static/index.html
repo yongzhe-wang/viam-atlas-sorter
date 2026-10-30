@@ -202,20 +202,21 @@ function isTarget(names, label) {
   return !!((t.text && all.some((n) => n === t.text || n.includes(t.text))) || (t.label && all.includes(t.label)));
 }
 
-// ---- the picture's boxes: objects, the target thick, edge-cut grey, a hand red ----------------------
+// ---- the picture's boxes: objects, the target thick, edge-cut grey (no hand boxes: removed 2026-10-30) ----------
 function drawBoxes() {
   const svg = $("boxes"), m = camMeta || {};
   svg.replaceChildren();
   if (!m.w) return;
   svg.setAttribute("viewBox", `0 0 ${m.w} ${m.h}`);
   for (const b of m.boxes || []) {
-    const [u0, v0, u1, v1] = b.bbox, hand = b.kind === "intruder", part = b.kind === "partial";
-    const hit = !hand && isTarget(b.names, b.label);
-    const colour = hand ? "var(--bad)" : hit ? "var(--accent)" : part ? "#9a988f" : "var(--box)";
+    if (b.kind === "intruder") continue;  // an old module's hand box: not shown
+    const [u0, v0, u1, v1] = b.bbox, part = b.kind === "partial";
+    const hit = isTarget(b.names, b.label);
+    const colour = hit ? "var(--accent)" : part ? "#9a988f" : "var(--box)";
     svg.appendChild(mk("rect", { x: u0, y: v0, width: u1 - u0, height: v1 - v0, fill: "none", stroke: colour,
-      "stroke-width": hit || hand ? 4 : 2, ...(part ? { "stroke-dasharray": "6 4" } : {}) }));
-    if (!b.label && !hand) continue;
-    const text = hand ? "hand: the arm waits" : `${hit ? "▶ " : ""}${b.label}${b.score != null && !hit ? ` ${Number(b.score).toFixed(2)}` : ""}`;
+      "stroke-width": hit ? 4 : 2, ...(part ? { "stroke-dasharray": "6 4" } : {}) }));
+    if (!b.label) continue;
+    const text = `${hit ? "▶ " : ""}${b.label}${b.score != null && !hit ? ` ${Number(b.score).toFixed(2)}` : ""}`;
     svg.appendChild(mk("text", { x: u0 + 2, y: v0 > 18 ? v0 - 5 : v1 + 15, fill: colour, stroke: "#000", "stroke-width": 3, "paint-order": "stroke" }, text));
   }
 }
@@ -227,8 +228,6 @@ function stateLine(d) {
   if (!d.link.up) return ["warn", "⟳", `reconnecting… ${d.link.error || ""}`];
   if (d.estop) return ["bad", "⛔", "E-STOP pressed — release it, then press Reset"];
   const ph = String(d.phase || "");
-  if (ph.startsWith("paused_person") || ph.startsWith("waiting") || (!d.busy && d.seen.intruders))
-    return ["bad", "✋", "camera blocked — a hand in the workspace, the arm waits"];
   if (ph === "reconnecting") return ["warn", "⟳", "the arm's link is reconnecting"];
   if (d.warm === false) return ["warn", "…", "warming up: loading CLIP and the object library"];
   const r = d.running;

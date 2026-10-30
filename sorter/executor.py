@@ -1183,79 +1183,6 @@ def width_mm(obj, fx: float) -> float:
     return grasp.across_mm(obj, fx)
 
 
-# Something in front of the colour lens only (the arm's cable hanging across the view, 2026-10-29): the colour image
-# shows a big dark band where the stereo depth still sees the flat table. That cut the square in two and a reset
-# ended "SquareNotFound". Dark-but-flat pixels: 81140 on that frame, <= 5252 on all 92 survey/observe frames.
-# {VIAM CENTERAL 2026-10-29 "加一个 CAMERA-OCCLUDED 检测 ... 暂停并重试，不要把它当成「找不到」"}
-# [CONFIDENCE: CONFIRMED 85% — one blocked frame vs 92 clear ones; a hand blocks depth too: the 15% rule]
-BLOCKED_DARK_FLAT_PX = 25000
-BLOCKED_DEPTH_FRAC = 0.15  # invalid or < 280 mm depth over the upper image (a hand right in front of the lens)
-BLOCKED_WAIT_S = 15.0  # then go on: views from other wrist angles get around a cable (go_over_square)
-BLOCKED_STATUS = "camera blocked (cable/hand in front of the lens)"
-
-
-def view_blocked(rgb: np.ndarray, depth: np.ndarray, over_table: np.ndarray = None) -> tuple:
-    """
-    (blocked?, why): something right in front of the lens hides a large part of the table.
-    over_table (camera_model.table_mask): only pixels over the table count; the floor past the table's edge reads no
-    depth and was "camera blocked" for 15 s at every edge view {OBS 14:04:43 POSE (240, 360, 400) "CAMERA BLOCKED"}.
-    """
-    if depth is None:
-        return False, "no depth"
-    band = depth[:440]  # above the held object / fingers
-    sel = over_table[:440] if over_table is not None else np.ones(band.shape, bool)
-    if sel.mean() < 0.2:  # the upper view is mostly past the table's edge: nothing there to block
-        sel = np.zeros(band.shape, bool)
-    # The bucket's rim (~180 mm up) is closer than 280 mm from z 400: the bucket, not a hand at the lens
-    # {SEARCH VIEW (HINT) "CAMERA BLOCKED …: 17% OF THE VIEW UNREADABLE OR CLOSER THAN 280 MM; WAITING"}
-    # [CONFIDENCE: INFERRED 75% — 17-21% at search views beside the bucket after the table-edge fix; perception cuts it too]
-    if bucket.TARGET == "bucket":
-        bk = bucket.find_mask(rgb)
-        if bk is not None:
-            sel = sel & ~ndimage.binary_dilation(bk["mask"], iterations=20)[:440]
-    bad = (band == 0) | ((band > 0) & (band < 280))
-    near = float(bad[sel].sum()) / band.size
-    if near > BLOCKED_DEPTH_FRAC:
-        return True, f"{near:.0%} of the view unreadable or closer than 280 mm"
-    hsv = np.asarray(Image.fromarray(rgb).convert("HSV"))
-    dark = hsv[..., 2] < 50
-    flat = (depth > 0) & (np.abs(depth - table_plane(depth)) < 4.0)
-    m = dark & flat
-    if over_table is not None:
-        m &= over_table
-    m[ppa.FINGER_ROW:] = False
-    n = int(m.sum())
-    if n > BLOCKED_DARK_FLAT_PX:
-        return True, f"{n} px dark in colour where depth sees flat table"
-    return False, "clear"
-
-
-async def clear_frame(rig) -> tuple:
-    """
-    rig.frame(), waiting (status BLOCKED_STATUS, a new frame every second) while view_blocked() says something is
-    in front of the lens; after BLOCKED_WAIT_S the last frame is returned and the caller decides. Empty gripper only.
-    """
-    t0 = time.monotonic()
-    while True:
-        rgb, depth = await rig.frame()
-        over = None
-        if depth is not None and rig.last_pose is not None:
-            from sorter import camera_model  # (imports perception: not at module level)
-            p = pose_dict(rig.last_pose)
-            # the table top is at world z ~0: camera_model.CAM_BELOW_POSE_MM under the pose point
-            over = camera_model.table_mask(p, intr(rig), depth.shape, p["z"] - camera_model.CAM_BELOW_POSE_MM)
-        blocked, why = view_blocked(rgb, depth, over)
-        if not blocked or time.monotonic() - t0 > BLOCKED_WAIT_S:
-            if rig.status == BLOCKED_STATUS:
-                rig.status = None
-                print("  view clear again" if not blocked else f"  camera still blocked after {BLOCKED_WAIT_S:.0f} s")
-            return rgb, depth
-        if rig.status != BLOCKED_STATUS:
-            print(f"  {BLOCKED_STATUS}: {why}; waiting")
-            rig.status = BLOCKED_STATUS
-        await asyncio.sleep(1.0)
-
-
 CAND_MERGE_MM = 60.0  # two sightings this close, from different views, are one candidate
 CAND_LOOKS = 3  # close looks at the best candidates, at most
 EXCLUDED_MM = 60.0  # an object this close to where a failed pick was is that object
@@ -1294,19 +1221,16 @@ def merge_candidates(table: list, new: list) -> None:
             same.update(c)
 
 
-async def look_here(rig, text: str, store, source: str = "demo", excluded: list = (), wait_clear: bool = True) -> dict:
+async def look_here(rig, text: str, store, source: str = "demo", excluded: list = ()) -> dict:
     """
     One frame from the current pose -> best match for `text` among objects outside the square.
 
     Returns clip_embed.best()'s dict plus "rgb", "depth", "pose", and "square" (square_from_frame) when the
     hole is in view. Objects cut by the image border or standing in the square are never candidates.
-    Waits while the camera is blocked (clear_frame), so a cable in front of the lens is not "not found".
     excluded: table xy of objects a failed pick of this job already tried: not candidates.
     SEARCH_V2 with nothing accepted: "candidates" holds view_candidates(), for the search's second stage.
-    wait_clear=False (a coverage view): the frame as it is, no wait while the camera reads blocked; coverage counts
-    only what it saw and the search moves on.
     """
-    rgb, depth = await clear_frame(rig) if wait_clear else await rig.frame()
+    rgb, depth = await rig.frame()
     pose = pose_dict(await rig.pose())
     rig.record("observe", rgb)
     seg = perception.segment_full(rgb, depth)
@@ -1529,7 +1453,7 @@ async def coverage_search(rig, text: str, store, hint_xy, progress, skip_current
         # A coverage view does not wait out a blocked camera (15 s each time, then 0 new cells): the next view is the cure
         # {LOG 21:08:33 "CAMERA BLOCKED … 17%; WAITING" → 21:08:49 "STILL BLOCKED AFTER 15 S" → "VIEW 7 (COVER): 0 NEW CELLS"}
         found = await look_here(rig, text, store, source="look" if path == "hint" else "demo",
-                                wait_clear=path != "cover", **look_kw)
+                                **look_kw)
         views += 1
         found.update(path=path, views=views)
         square = found.get("square") or square
@@ -2279,7 +2203,7 @@ async def go_over_square(rig) -> tuple:
     k = intr(rig)
 
     async def look(prev=None):
-        rgb, depth = await clear_frame(rig)
+        rgb, depth = await rig.frame()
         q = pose_dict(await rig.pose())
         return frame_square(rgb, depth, q, k, prev=prev), q
 
@@ -2408,7 +2332,7 @@ async def clear_square(rig, store) -> dict:
         first = (rgb0, depth0, pose_dict(await rig.pose()))
         centre, _, sq_est = await go_over_square(rig)
         for _round in range(6):
-            rgb, depth = await clear_frame(rig)
+            rgb, depth = await rig.frame()
             q = pose_dict(await rig.pose())
             rig.record("reset", rgb)
             seen, inside, seg, hole = reset_count(rgb, depth, q, k, sq_est)
@@ -2473,7 +2397,7 @@ async def clear_square(rig, store) -> dict:
                         print(f"reset: pick {_try + 1}/{RESET_PICK_TRIES} failed ({e}); looking again")
                         await rig.lift()
                         centre, _, sq_est = await go_over_square(rig)
-                        rgb, depth = await clear_frame(rig)
+                        rgb, depth = await rig.frame()
                         q = pose_dict(await rig.pose())
                         _, inside, _, _ = reset_count(rgb, depth, q, k, sq_est)
                         inside = [o for o in inside if not near_any(footprint(rig, o, q)["xy"], unreachable)]
