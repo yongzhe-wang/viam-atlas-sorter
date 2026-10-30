@@ -1,822 +1,463 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="halloween">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sorter Dashboard</title>
+<title>Sorter Live</title>
 <style>
   :root {
-    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
-    --ok: #1f8a4c; --bad: #c4372c; --warn: #b7791f; --accent: #2457d6; --chip: #efeee9;
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db; --chip: #efeee9;
+    --ok: #1f8a4c; --bad: #c4372c; --warn: #b7791f; --accent: #2457d6; --bucket: #ef7d1a; --box: #f2c200;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #141413; --panel: #1e1e1c; --ink: #ecebe6; --muted: #9a988f; --line: #2f2e2b;
-            --ok: #4cc07a; --bad: #ef6b5f; --warn: #e0a64a; --accent: #7aa2ff; --chip: #2a2927; }
+    :root:not([data-theme="light"]) { --bg: #141413; --panel: #1e1e1c; --ink: #ecebe6; --muted: #9a988f; --line: #2f2e2b;
+      --chip: #2a2927; --ok: #4cc07a; --bad: #ef6b5f; --warn: #e0a64a; --accent: #7aa2ff; }
   }
-  /* Halloween theme (header toggle; judging gives 5% for Halloween style) */
+  /* Halloween (judging gives 5% for Halloween style): the default; the header button switches to plain */
   :root[data-theme="halloween"] {
-    --bg: #120d18; --panel: #1d1426; --ink: #f6e9da; --muted: #b59fc4; --line: #3a2a48;
-    --ok: #8be04e; --bad: #ff4d4d; --warn: #ff9a3c; --accent: #ff7518; --chip: #2b1f38;
+    --bg: #120d18; --panel: #1d1426; --ink: #f6e9da; --muted: #b59fc4; --line: #3a2a48; --chip: #2b1f38;
+    --ok: #8be04e; --bad: #ff4d4d; --warn: #ff9a3c; --accent: #ff7518; --bucket: #ff7518; --box: #ffd23f;
   }
-  :root[data-theme="halloween"] body {
-    background: radial-gradient(1200px 500px at 85% -10%, #3b1d52 0%, transparent 60%), var(--bg);
-  }
-  :root[data-theme="halloween"] h1::after { content: " · Trick or Treat"; color: var(--accent); }
+  :root[data-theme="halloween"] body { background: radial-gradient(1100px 480px at 85% -10%, #3b1d52 0%, transparent 60%), var(--bg); }
   :root[data-theme="halloween"] .card { box-shadow: 0 0 0 1px #ff751822, 0 8px 30px #00000055; }
   :root[data-theme="halloween"] button.primary { box-shadow: 0 0 14px #ff751866; }
-  #b-theme { margin-left: auto; }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
-  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line);
-           flex-wrap: wrap; }
-  h1 { font-size: 17px; margin: 0 8px 0 0; letter-spacing: .2px; }
-  .pill { padding: 3px 10px; border-radius: 999px; background: var(--chip); color: var(--muted); font-size: 12px; }
-  .pill.ok { color: var(--ok); } .pill.bad { color: var(--bad); } .pill.warn { color: var(--warn); }
-  main { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px;
-         max-width: 1500px; margin: 0 auto; }
-  /* Grid items may shrink below their content, so the wide attempts table scrolls inside its card */
-  main > * { min-width: 0; }
-  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px; } }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
-  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 10px; }
-  #cam { width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #000; border-radius: 8px; display: block; }
-  #camnote { color: var(--muted); font-size: 12px; margin-top: 6px; min-height: 18px; }
-  form { display: flex; gap: 8px; flex-wrap: wrap; }
-  input[type=text] { flex: 1 1 220px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
-                     background: var(--bg); color: var(--ink); font-size: 15px; }
-  button { padding: 9px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--chip);
-           color: var(--ink); font-size: 14px; cursor: pointer; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button:disabled { opacity: .5; cursor: default; }
-  #msg { min-height: 20px; color: var(--muted); font-size: 12px; margin-top: 6px; white-space: pre-line; }
-  #workers { margin-bottom: 12px; }
-  .worker { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 10px;
-            background: var(--bg); border-radius: 8px; margin-bottom: 6px; font-size: 13px; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
-  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
-  .phase { font-weight: 600; }
-  .werr { flex-basis: 100%; color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
-  .takes { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--ok); color: var(--ok); }
-  .twocons { background: var(--bad); color: #fff; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px;
-             font-size: 13px; font-weight: 600; }
-  ul.cmds { list-style: none; margin: 10px 0 0; padding: 0; }
-  ul.cmds li { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--chip); white-space: nowrap; align-self: flex-start; }
-  .badge.pending { color: var(--warn); } .badge.running { color: var(--accent); }
-  .badge.done { color: var(--ok); } .badge.failed, .badge.not_found, .badge.error { color: var(--bad); }
-  .badge.busy, .badge.rejected, .badge.ambiguous, .badge.too_wide, .badge.too_close, .badge.square_full, .badge.partial { color: var(--warn); }
-  .badge.estop, .badge.unsafe_grasp { color: var(--bad); }
-  .badge.sending { color: var(--accent); } .badge.already_in_square { color: var(--ok); }
-  .cmdfail { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
-  .cmditem { font-size: 12px; overflow-wrap: anywhere; }
-  .cmditem.bad { color: var(--bad); } .cmditem.wait { color: var(--muted); }
-  #known { margin-top: 8px; font-size: 12px; line-height: 2; }
-  .chip { display: inline-block; padding: 1px 9px; margin: 0 4px 0 0; border-radius: 999px; background: var(--chip);
-          border: 1px solid var(--line); cursor: pointer; font-size: 12px; color: var(--ink); }
-  .chip:hover { border-color: var(--accent); }
-  .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
-  .kpi { background: var(--bg); border-radius: 8px; padding: 8px 10px; }
-  .kpi b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
-  .kpi span { color: var(--muted); font-size: 12px; }
-  svg text { fill: var(--muted); font-size: 11px; }
-  /* Table map labels: named objects in ink; remembered ones muted; "unknown" only on hover */
-  #tmap text.lbl { fill: var(--ink); }
-  #tmap text.lbl-mute { fill: var(--muted); }
-  /* pointer-events off: an invisible label lying over a neighbour's dot would swallow its click */
-  #tmap text.lbl-unk { opacity: 0; transition: opacity .12s; pointer-events: none; }
-  #tmap g:hover text.lbl-unk { opacity: 1; }
-  .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 4px; }
-  .sw { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 5px; }
-  .full { grid-column: 1 / -1; }
-  .tablewrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 8px; border-top: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
-  th { color: var(--muted); font-weight: 500; border-top: 0; }
-  td img { height: 54px; border-radius: 4px; display: block; }
-  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  header { display: flex; align-items: center; gap: 10px; padding: 12px 16px; }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; }
+  .pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .pill.ok { color: var(--ok); } .pill.bad { color: #fff; background: var(--bad); } .pill.warn { color: var(--warn); }
+  #b-theme { margin-left: auto; }
+  .wrap { padding: 0 16px 16px; display: grid; gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; min-width: 0; }
+  .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+  .head span { font-size: 12px; color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); } }
+  form { display: flex; flex-wrap: wrap; gap: 8px; }
+  input[type=text] { flex: 1 1 220px; min-width: 0; font: inherit; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--chip); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  #state { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; font-size: 18px; font-weight: 600; }
+  #state i { font-style: normal; width: 1.4em; text-align: center; }
+  #state.busy { color: var(--accent); } #state.warn { color: var(--warn); } #state.bad { color: var(--bad); }
+  #job { font-size: 13px; }
+  #job .top { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+  .badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .badge.done { color: var(--ok); } .badge.running, .badge.sending { color: var(--accent); }
+  .badge.failed, .badge.error, .badge.estop, .badge.rejected, .badge.not_found { color: var(--bad); }
+  .items { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 2px; }
+  .items li { display: flex; flex-wrap: wrap; gap: 0 8px; } .items .why { color: var(--muted); }
+  .fail { color: var(--bad); }
   .muted { color: var(--muted); }
-  iframe { width: 100%; height: 360px; border: 0; border-radius: 8px; background: var(--bg); }
-  /* Replay player */
-  dialog#player { border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; background: var(--panel);
-                  color: var(--ink); width: min(760px, calc(100vw - 32px)); }
-  dialog#player::backdrop { background: rgba(0, 0, 0, .55); }
-  #pl-img { width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #000; border-radius: 8px; display: block; }
-  .pl-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; }
-  .pl-head b { font-size: 14px; }
-  #pl-cap { margin: 8px 0; font-size: 13px; font-variant-numeric: tabular-nums; }
-  .pl-ctl { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  .pl-ctl input[type=range] { flex: 1 1 200px; }
-  .pl-ctl select, .pl-ctl a { font-size: 13px; }
-  .pl-ctl a { color: var(--accent); }
-  .camwrap { position: relative; }
-  #cam.pickable { cursor: crosshair; }
-  #cam-mark { position: absolute; width: 18px; height: 18px; margin: -9px 0 0 -9px; border: 2px solid var(--accent);
-    border-radius: 50%; box-shadow: 0 0 0 2px rgba(0, 0, 0, .5); pointer-events: none; }
-  .atlas { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px 24px; align-items: start; }
-  .atlas h3 { font-size: 13px; margin: 0 0 8px; font-weight: 600; }
-  .atlas .kpis { margin-bottom: 6px; grid-template-columns: repeat(2, 1fr); }
-  .learned-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 13px; margin: 4px 0; }
-  .learned { font-size: 12px; color: var(--ok); }
-  #teach-form { margin-top: 12px; display: grid; gap: 6px; }
-  #teach-form input { min-width: 0; }
-  #teach-msg { font-size: 13px; }
-  .bars div { display: grid; grid-template-columns: 120px 1fr 60px; gap: 8px; align-items: center; margin: 4px 0; font-size: 12px; }
-  .bar { height: 8px; border-radius: 4px; background: var(--chip); overflow: hidden; }
-  .bar i { display: block; height: 100%; background: var(--ok); }
+  details { margin-top: 10px; } summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+  #more-msg { font-size: 13px; margin-top: 6px; }
+  .camwrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; }
+  #cam, #boxes { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #cam { object-fit: contain; display: block; }
+  #cam.pick { cursor: crosshair; }
+  #boxes { pointer-events: none; }
+  #boxes text { font: 600 13px sans-serif; }
+  #cam-empty { position: absolute; inset: 0; display: grid; place-items: center; color: #bbb; font-size: 13px; }
+  #cam-empty[hidden] { display: none; }
+  #map { width: 100%; height: auto; display: block; }
+  #map text { font: 14px sans-serif; fill: var(--ink); paint-order: stroke; stroke: var(--panel); stroke-width: 3px; }
+  #map .mute { fill: var(--muted); }
+  #map-foot { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .stale { opacity: .55; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Sorter Dashboard</h1>
-  <span id="p-atlas" class="pill">Atlas …</span>
-  <span id="p-cam" class="pill">Camera …</span>
-  <span id="p-perc" class="pill">Perception …</span>
-  <span id="p-mode" class="pill">Commands …</span>
-  <button type="button" id="b-theme" aria-pressed="false" title="Halloween theme">🎃 Spooky mode</button>
+  <h1>🎃 Sorter</h1>
+  <span id="conn" class="pill">connecting…</span>
+  <button type="button" id="b-theme" title="Halloween or plain colours">plain colours</button>
 </header>
-<main>
-  <section class="card">
-    <h2>What the arm sees</h2>
-    <div class="camwrap"><img id="cam" alt="live camera"><span id="cam-mark" hidden></span></div>
-    <div id="camnote"></div>
-  </section>
-
-  <section class="card">
-    <h2>Command</h2>
-    <div id="workers"></div>
+<div class="wrap">
+  <section class="card" id="cmd">
     <form id="f">
-      <input id="t" type="text" placeholder="grasp green square" autocomplete="off" maxlength="200">
+      <input id="t" type="text" placeholder="green square — or several: tape, snack and screwdriver" autocomplete="off" maxlength="200" aria-label="what to grasp">
       <button class="primary" type="submit">Grasp</button>
-      <button type="button" id="b-prev">Preview</button>
-      <button type="button" id="b-reset">Clear square</button>
-      <button type="button" id="b-scan" title="Look over the whole table once and put everything on the map (a grasp never needs this first)">Scan table</button>
-      <button type="button" id="b-clearmap" title="Someone rearranged the table: forget the map and every last-seen position">Clear map</button>
+      <button type="button" id="b-reset" title="Clear the drop target; after an E-stop, release it first">Reset</button>
     </form>
-    <div id="msg"></div>
-    <div id="known" hidden><span class="muted">Known objects:</span> <span id="known-list"></span></div>
-    <ul class="cmds" id="cmds"></ul>
-  </section>
-
-  <section class="card">
-    <h2>Success rate</h2>
-    <div class="kpis">
-      <div class="kpi"><b id="k-n">–</b><span>attempts</span></div>
-      <div class="kpi"><b id="k-rate">–</b><span>success</span></div>
-      <div class="kpi"><b id="k-time">–</b><span>mean time (success)</span></div>
-    </div>
-    <div id="k-reset" class="muted" style="font-size:12px;margin:-4px 0 8px"></div>
-    <svg id="chart" viewBox="0 0 520 180" width="100%" role="img" aria-label="success rate over attempts"></svg>
-    <div class="legend"><span><i class="sw" style="background:var(--accent)"></i>cumulative</span>
-      <span><i class="sw" style="background:var(--ok)"></i>last 10</span></div>
-  </section>
-
-  <section class="card">
-    <h2>By object</h2>
-    <div class="bars" id="bars"><span class="muted">no attempts yet</span></div>
-  </section>
-
-  <section class="card full">
-    <h2>Table map</h2>
-    <div id="map-head" class="muted" style="font-size:13px;margin-bottom:6px">no table scan yet</div>
-    <svg id="tmap" viewBox="0 0 560 300" width="100%" role="img" aria-label="top-down table map"></svg>
-    <div class="legend"><span><i class="sw" style="background:var(--ok);height:8px;width:8px;border-radius:50%"></i>on the live map (every picture updates it)</span>
-      <span>○ last seen elsewhere (memory)</span><span>◌ ≈ only seen at a picture's edge (position approximate)</span><span><i class="sw" style="background:#2457d6;height:8px;width:8px;border-radius:50%"></i>✓ already delivered into the square</span><span>colour = when last seen: green &lt; 1 min, amber &lt; 5 min, grey older or not recognised (hover for "unknown"); dots fade as they age</span><span>ring = last preview / grasp target</span><span>click an object to grasp it</span></div>
-  </section>
-
-  <section class="card full" id="atlas-card">
-    <h2 id="a-title">MongoDB Atlas</h2>
-    <div class="atlas">
-      <div>
-        <div class="kpis">
-          <div class="kpi"><b id="a-views">–</b><span>views</span></div>
-          <div class="kpi"><b id="a-labels">–</b><span>objects</span></div>
-          <div class="kpi"><b id="a-attempts">–</b><span>grasps logged</span></div>
-          <div class="kpi"><b id="a-obs">–</b><span>observations</span></div>
-        </div>
-        <div id="a-usage" class="muted"></div>
+    <div id="state" class="warn"><i>…</i><span>connecting to the robot</span></div>
+    <div id="job"></div>
+    <details id="more">
+      <summary>more</summary>
+      <div class="row">
+        <button type="button" id="b-prev" title="What the arm would pick for the text, without moving">Preview</button>
+        <button type="button" id="b-scan" title="Look over the whole table once (a grasp never needs this first)">Scan table</button>
+        <button type="button" id="b-clearmap" title="Someone rearranged the table: forget the map">Clear map</button>
       </div>
-      <div>
-        <h3><code id="a-search-via">$vectorSearch</code> <span id="a-search-meta" class="muted"></span></h3>
-        <div id="a-hits" class="bars"></div>
+      <form id="teach-form" hidden>
+        <input id="teach-name" type="text" placeholder="teach a name: m&amp;m bag" autocomplete="off" maxlength="60" aria-label="name to teach">
+        <input id="teach-alias" type="text" placeholder="same object as… (optional)" autocomplete="off" maxlength="60" aria-label="known object it is another name for">
+        <button type="submit">Teach</button>
+        <span class="muted" id="teach-pick">click the object in the picture, or leave it to the best match</span>
+      </form>
+      <div id="more-msg"></div>
+    </details>
+  </section>
+  <main>
+    <section class="card">
+      <div class="head"><h2>Arm camera</h2><span id="cam-meta"></span></div>
+      <div class="camwrap" id="camwrap">
+        <img id="cam" alt="what the arm's camera sees">
+        <svg id="boxes" aria-hidden="true"></svg>
+        <div id="cam-empty">waiting for the first picture…</div>
       </div>
-      <div>
-        <h3>Learned while running</h3>
-        <div id="a-learned"></div>
-        <form id="teach-form" hidden>
-          <h3>Teach an object</h3>
-          <input id="teach-name" type="text" placeholder="m&amp;m bag" autocomplete="off" maxlength="60" aria-label="name of the object">
-          <input id="teach-alias" type="text" placeholder="same object as… (optional)" autocomplete="off" maxlength="60" aria-label="known object this is another name for">
-          <button class="primary" type="submit">Teach</button>
-          <div class="muted"><span id="teach-pick">click the object in the picture, or leave it to the best match for the name</span>
-            <button type="button" id="teach-clear" hidden>clear</button></div>
-          <div id="teach-msg"></div>
-        </form>
-        <div id="teach-off" class="muted" hidden>Teaching is off on the robot (SORTER_TEACH=1).</div>
-      </div>
-    </div>
-  </section>
-
-  <section class="card full" id="charts-card" hidden>
-    <h2>Atlas Charts</h2>
-    <div id="charts"></div>
-  </section>
-
-  <section class="card full">
-    <h2>Attempts</h2>
-    <div class="tablewrap">
-      <table>
-        <thead><tr><th>Time</th><th>Mode</th><th>Asked</th><th>Picked</th><th>Score</th><th>Result</th>
-          <th>Fail phase</th><th>Seconds</th><th>Before</th><th>After</th><th>Replay</th></tr></thead>
-        <tbody id="att"></tbody>
-      </table>
-    </div>
-  </section>
-</main>
-<dialog id="player" aria-label="Attempt replay">
-  <div class="pl-head"><b id="pl-title">Replay</b><button type="button" id="pl-close">Close</button></div>
-  <img id="pl-img" alt="replay frame">
-  <div id="pl-cap" class="muted"></div>
-  <div class="pl-ctl">
-    <button type="button" id="pl-prev" aria-label="previous frame">⏮</button>
-    <button type="button" id="pl-play" class="primary">▶ Play</button>
-    <button type="button" id="pl-next" aria-label="next frame">⏭</button>
-    <input type="range" id="pl-seek" min="0" value="0" aria-label="frame">
-    <select id="pl-speed" aria-label="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option>
-      <option value="2">2×</option><option value="4">4×</option></select>
-    <a id="pl-gif" download>GIF</a><a id="pl-mp4" download>MP4</a>
-  </div>
-</dialog>
+    </section>
+    <section class="card">
+      <div class="head"><h2>Table map</h2><span id="map-meta"></span></div>
+      <svg id="map" viewBox="0 0 560 330" role="img" aria-label="top-down map of the table as the robot remembers it"></svg>
+      <div id="map-foot"><span>● seen now · faded = remembered · ◌ = only seen at a picture's edge · ▭ = what the camera sees</span><span id="lib"></span></div>
+    </section>
+  </main>
+</div>
 <script>
 const $ = (id) => document.getElementById(id);
 const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; };
-const hhmm = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"}) : "";
-const pct = (x) => x == null ? "–" : Math.round(x * 100) + "%";
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
-  return r.json();
-}
-function setPill(id, text, cls) { const p = $(id); p.textContent = text; p.className = "pill " + (cls || ""); }
+const NS = "http://www.w3.org/2000/svg";
+const mk = (tag, attrs, text) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
+const norm = (s) => String(s || "").toLowerCase().replace(/^(the|a|an)\s+/, "").trim();
+const agoText = (s) => s < 90 ? `${Math.round(s)} s` : `${Math.round(s / 60)} min`;
+const keep = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
 
-// Camera: swap in a new frame only once it has loaded, so the image never flickers
-let camBusy = false;
-function refreshCam() {
-  if (camBusy) return;
-  camBusy = true;
-  const img = new Image();
-  img.onload = () => { $("cam").src = img.src; camBusy = false; };
-  img.onerror = () => { camBusy = false; };
-  img.src = "/api/snapshot.jpg?t=" + Date.now();
+// ---- theme: Halloween by default --------------------------------------------------------------------
+function setTheme(t) {
+  document.documentElement.dataset.theme = t;
+  $("b-theme").textContent = t === "halloween" ? "plain colours" : "🎃 spooky";
+  keep.set("theme", t);
 }
+setTheme(keep.get("theme") || "halloween");
+$("b-theme").onclick = () => setTheme(document.documentElement.dataset.theme === "halloween" ? "auto" : "halloween");
 
-// ---- MongoDB Atlas panel: what the library knows, what it just answered, what it learned while running ----
-function renderAtlas(p) {
-  const pl = (n, w) => `${Math.round(n)} ${w}${Math.round(n) === 1 ? "" : "s"}`;
-  const atlas = p.store === "atlas";
-  $("a-title").textContent = atlas ? "MongoDB Atlas" : p.store === "jsonl" ? "Library (local files)" : "MongoDB Atlas";
-  $("a-views").textContent = p.views ?? p.library?.views ?? "–";
-  $("a-labels").textContent = p.labels ?? p.library?.labels ?? "–";
-  $("a-attempts").textContent = p.attempts ?? "–";
-  $("a-obs").textContent = p.observations?.count ?? "–";
-  const u = p.usage || {};
-  $("a-usage").textContent = u.used_mb != null ? `${Math.round(u.used_mb)} of ${u.limit_mb} MB used` : "";
-  const ls = p.last_search;
-  $("a-search-via").textContent = ls ? ls.via : "$vectorSearch";
-  $("a-search-meta").textContent = ls ? `${Number(ls.ms).toFixed(0)} ms · ${Math.round(p.searches || 0)} this run` : "no search yet";
-  const hits = $("a-hits");
-  hits.textContent = "";
-  for (const h of (ls && ls.hits) || []) {
-    const row = el("div", null, "hit");
-    row.appendChild(el("span", h.label || "?"));
-    const bar = el("span", null, "bar");
-    const fill = el("i");
-    fill.style.width = `${Math.round(Math.max(0, Math.min(1, h.score)) * 100)}%`;
-    bar.appendChild(fill);
-    row.appendChild(bar);
-    row.appendChild(el("span", Number(h.score).toFixed(3)));
-    hits.appendChild(row);
-  }
-  const list = $("a-learned");
-  list.textContent = "";
-  for (const e of p.learned || []) {
-    const row = el("div", null, "learned-row");
-    row.appendChild(el("b", e.label));
-    if (e.new) row.appendChild(el("span", "new", "badge done"));
-    const how = [e.teach ? pl(e.teach, "taught view") : "", e.grasp ? pl(e.grasp, "view") + " from grasps" : ""];
-    row.appendChild(el("span", how.filter(Boolean).join(" · "), "muted"));
-    list.appendChild(row);
-  }
-  if (!list.childElementCount) list.appendChild(el("div", "nothing yet", "muted"));
-  const teach = p.teach || {};
-  $("teach-form").hidden = !teach.enabled;
-  $("teach-off").hidden = !!teach.enabled || p.store == null;
-  teachEnabled = !!teach.enabled;
-  $("cam").classList.toggle("pickable", teachEnabled);
-  const tp = teach.progress;
-  if (tp) $("teach-msg").textContent = `looking from pose ${Math.round(tp.k)} of ${Math.round(tp.n)}…`;
-  else if ($("teach-msg").textContent.startsWith("looking from pose")) $("teach-msg").textContent = "";
-}
-
-// A click on the picture says which object to teach; the point is 0-1 of the picture, not of the box around it
-let teachEnabled = false, teachPoint = null;
-function showTeachPoint() {
-  const cam = $("cam"), mark = $("cam-mark");
-  mark.hidden = !teachPoint;
-  $("teach-pick").textContent = teachPoint ? "object picked in the picture" : "click the object in the picture, or leave it to the best match for the name";
-  $("teach-clear").hidden = !teachPoint;
-  if (!teachPoint) return;
-  const r = picRect(cam);
-  mark.style.left = `${r.x + teachPoint[0] * r.w}px`;
-  mark.style.top = `${r.y + teachPoint[1] * r.h}px`;
-}
-function picRect(cam) {
-  // object-fit: contain leaves bars around a picture of another shape
-  const bw = cam.clientWidth, bh = cam.clientHeight, ar = (cam.naturalWidth || 16) / (cam.naturalHeight || 9);
-  const w = Math.min(bw, bh * ar), h = w / ar;
-  return { x: (bw - w) / 2, y: (bh - h) / 2, w, h };
-}
-$("cam").addEventListener("click", ev => {
-  if (!teachEnabled) return;
-  const r = picRect(ev.currentTarget), u = (ev.offsetX - r.x) / r.w, v = (ev.offsetY - r.y) / r.h;
-  if (u < 0 || u > 1 || v < 0 || v > 1) return;
-  teachPoint = [u, v];
-  showTeachPoint();
-});
-$("teach-clear").addEventListener("click", () => { teachPoint = null; showTeachPoint(); });
-$("teach-form").addEventListener("submit", async ev => {
-  ev.preventDefault();
-  const name = $("teach-name").value.trim();
-  if (!name) return;
+// ---- fetching: one JSON a second; the picture by long poll (the server answers when a new one is there, else 304
+// after 2 s); both paused while the page is hidden
+async function getJSON(url, ms = 3000) {
+  const c = new AbortController(), t = setTimeout(() => c.abort(), ms);
   try {
-    const r = await api("/api/teach", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, alias_of: $("teach-alias").value.trim() || null, point: teachPoint }) });
-    const m = r.module || {};
-    $("teach-msg").textContent = m.accepted ? `teaching "${name}" (${m.why || "chosen"}): the arm looks from above and does not touch it`
-      : m.error === "busy" ? "the arm is busy, try again when it is done" : (m.reason || m.error || "not accepted");
-    if (m.accepted) { $("teach-name").value = ""; $("teach-alias").value = ""; teachPoint = null; showTeachPoint(); }
-    refreshCommands();
-  } catch (err) { $("teach-msg").textContent = "error: " + err.message; }
-});
+    const r = await fetch(url, { cache: "no-store", signal: c.signal });
+    if (!r.ok) throw new Error(`${r.status}`);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+async function post(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.detail || `${r.status}`);
+  return d;
+}
 
-async function refreshStatus() {
+let live = null, liveFails = 0, liveTimer = null;
+async function tickLive() {
+  clearTimeout(liveTimer);
+  if (document.hidden) return;
+  try { live = await getJSON("/api/live"); liveFails = 0; render(live); }
+  catch { liveFails++; offline(); }
+  liveTimer = setTimeout(tickLive, liveFails ? Math.min(1000 * 2 ** liveFails, 5000) : 1000);
+}
+
+let etag = null, camTimer = null, camUrl = null, camMeta = null;
+const shown = [];  // when the last pictures arrived, for the frame rate
+async function tickCam() {
+  clearTimeout(camTimer);
+  if (document.hidden) return;
+  let delay = 0;
+  const c = new AbortController(), t = setTimeout(() => c.abort(), 4000);
   try {
-    const s = await api("/api/status");
-    const q = Object.values(s.queued).reduce((a, b) => a + b, 0);
-    // Module mode: the robot's Store is what counts, this server has no MONGODB_URI (s.atlas null: no answer yet)
-    if (s.command_path === "module") {
-      if (s.atlas === null) setPill("p-atlas", "Atlas: waiting for the robot", "warn");
-      else if (s.atlas_stale) setPill("p-atlas", `${s.atlas ? "Atlas" : "Local files"} when last heard · robot link down`, "warn");
-      else setPill("p-atlas", s.atlas ? "Atlas online · robot" : "Robot on local files, no Atlas", s.atlas ? "ok" : "warn");
-    } else setPill("p-atlas", s.atlas ? "Atlas online" : `Atlas offline · ${q} queued locally`, s.atlas ? "ok" : "warn");
-    renderAtlas(s.atlas_panel || {});
-    const c = s.camera;
-    // Picture pill follows whichever source the server picked (worker frame or our own camera)
-    if (s.frame) setPill("p-cam", `Picture: ${s.frame.source} · ${s.frame.age_s} s`, s.frame.age_s < 10 ? "ok" : "warn");
-    else setPill("p-cam", "No picture yet", "bad");
-    // Targets are what the arm may pick; ignored = cut by the image edge / outside the workspace
-    const ms = s.module_seen;
-    if (ms) {
-      // Module mode: perception runs on the robot; show what the module sees from its observe pose
-      if (ms.intruders) setPill("p-perc", "Hand in workspace · arm pauses", "bad");
-      else if (ms.at_observe === false) setPill("p-perc", "Robot: arm away from observe pose", "warn");
-      else setPill("p-perc", `Robot sees ${ms.objects} object${ms.objects === 1 ? "" : "s"}`, ms.objects ? "ok" : "warn");
-    }
-    else if (!c.perception) setPill("p-perc", "Perception off", "warn");
-    else if (c.intruders) setPill("p-perc", "Hand in workspace · arm pauses", "bad");
-    else setPill("p-perc", `Perception · ${c.objects} target${c.objects === 1 ? "" : "s"}${c.excluded ? ` · ${c.excluded} ignored` : ""}`, "ok");
-    // Where "Grasp" goes: the Store queue (a worker claims it) or straight to the Viam module's DoCommand
-    commandPath = s.command_path;
-    setPill("p-mode", s.command_path === "module" ? "Commands → Viam module" : "Commands → queue", "");
-    // Our own camera's errors only matter when the picture comes from our own camera
-    const ownCamera = s.frame ? s.frame.source === "direct camera" : true;
-    $("camnote").textContent = ownCamera ? (c.error || c.perception_error || "") : "";
-    renderWorkers(s.workers);
-    const box = $("charts");
-    if (s.charts.length && !box.childElementCount) {
-      $("charts-card").hidden = false;
-      for (const u of s.charts) { const f = el("iframe"); f.src = u; box.appendChild(f); }
-    }
-  } catch (e) { setPill("p-atlas", "dashboard server unreachable", "bad"); }
+    const r = await fetch("/api/frame.jpg", { cache: "no-store", headers: etag ? { "If-None-Match": etag } : {}, signal: c.signal });
+    if (r.status === 200) {
+      const meta = JSON.parse(decodeURIComponent(r.headers.get("X-Frame-Meta") || "%7B%7D"));
+      etag = r.headers.get("ETag");
+      await showFrame(URL.createObjectURL(await r.blob()), meta);
+    } else if (r.status !== 304) delay = 1500;  // no picture yet
+  } catch { delay = 1500; }
+  clearTimeout(t);
+  camTimer = setTimeout(tickCam, delay);
+}
+function showFrame(url, meta) {
+  return new Promise((done) => {
+    const img = $("cam");
+    img.onload = () => {
+      if (camUrl) URL.revokeObjectURL(camUrl);
+      camUrl = url; camMeta = meta;
+      $("cam-empty").hidden = true;
+      if (meta.w && meta.h) $("camwrap").style.aspectRatio = `${meta.w} / ${meta.h}`;
+      shown.push(performance.now());
+      while (shown.length > 1 && shown[0] < performance.now() - 5000) shown.shift();
+      drawBoxes();
+      done();
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); done(); };
+    img.src = url;
+  });
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { tickLive(); tickCam(); } });
+
+// ---- what the current job is after, to mark it in the picture and on the map -----------------------
+function target() {
+  const r = live && live.running;
+  const text = r && (r.item ? r.item.text : r.kind === "grasp" ? r.text : null);
+  const hl = live && live.highlight;
+  return { text: norm(text || (hl && hl.text)), label: norm(hl && hl.label), xy: hl && hl.xy };
+}
+function isTarget(names, label) {
+  const t = target();
+  const all = [label, ...(names || [])].map(norm).filter(Boolean);
+  return !!((t.text && all.some((n) => n === t.text || n.includes(t.text))) || (t.label && all.includes(t.label)));
 }
 
-const ago = (s) => s < 90 ? `${Math.round(s)} s ago` : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
-function renderWorkers(list) {
-  const box = $("workers"); box.replaceChildren();
-  if (!list.length) { box.appendChild(el("div", "Arm worker: no heartbeat yet", "worker muted")); return; }
-  // Exactly one live command consumer is allowed (EXEC_PLAN); two would both claim commands and drive the arm
-  const live = list.filter((w) => w.online && w.consumer).map((w) => w.worker);
-  if (live.length > 1) box.appendChild(el("div", `Two arm drivers live (${live.join(", ")}): stop one`, "twocons"));
-  for (const w of list) {
-    const row = el("div", null, "worker");
-    row.appendChild(el("span", null, "dot " + (!w.online ? "" : w.error ? "bad" : "ok")));
-    row.appendChild(el("span", w.worker));
-    if (w.online && w.consumer) row.appendChild(el("span", "takes commands", "takes"));
-    row.appendChild(el("span", w.online ? w.phase : "offline", "phase"));
-    if (w.online && w.holding != null) row.appendChild(el("span", w.holding ? "holding object" : "gripper empty", "muted"));
-    row.appendChild(el("span", w.online ? ago(w.age_s) : `last seen ${ago(w.age_s)}`, "muted"));
-    if (w.error) row.appendChild(el("div", w.error, "werr"));
-    box.appendChild(row);
-  }
-}
-
-// One item of a list: ✅ / ❌ with what was picked or why not; the ones not reached yet are plain
-const ITEM_OK = ["done", "already_in_square"];
-function itemRow(i) {
-  const wait = {pending: "·", running: "▶", skipped: "⏭"}[i.status];
-  const icon = wait || (ITEM_OK.includes(i.status) ? "✅" : "❌");
-  const what = i.status === "already_in_square" ? "already in the square"
-    : i.status === "done" ? (i.label && i.label !== i.text ? `→ ${i.label}` : "") : i.fail_reason || (wait ? "" : (i.status || "").replace(/_/g, " "));
-  const took = i.status === "done" && i.duration_s != null ? `${Number(i.duration_s).toFixed(0)} s` : "";
-  const row = el("div", `${icon} ${i.text}` + (what.startsWith("→") ? ` ${what}` : what ? ` · ${what}` : "") + (took ? ` · ${took}` : ""), "cmditem");
-  if (!wait && !ITEM_OK.includes(i.status)) row.classList.add("bad");
-  if (wait && i.status !== "running") row.classList.add("wait");
-  return row;
-}
-
-async function refreshCommands() {
-  const list = await api("/api/commands?limit=12");
-  const ul = $("cmds"); ul.replaceChildren();
-  for (const c of list) {
-    const li = el("li");
-    const left = el("div");
-    left.appendChild(el("div", c.text === "__reset__" ? "Clear square" : c.text === "__scan__" ? "Scan table" : c.text));
-    // Library name first, its colour in brackets ("picked blue screwdriver (black)"); colour alone if unrecognised
-    const ch = c.chosen, name = ch && (ch.label ?? (ch.colour ? `${ch.colour} object` : "#" + ch.id));
-    const chosen = ch ? `picked ${name}${ch.label && ch.colour ? ` (${ch.colour})` : ""}${ch.score != null ? " · " + Number(ch.score).toFixed(2) : ""}` : "";
-    const took = c.duration_s != null ? `${Number(c.duration_s).toFixed(0)} s` : "";
-    const decided = c.decide_ms != null ? `decided in ${c.decide_ms} ms` : "";
-    left.appendChild(el("div", [hhmm(c.ts), chosen, decided, took].filter(Boolean).join(" · "), "muted"));
-    // Last result straight from the module (or the worker): why it failed, so the demo needs no Atlas
-    // square_full (AGENT1): the object went back where it was; the way on is to clear the square
-    if (c.fail_reason && !c.items) left.appendChild(el("div", c.fail_reason + (c.status === "square_full" ? " · press Clear square" : ""), "cmdfail"));
-    // A list of objects: where it is now, then every item with its result
-    if (c.progress) left.appendChild(el("div", c.progress, "muted"));
-    if (c.note) left.appendChild(el("div", c.note, "learned"));
-    for (const i of c.items || []) left.appendChild(itemRow(i));
-    if (c.stopped_by) left.appendChild(el("div", `stopped: ${c.stopped_by}`, "cmdfail"));
-    if ((c.ignored || []).length) left.appendChild(el("div", `only 5 at a time, ignored: ${c.ignored.join(", ")}`, "muted"));
-    li.appendChild(left);
-    li.appendChild(el("span", (c.status || "").replace(/_/g, " "), "badge " + c.status));  // "already in square"
-    ul.appendChild(li);
-  }
-  if (!list.length) ul.appendChild(el("li", "No commands yet", "muted"));
-}
-
-function drawChart(series) {
-  const svg = $("chart"), W = 520, H = 180, L = 34, R = 8, T = 10, B = 24;
-  const ns = "http://www.w3.org/2000/svg";
-  const mk = (tag, attrs) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+// ---- the picture's boxes: objects, the target thick, edge-cut grey, a hand red ----------------------
+function drawBoxes() {
+  const svg = $("boxes"), m = camMeta || {};
   svg.replaceChildren();
-  const x = (i) => L + (series.length > 1 ? (i - 1) / (series.length - 1) : 0.5) * (W - L - R);
-  const y = (v) => T + (1 - v) * (H - T - B);
-  for (const v of [0, 0.5, 1]) {
-    svg.appendChild(mk("line", {x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: "var(--line)"}));
-    const t = mk("text", {x: L - 6, y: y(v) + 4, "text-anchor": "end"}); t.textContent = Math.round(v * 100) + "%"; svg.appendChild(t);
+  if (!m.w) return;
+  svg.setAttribute("viewBox", `0 0 ${m.w} ${m.h}`);
+  for (const b of m.boxes || []) {
+    const [u0, v0, u1, v1] = b.bbox, hand = b.kind === "intruder", part = b.kind === "partial";
+    const hit = !hand && isTarget(b.names, b.label);
+    const colour = hand ? "var(--bad)" : hit ? "var(--accent)" : part ? "#9a988f" : "var(--box)";
+    svg.appendChild(mk("rect", { x: u0, y: v0, width: u1 - u0, height: v1 - v0, fill: "none", stroke: colour,
+      "stroke-width": hit || hand ? 4 : 2, ...(part ? { "stroke-dasharray": "6 4" } : {}) }));
+    if (!b.label && !hand) continue;
+    const text = hand ? "hand: the arm waits" : `${hit ? "▶ " : ""}${b.label}${b.score != null && !hit ? ` ${Number(b.score).toFixed(2)}` : ""}`;
+    svg.appendChild(mk("text", { x: u0 + 2, y: v0 > 18 ? v0 - 5 : v1 + 15, fill: colour, stroke: "#000", "stroke-width": 3, "paint-order": "stroke" }, text));
   }
-  if (!series.length) { const t = mk("text", {x: W / 2, y: H / 2, "text-anchor": "middle"}); t.textContent = "no attempts yet"; svg.appendChild(t); return; }
-  const path = (key) => series.map((p, k) => (k ? "L" : "M") + x(p.i).toFixed(1) + " " + y(p[key]).toFixed(1)).join(" ");
-  svg.appendChild(mk("path", {d: path("roll10"), fill: "none", stroke: "var(--ok)", "stroke-width": 2}));
-  svg.appendChild(mk("path", {d: path("cum_rate"), fill: "none", stroke: "var(--accent)", "stroke-width": 2.5}));
-  for (const p of series) svg.appendChild(mk("circle", {cx: x(p.i), cy: p.success ? T + 2 : H - B - 2, r: 2.5, fill: p.success ? "var(--ok)" : "var(--bad)"}));
-  const t = mk("text", {x: W - R, y: H - 6, "text-anchor": "end"}); t.textContent = `attempt ${series.length}`; svg.appendChild(t);
 }
 
-async function refreshStats() {
-  const s = await api("/api/stats");
-  $("k-n").textContent = s.n; $("k-rate").textContent = pct(s.rate);
-  $("k-time").textContent = s.mean_success_s ? s.mean_success_s.toFixed(0) + " s" : "–";
-  // Square clearing is not a requested grasp: counted here, kept out of the rate and the chart
-  $("k-reset").textContent = s.resets.n ? `Clear-square passes (not in the rate): ${s.resets.n}, ${s.resets.ok} cleared` : "";
-  drawChart(s.series);
-  const bars = $("bars"); bars.replaceChildren();
-  for (const p of s.per_label) {
-    const row = el("div"); row.appendChild(el("span", p.label));
-    const bar = el("div", null, "bar"); const fill = el("i"); fill.style.width = (p.rate * 100) + "%"; bar.appendChild(fill);
-    row.appendChild(bar); row.appendChild(el("span", `${p.ok}/${p.n}`, "muted")); bars.appendChild(row);
+// ---- the command block -------------------------------------------------------------------------------
+const PHASE = { observe: "searching for", servo: "grasping", descend: "grasping", grab: "grasping", carry: "carrying",
+                place: "putting down", sweep: "scanning the table" };
+function stateLine(d) {
+  if (!d.link.up) return ["warn", "⟳", `reconnecting… ${d.link.error || ""}`];
+  if (d.estop) return ["bad", "⛔", "E-STOP pressed — release it, then press Reset"];
+  const ph = String(d.phase || "");
+  if (ph.startsWith("paused_person") || ph.startsWith("waiting") || (!d.busy && d.seen.intruders))
+    return ["bad", "✋", "camera blocked — a hand in the workspace, the arm waits"];
+  if (ph === "reconnecting") return ["warn", "⟳", "the arm's link is reconnecting"];
+  if (d.warm === false) return ["warn", "…", "warming up: loading CLIP and the object library"];
+  const r = d.running;
+  if (!d.busy || !r) return ["ok", "●", d.seen.at_observe === false ? "ready · arm away from its viewing pose"
+    : `ready · sees ${d.seen.objects} object${d.seen.objects === 1 ? "" : "s"}`];
+  if (r.kind === "scan") return ["busy", "◎", `scanning the table${r.sweep ? ` · pose ${r.sweep.k}/${r.sweep.n}` : "…"}`];
+  if (r.kind === "teach") return ["busy", "◎", `teaching “${r.text}”${r.teach ? ` · looking from pose ${r.teach.k}/${r.teach.n}` : "…"}`];
+  if (r.kind === "reset") return ["busy", "↺", "reset: clearing the drop target"];
+  const what = r.item ? r.item.text : r.text, s = r.search;
+  const nth = r.item ? ` · item ${r.item.k}/${r.item.n}` : "";
+  const retry = r.attempt > 1 ? ` · try ${r.attempt}/${r.attempts_max}` : "";
+  if (s && s.n && !s.found && (!ph || ph === "observe")) return ["busy", "🔍", `searching for “${what}” · view ${s.k}/${s.n}${nth}${retry}`];
+  const verb = PHASE[ph] || (s && s.found ? "grasping" : "working on");
+  return ["busy", verb === "carrying" ? "🪣" : "✊", `${verb} “${what}”${verb === "carrying" ? " to the bucket" : ""}${nth}${retry}`];
+}
+const ITEM_ICON = { done: "✅", already_in_square: "✅", running: "⏳", pending: "·", skipped: "⏭" };
+function renderJob(c) {
+  const box = $("job");
+  box.replaceChildren();
+  if (!c) return;
+  const top = el("div", null, "top");
+  top.appendChild(el("b", c.text === "__reset__" ? "Reset" : c.text === "__scan__" ? "Scan table" : c.text));
+  top.appendChild(el("span", String(c.status || "").replace(/_/g, " "), `badge ${c.status}`));
+  if (c.label && c.status === "done") top.appendChild(el("span", `picked ${c.label}`, "muted"));
+  if (c.duration_s != null) top.appendChild(el("span", `${Number(c.duration_s).toFixed(0)} s`, "muted"));
+  if (c.progress) top.appendChild(el("span", c.progress, "muted"));
+  box.appendChild(top);
+  if (c.fail_reason && !c.items) box.appendChild(el("div", c.fail_reason, "fail"));
+  if (c.items && c.items.length) {
+    const ul = el("ul", null, "items");
+    for (const i of c.items) {
+      const li = el("li");
+      li.appendChild(el("span", ITEM_ICON[i.status] || "❌"));
+      li.appendChild(el("span", `${i.text}${i.label && i.label !== i.text ? ` → ${i.label}` : ""}`));
+      const why = i.fail_reason || (ITEM_ICON[i.status] ? "" : String(i.status || "").replace(/_/g, " "));
+      if (why) li.appendChild(el("span", why, "why"));
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
   }
-  if (!s.per_label.length) bars.appendChild(el("span", "no attempts yet", "muted"));
+  if (c.stopped_by) box.appendChild(el("div", `stopped: ${c.stopped_by}`, "fail"));
 }
 
-async function refreshAttempts() {
-  const list = await api("/api/attempts?limit=30");
-  const tb = $("att"); tb.replaceChildren();
-  for (const a of list) {
-    const tr = el("tr");
-    const cells = [hhmm(a.ts), a.mode ?? "", a.target_text ?? "", a.label ?? "", a.score != null ? Number(a.score).toFixed(2) : ""];
-    for (const c of cells) tr.appendChild(el("td", c));
-    tr.appendChild(el("td", a.success ? "success" : "fail", a.success ? "ok" : "bad"));
-    tr.appendChild(el("td", a.fail_phase ? `${a.fail_phase}${a.fail_reason ? ": " + a.fail_reason : ""}` : ""));
-    tr.appendChild(el("td", a.duration_s != null ? Number(a.duration_s).toFixed(0) : ""));
-    for (const f of ["img_before", "img_after"]) {
-      const td = el("td");
-      if (a[f]) { const i = el("img"); i.loading = "lazy"; i.alt = f; i.src = `/api/image/attempts/${encodeURIComponent(a._id)}/${f}`; td.appendChild(i); }
-      tr.appendChild(td);
-    }
-    const rp = el("td");
-    if (a.clip_frames) {
-      const b = el("button", `▶ Replay (${a.clip_frames})`, "chip");
-      b.type = "button";
-      b.addEventListener("click", () => openPlayer(a._id, `${a.target_text || a.label || a.mode || "attempt"} · ${hhmm(a.ts)}`));
-      rp.appendChild(b);
-    }
-    tr.appendChild(rp);
-    tb.appendChild(tr);
-  }
-  if (!list.length) { const tr = el("tr"); const td = el("td", "No attempts yet", "muted"); td.colSpan = 11; tr.appendChild(td); tb.appendChild(tr); }
+function offline() {
+  const p = $("conn");
+  p.className = "pill warn"; p.textContent = "reconnecting…";
+  const s = $("state");
+  s.className = "warn"; s.firstElementChild.textContent = "⟳"; s.lastElementChild.textContent = "reconnecting to the dashboard server…";
+  document.querySelector("main").classList.add("stale");
 }
 
-async function send(text) {
-  const r = await api("/api/commands", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text})});
-  refreshCommands();
-  return r;
+function render(d) {
+  document.querySelector("main").classList.toggle("stale", !d.link.up);
+  const p = $("conn");
+  p.className = `pill ${d.estop ? "bad" : d.link.up ? "ok" : "warn"}`;
+  p.textContent = d.estop ? "E-STOP" : d.link.up ? "robot live" : "reconnecting…";
+  const [cls, icon, text] = stateLine(d), s = $("state");
+  s.className = cls; s.firstElementChild.textContent = icon; s.lastElementChild.textContent = text;
+  renderJob(d.command);
+  $("teach-form").hidden = !d.teach;
+  const fps = shown.length > 1 ? (shown.length - 1) / ((shown[shown.length - 1] - shown[0]) / 1000) : 0;
+  const age = d.frame_age_s;
+  $("cam-meta").textContent = age == null ? "" : age > 3 ? `no new picture for ${agoText(age)}${d.busy ? " (arm moving)" : ""}`
+    : `live · ${fps.toFixed(1)} fps`;
+  $("lib").textContent = d.library.store ? `library: ${d.library.store === "atlas" ? "MongoDB Atlas" : "local files"}${d.library.views ? ` · ${Math.round(d.library.views)} views` : ""}` : "";
+  drawBoxes();
+  drawMap(d);
 }
-$("f").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const text = $("t").value.trim();
-  if (!text) return;
-  try { const r = await send(text); $("msg").textContent = sentMsg(r, `"${text}"`); $("t").value = ""; }
-  catch (err) { $("msg").textContent = "error: " + err.message; }
-});
-$("b-reset").addEventListener("click", async () => {
-  try { const r = await send("__reset__"); $("msg").textContent = sentMsg(r, "clear the blue square"); }
-  catch (err) { $("msg").textContent = "error: " + err.message; }
-});
-$("b-scan").addEventListener("click", async () => {
-  try { const r = await send("__scan__"); $("msg").textContent = sentMsg(r, "scan the whole table"); }
-  catch (err) { $("msg").textContent = "error: " + err.message; }
-});
-$("b-clearmap").addEventListener("click", async () => {
-  try {
-    const d = await api("/api/clear_map", {method: "POST"}), r = d.module || d;
-    const pl = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
-    $("msg").textContent = r.ok ? `map cleared: ${pl(r.cleared_objects, "object")} and ${pl(r.cleared_sightings, "last-seen position")} forgotten`
-      : r.error === "busy" ? `module is busy with "${r.running?.text || "a job"}", clear the map when it is idle` : `not cleared: ${r.error || r.reason}`;
-    safe(refreshMap)();
-  } catch (err) { $("msg").textContent = "error: " + err.message; }
-});
-let commandPath = "queue";
-function sentMsg(r, what) {
-  if (!r.module) return `queued: ${what}`;
-  const ms = r.module.decide_ms != null ? ` (decided in ${r.module.decide_ms} ms)` : "";
-  if (r.module.items) return r.module.message + ((r.module.ignored || []).length ? ` (only 5 at a time, ignored: ${r.module.ignored.join(", ")})` : "");
-  if (r.module.accepted) return `module started: ${what}${ms}`;
-  if (r.module.reason) return `${r.module.reason}${ms}`;
-  return r.module.error === "busy" ? `module is busy with "${r.module.running?.text || "a job"}", try again when it is idle` : `module refused: ${r.module.error}`;
-}
-$("b-prev").addEventListener("click", async () => {
-  const text = $("t").value.trim();
-  if (!text) { $("msg").textContent = "type what to grasp first"; return; }
-  try {
-    const r = await api("/api/preview", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text})});
-    if (r.module) {
-      // Module mode: the robot's own decision from its cached frame; the target is boxed green in the picture
-      const m = r.module, ms = m.decide_ms != null ? ` (decided in ${m.decide_ms} ms)` : "";
-      // A list: what each item would do, one line each
-      const pv = (x) => x.target ? `would pick ${x.target.label || "#" + x.target.id} · ${Number(x.target.score).toFixed(2)}` : x.message || x.reason;
-      if (m.items) { $("msg").textContent = m.items.map((x) => `${x.text}: ${pv(x)}`).join("\n"); refreshCam(); return; }
-      // frame path: a target; map path: a message (no target); otherwise why not / what a grasp would do
-      $("msg").textContent = m.ok && m.target ? `would pick ${m.target.label || "#" + m.target.id} · ${Number(m.target.score).toFixed(2)}${ms}`
-        : `${m.message || m.reason}${ms}`;
-    } else {
-      $("msg").textContent = "best match: " + r.slice(0, 3).map((o) => `#${o.id} ${o.score.toFixed(2)}`).join(", ");
-    }
-    refreshCam();
-  } catch (err) { $("msg").textContent = "preview: " + err.message; }
-});
 
-// Halloween theme: remembered per browser; storage can be unavailable (private window), so guard it
-function setTheme(on) {
-  document.documentElement.dataset.theme = on ? "halloween" : "";
-  $("b-theme").setAttribute("aria-pressed", String(on));
-  $("b-theme").textContent = on ? "☀️ Normal mode" : "🎃 Spooky mode";
-  $("t").placeholder = on ? "trick or treat: candy corn" : "grasp green square";
-  try { localStorage.setItem("theme", on ? "halloween" : ""); } catch (e) {}
-}
-$("b-theme").addEventListener("click", () => setTheme(document.documentElement.dataset.theme !== "halloween"));
-let savedTheme = "";
-try { savedTheme = localStorage.getItem("theme") || ""; } catch (e) {}
-setTheme(savedTheme === "halloween");
-
-// Replay player: frames of one attempt with phase + time; plays at the real pace times the chosen speed
-const player = {id: null, frames: [], i: 0, timer: null, imgs: []};
-function showFrame(i) {
-  const f = player.frames[i];
-  if (!f) return;
-  player.i = i;
-  $("pl-img").src = player.imgs[i].src;
-  $("pl-seek").value = i;
-  const t = f.ts - player.frames[0].ts;
-  $("pl-cap").textContent = `${f.phase} · +${t.toFixed(1)} s · frame ${i + 1} / ${player.frames.length}`;
-}
-function stopPlay() { clearTimeout(player.timer); player.timer = null; $("pl-play").textContent = "▶ Play"; }
-function step() {
-  if (player.i >= player.frames.length - 1) { stopPlay(); return; }
-  const gap = (player.frames[player.i + 1].ts - player.frames[player.i].ts) * 1000;
-  const wait = Math.min(Math.max(gap, 80), 2000) / Number($("pl-speed").value);
-  player.timer = setTimeout(() => { showFrame(player.i + 1); step(); }, wait);
-}
-async function openPlayer(id, title) {
-  stopPlay();
-  player.id = id;
-  player.frames = await api(`/api/clips/${encodeURIComponent(id)}`);
-  player.imgs = player.frames.map((f) => { const im = new Image(); im.src = `/api/clips/${encodeURIComponent(id)}/${f.seq}.jpg`; return im; });
-  $("pl-title").textContent = title;
-  $("pl-seek").max = Math.max(player.frames.length - 1, 0);
-  $("pl-gif").href = `/api/clips/${encodeURIComponent(id)}/download.gif`;
-  $("pl-mp4").href = `/api/clips/${encodeURIComponent(id)}/download.mp4`;
-  showFrame(0);
-  $("player").showModal();
-}
-$("pl-play").addEventListener("click", () => {
-  if (player.timer) { stopPlay(); return; }
-  if (player.i >= player.frames.length - 1) showFrame(0);
-  $("pl-play").textContent = "⏸ Pause";
-  step();
-});
-$("pl-prev").addEventListener("click", () => { stopPlay(); showFrame(Math.max(player.i - 1, 0)); });
-$("pl-next").addEventListener("click", () => { stopPlay(); showFrame(Math.min(player.i + 1, player.frames.length - 1)); });
-$("pl-seek").addEventListener("input", (e) => { stopPlay(); showFrame(Number(e.target.value)); });
-$("pl-close").addEventListener("click", () => { stopPlay(); $("player").close(); });
-$("player").addEventListener("close", stopPlay);
-
-// Top-down table map: arm base at the bottom centre, +x (forward) up, +y (left) to the left; units mm
-const MAP = {W: 560, H: 300, s: 0.4, base: [280, 290]};
+// ---- the map: arm base at the bottom centre, +x (forward) up, +y (left) to the left; mm ---------------
+const MAP = { W: 560, H: 330, s: 0.4, base: [280, 315] };
 const mapXY = (x, y) => [MAP.base[0] - y * MAP.s, MAP.base[1] - x * MAP.s];
 const ageColour = (age) => age < 60 ? "var(--ok)" : age < 300 ? "var(--warn)" : "var(--muted)";
-const agoText = (s) => s < 90 ? `${Math.round(s)} s ago` : `${Math.round(s / 60)} min ago`;
-// Map labels without collisions: in priority order, each label takes the first spot around its marker (right,
-// left, above, below, diagonals) whose box hits no placed label, no other marker and stays inside the map; the
-// far rings get a leader line back to the marker. "unknown" labels are not placed: they show on hover only.
-// fixed: boxes already taken (the "arm" label); frames: rects whose border a label must not cross (drop square).
-function placeLabels(svg, mk, marks, labels, fixed = [], frames = []) {
-  const [W, H] = [MAP.W, MAP.H], boxes = [...fixed];
+// Labels without collisions: in priority order, each takes the first spot around its marker (right, left, above, below,
+// diagonals) that hits no placed label or other marker and stays inside the map; far spots get a leader line
+function placeLabels(svg, marks, labels, fixed = []) {
+  const boxes = [...fixed];
   const meets = (b, o) => b.x0 < o.x1 && b.x1 > o.x0 && b.y0 < o.y1 && b.y1 > o.y0;
-  const hitsBox = (b) => boxes.some((o) => meets(b, o));
-  const crossesFrame = (b) => frames.some((f) => meets(b, f) && !(b.x0 >= f.x0 && b.x1 <= f.x1 && b.y0 >= f.y0 && b.y1 <= f.y1));
-  const hitsMark = (b, own) => marks.some((c) => c !== own && Math.hypot(Math.max(b.x0, Math.min(c.x, b.x1)) - c.x,
-                                                                         Math.max(b.y0, Math.min(c.y, b.y1)) - c.y) < c.r);
+  const hitsMark = (b, own) => marks.some((c) => c !== own && Math.hypot(Math.max(b.x0, Math.min(c.x, b.x1)) - c.x, Math.max(b.y0, Math.min(c.y, b.y1)) - c.y) < c.r);
   for (const L of labels.sort((a, b) => a.prio - b.prio)) {
-    const t = mk("text", {class: L.cls, x: L.x + 10, y: L.y + 4}, L.text);
-    L.g.appendChild(t);
-    if (L.cls === "lbl-unk") continue;
+    const t = mk("text", { x: L.x + 10, y: L.y + 4, ...(L.cls ? { class: L.cls } : {}) }, L.text);
+    svg.appendChild(t);
     const own = marks.find((c) => c.x === L.x && c.y === L.y), w = t.getComputedTextLength() || L.text.length * 6.2;
     let best = null;
     for (const far of [0, 16, 34]) {
-      const spots = [[L.x + 11 + far, L.y + 4], [L.x - 11 - far - w, L.y + 4], [L.x - w / 2, L.y - 12 - far],
-                     [L.x - w / 2, L.y + 20 + far], [L.x + 8 + far, L.y - 9 - far], [L.x + 8 + far, L.y + 17 + far],
-                     [L.x - 8 - far - w, L.y - 9 - far], [L.x - 8 - far - w, L.y + 17 + far]];
-      for (const [tx, ty] of spots) {
-        const b = {x0: tx - 1, y0: ty - 10, x1: tx + w + 1, y1: ty + 3};
-        if (b.x0 < 0 || b.x1 > W || b.y0 < 0 || b.y1 > H || hitsBox(b) || hitsMark(b, own) || crossesFrame(b)) continue;
-        best = {tx, ty, b, far};
+      for (const [tx, ty] of [[L.x + 11 + far, L.y + 4], [L.x - 11 - far - w, L.y + 4], [L.x - w / 2, L.y - 12 - far], [L.x - w / 2, L.y + 20 + far],
+                              [L.x + 8 + far, L.y - 9 - far], [L.x + 8 + far, L.y + 17 + far], [L.x - 8 - far - w, L.y - 9 - far], [L.x - 8 - far - w, L.y + 17 + far]]) {
+        const b = { x0: tx - 1, y0: ty - 10, x1: tx + w + 1, y1: ty + 3 };
+        if (b.x0 < 0 || b.x1 > MAP.W || b.y0 < 0 || b.y1 > MAP.H || boxes.some((o) => meets(b, o)) || hitsMark(b, own)) continue;
+        best = { tx, ty, b, far };
         break;
       }
       if (best) break;
     }
-    best = best || {tx: L.x + 11, ty: L.y + 4, b: {x0: L.x + 10, y0: L.y - 6, x1: L.x + 12 + w, y1: L.y + 7}, far: 0};
-    t.setAttribute("x", best.tx);
-    t.setAttribute("y", best.ty);
+    best = best || { tx: L.x + 11, ty: L.y + 4, b: { x0: L.x + 10, y0: L.y - 6, x1: L.x + 12 + w, y1: L.y + 7 }, far: 0 };
+    t.setAttribute("x", best.tx); t.setAttribute("y", best.ty);
     boxes.push(best.b);
     if (best.far) {
-      // Leader line from the marker's edge to the nearest point of the label box
       const nx = Math.max(best.b.x0, Math.min(L.x, best.b.x1)), ny = Math.max(best.b.y0, Math.min(L.y, best.b.y1));
       const len = Math.hypot(nx - L.x, ny - L.y) || 1, r0 = (own && own.r) || 8;
-      L.g.insertBefore(mk("line", {x1: L.x + (nx - L.x) * r0 / len, y1: L.y + (ny - L.y) * r0 / len, x2: nx, y2: ny,
-                                   stroke: "var(--muted)", "stroke-width": 1}), t);
+      svg.insertBefore(mk("line", { x1: L.x + (nx - L.x) * r0 / len, y1: L.y + (ny - L.y) * r0 / len, x2: nx, y2: ny, stroke: "var(--muted)" }), t);
     }
   }
 }
-async function refreshMap() {
-  const d = await api("/api/table_map");
-  const svg = $("tmap"), ns = "http://www.w3.org/2000/svg";
-  const mk = (tag, attrs, text) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
+function drawMap(d) {
+  const svg = $("map"), m = d.map, [bx, by] = MAP.base, s = MAP.s;
   svg.replaceChildren();
-  // Reachable area: half ring between the inner and outer reach limits the arm code enforces
-  const [rin, rout] = d.reach_mm.map((r) => r * MAP.s), [bx, by] = MAP.base;
-  svg.appendChild(mk("path", {d: `M ${bx - rout} ${by} A ${rout} ${rout} 0 0 1 ${bx + rout} ${by} L ${bx + rin} ${by} A ${rin} ${rin} 0 0 0 ${bx - rin} ${by} Z`,
-    fill: "var(--chip)", stroke: "var(--line)"}));
-  svg.appendChild(mk("rect", {x: bx - 10, y: by - 6, width: 20, height: 10, rx: 2, fill: "var(--muted)"}));
-  svg.appendChild(mk("text", {x: bx + 14, y: by - 1}, "arm"));
-  const m = d.map, frames = [], fixed = [{x0: bx - 12, y0: by - 12, x1: bx + 40, y1: by + 6}];  // label-free boxes: the "arm" text, ...
-  if (m && m.square && m.square.xy) {
-    // AGENT3: size_mm = [along x, along y] of the white inner area; x is up on screen, y is left
-    const [sx, sy] = mapXY(...m.square.xy), size = [].concat(m.square.size_mm || [200, 200]);
-    const w = (size[1] ?? size[0]) * MAP.s, h = size[0] * MAP.s;
-    // partial (AGENT3): the square was cut by the picture's edge; xy/size cover only the part in view: dashed
-    const style = {fill: "none", stroke: "#2457d6", "stroke-width": 4, ...(m.square.partial ? {"stroke-dasharray": "10 6"} : {})};
-    // corners (AGENT3: the square at any rotation, [[x, y] table mm] x 4) -> its real outline; else the axis box
+  const [rin, rout] = d.reach_mm.map((r) => r * s);
+  svg.appendChild(mk("path", { d: `M ${bx - rout} ${by} A ${rout} ${rout} 0 0 1 ${bx + rout} ${by} L ${bx + rin} ${by} A ${rin} ${rin} 0 0 0 ${bx - rin} ${by} Z`,
+    fill: "var(--chip)", stroke: "var(--line)" }));
+  // What the camera's newest picture covers on the table
+  if (d.view && d.view.length >= 3 && (d.frame_age_s ?? 99) < 5)
+    svg.appendChild(mk("polygon", { points: d.view.map((c) => mapXY(c[0], c[1]).join(",")).join(" "), fill: "var(--accent)", "fill-opacity": 0.12,
+      stroke: "var(--accent)", "stroke-opacity": 0.5, "stroke-dasharray": "4 3" }));
+  const marks = [], labels = [], fixed = [], delivered = [];
+  // The drop target: the bucket (AGENT3's tmap["bucket"]), else a tape square when the map has one
+  let dropAt = null;
+  if (m && m.bucket && m.bucket.xy) {
+    const [px, py] = mapXY(...m.bucket.xy), r = Math.max(10, (m.bucket.radius_mm || 90) * s);
+    svg.appendChild(mk("circle", { cx: px, cy: py, r, fill: "var(--bucket)", "fill-opacity": 0.25, stroke: "var(--bucket)", "stroke-width": 3,
+      ...(m.bucket.partial ? { "stroke-dasharray": "8 5" } : {}) }));
+    svg.appendChild(mk("text", { x: px, y: py + 4, "text-anchor": "middle" }, "🪣"));
+    dropAt = [px, py, r + 2];
+  } else if (m && m.square && m.square.xy) {
     const pts = Array.isArray(m.square.corners) && m.square.corners.length >= 3 ? m.square.corners.map((c) => mapXY(c[0], c[1])) : null;
-    const sq = pts ? mk("polygon", {points: pts.map((p) => p.join(",")).join(" "), ...style})
-                   : mk("rect", {x: sx - w / 2, y: sy - h / 2, width: w, height: h, ...style});
-    const conf = m.square.confidence != null ? ` · confidence ${Number(m.square.confidence).toFixed(2)}` : "";
-    const yaw = m.square.yaw_deg != null ? ` · ${Number(m.square.yaw_deg).toFixed(0)}°` : "";
-    sq.appendChild(mk("title", {}, (m.square.partial ? "drop square, only partly in view so far" : "drop square") + yaw + conf));
-    svg.appendChild(sq);
-    const xs = pts ? pts.map((p) => p[0]) : [sx - w / 2, sx + w / 2], ys = pts ? pts.map((p) => p[1]) : [sy - h / 2, sy + h / 2];
-    // Partial: the full rectangle is AGENT3's estimate from the edges seen so far; say how sure, right on the map
-    if (m.square.partial && m.square.confidence != null) {
-      const tx = Math.min(...xs), ty = Math.min(...ys) - 5, txt = `estimated · ${Math.round(100 * m.square.confidence)}%`;
-      const t = mk("text", {x: tx, y: ty, class: "lbl-mute"}, txt);
-      svg.appendChild(t);
-      fixed.push({x0: tx - 1, y0: ty - 10, x1: tx + (t.getComputedTextLength() || txt.length * 6.2) + 1, y1: ty + 3});  // ... and this one
-    }
-    frames.push({x0: Math.min(...xs) - 2, y0: Math.min(...ys) - 2, x1: Math.max(...xs) + 2, y1: Math.max(...ys) + 2});
+    const [sx, sy] = mapXY(...m.square.xy), size = [].concat(m.square.size_mm || [200, 200]), w = (size[1] ?? size[0]) * s, h = size[0] * s;
+    const style = { fill: "none", stroke: "#2457d6", "stroke-width": 3, ...(m.square.partial ? { "stroke-dasharray": "10 6" } : {}) };
+    svg.appendChild(pts ? mk("polygon", { points: pts.map((p) => p.join(",")).join(" "), ...style }) : mk("rect", { x: sx - w / 2, y: sy - h / 2, width: w, height: h, ...style }));
+    dropAt = [sx, sy, Math.max(w, h) / 2];
   }
-  const pick = (label) => { if (label) { $("t").value = label; $("t").focus(); } };
-  const onMap = new Map();  // label -> its map object (xy, age_s)
-  const hl = d.highlight;
-  const marks = [], labels = [];  // marker circles (obstacles) and labels to place once every marker is known
+  if (dropAt) marks.push({ x: dropAt[0], y: dropAt[1], r: dropAt[2] });
+  const hl = target();
   for (const o of (m && m.objects) || []) {
-    const [px, py] = mapXY(...o.xy), named = !!o.label, label = o.label || "unknown";
-    // Live map: each object has its own age (seen_ts); the dot fades from fully drawn when just seen to faint
-    // after 5 min, so what the robot saw a moment ago stands out from what it only remembers
-    // superseded (AGENT3 _current): the object was seen somewhere else since; this is its old spot, drawn faint
-    const old = !!o.superseded;
-    const age = o.age_s ?? m.age_s, fade = old ? 0.25 : age <= 10 ? 1 : Math.max(0.4, 1 - 0.6 * (age - 10) / 290);
-    if (named) onMap.set(o.label, o);
-    // in_square (AGENT3): already delivered into the drop square; a grasp never picks it again, so no click
-    const done = !!o.in_square, clickable = named && !done;
-    const g = mk("g", {style: `opacity:${fade.toFixed(2)}${clickable ? ";cursor:pointer" : ""}`});
-    // Ring the object the last preview / grasp resolved to: same map position, else same label
-    const hit = hl && (hl.xy ? Math.hypot(hl.xy[0] - o.xy[0], hl.xy[1] - o.xy[1]) < 40 : hl.label && hl.label === o.label);
-    if (hit) g.appendChild(mk("circle", {cx: px, cy: py, r: 13, fill: "none", stroke: "var(--accent)", "stroke-width": 3}));
-    // Unrecognised objects (no library label) are grey, whatever their age
-    g.appendChild(mk("circle", {cx: px, cy: py, r: 7, fill: done ? "#2457d6" : named ? ageColour(age) : "var(--muted)", stroke: "var(--panel)", "stroke-width": 2}));
-    // partial (AGENT3): only seen cut by a picture's edge, so the position is approximate; a grasp looks there first
-    if (o.partial) g.appendChild(mk("circle", {cx: px, cy: py, r: 11, fill: "none", stroke: "var(--muted)", "stroke-width": 1.5, "stroke-dasharray": "3 2.5"}));
-    g.appendChild(mk("title", {}, `${label} · seen ${agoText(age)}${o.partial ? " at a picture's edge, position approximate" : ""} · (${o.xy[0].toFixed(0)}, ${o.xy[1].toFixed(0)}) mm · score ${o.score}`));
-    if (clickable) g.addEventListener("click", () => pick(o.label));
+    if (o.in_square) { if (o.label) delivered.push(o.label); continue; }  // delivered: off the table, listed at the bucket
+    const [px, py] = mapXY(...o.xy), named = !!o.label, age = o.age_s ?? 0, old = !!o.superseded;
+    const fade = old ? 0.25 : age <= 10 ? 1 : Math.max(0.4, 1 - 0.6 * (age - 10) / 290);
+    const hit = named && !old && ((hl.xy && Math.hypot(hl.xy[0] - o.xy[0], hl.xy[1] - o.xy[1]) < 40) || isTarget(o.names, o.label));
+    const g = mk("g", { style: `opacity:${fade.toFixed(2)}${named && !old ? ";cursor:pointer" : ""}` });
+    if (hit) g.appendChild(mk("circle", { cx: px, cy: py, r: 13, fill: "none", stroke: "var(--accent)", "stroke-width": 3 }));
+    g.appendChild(mk("circle", { cx: px, cy: py, r: 7, fill: named ? ageColour(age) : "var(--muted)", stroke: "var(--panel)", "stroke-width": 2 }));
+    if (o.partial) g.appendChild(mk("circle", { cx: px, cy: py, r: 11, fill: "none", stroke: "var(--muted)", "stroke-dasharray": "3 2.5" }));
+    g.appendChild(mk("title", {}, `${o.label || "not recognised"} · seen ${agoText(age)} ago · (${o.xy[0].toFixed(0)}, ${o.xy[1].toFixed(0)}) mm`));
+    if (named && !old) g.addEventListener("click", () => { $("t").value = o.label; $("t").focus(); });
     svg.appendChild(g);
-    marks.push({x: px, y: py, r: hit ? 14 : o.partial ? 12 : 9});  // labels keep clear of the dashed ring too
-    // Older than a minute (a grasp would rescan before trusting it): say how old next to the name
-    const name = done ? `${label} ✓ in the square` : old ? `${label} · old spot` : o.partial ? `≈ ${label}` : label;
-    const text = named && age > 60 ? `${name} · ${agoText(age).replace(" ago", "")}` : name;
-    labels.push({g, x: px, y: py, text, prio: hit ? 0 : old ? 3 : named ? 1 : 3, cls: named ? "lbl" : "lbl-unk"});
+    marks.push({ x: px, y: py, r: hit ? 14 : o.partial ? 12 : 9 });
+    if (named) labels.push({ x: px, y: py, prio: hit ? 0 : old ? 3 : 1, cls: old ? "mute" : "",
+      text: `${o.partial ? "≈ " : ""}${o.label}${old ? " · old spot" : age > 15 ? ` · ${agoText(age)}` : ""}` });
   }
-  // Sightings are memory, not a current detection: a hollow ring + "last seen …", drawn only where they add
-  // something (no dot for that label on the map, or seen somewhere else more recently than its map dot)
-  for (const s of d.sightings || []) {
-    if (!s.xy) continue;
-    const at = onMap.get(s.label);
-    if (at && (Math.hypot(at.xy[0] - s.xy[0], at.xy[1] - s.xy[1]) < 40 || s.age_s >= (at.age_s ?? m.age_s))) continue;
-    const [px, py] = mapXY(...s.xy);
-    const g = mk("g", {style: "cursor:pointer"});
-    g.appendChild(mk("circle", {cx: px, cy: py, r: 7, fill: "none", stroke: ageColour(s.age_s), "stroke-width": 2.5}));
-    g.appendChild(mk("title", {}, `${s.label} · last seen ${agoText(s.age_s)} (${s.source}), not on the live map there`));
-    g.addEventListener("click", () => pick(s.label));
-    svg.appendChild(g);
-    marks.push({x: px, y: py, r: 9});
-    labels.push({g, x: px, y: py, text: `${s.label} · last seen ${agoText(s.age_s)}`, prio: 2, cls: "lbl-mute"});
+  if (dropAt && delivered.length) labels.push({ x: dropAt[0], y: dropAt[1], prio: 0, text: `in the bucket: ${[...new Set(delivered)].join(", ")}` });
+  // The arm: its base, the line to where the flange is now, and the jaws turned by the wrist
+  svg.appendChild(mk("rect", { x: bx - 12, y: by - 7, width: 24, height: 12, rx: 3, fill: "var(--muted)" }));
+  fixed.push({ x0: bx - 14, y0: by - 9, x1: bx + 14, y1: by + 7 });
+  if (d.arm) {
+    const [ax, ay] = mapXY(d.arm.x, d.arm.y), a = (d.arm.theta || 0) * Math.PI / 180;
+    svg.appendChild(mk("line", { x1: bx, y1: by - 6, x2: ax, y2: ay, stroke: "var(--muted)", "stroke-width": 5, "stroke-linecap": "round", opacity: 0.6 }));
+    const jx = 11 * Math.cos(a), jy = 11 * Math.sin(a);
+    svg.appendChild(mk("line", { x1: ax - jx, y1: ay - jy, x2: ax + jx, y2: ay + jy, stroke: "var(--ink)", "stroke-width": 3, "stroke-linecap": "round" }));
+    svg.appendChild(mk("circle", { cx: ax, cy: ay, r: 5, fill: "var(--ink)" }));
+    marks.push({ x: ax, y: ay, r: 12 });
+    labels.push({ x: ax, y: ay, prio: 0, cls: "mute", text: `arm · z ${Math.round(d.arm.z)}` });
   }
-  placeLabels(svg, mk, marks, labels, fixed, frames);
-  // A grasp's search (AGENT1's search_and_find): stops at the first view that shows the object and grasps
-  const srch = d.search;
-  const nth = srch && srch.item ? `item ${srch.item.k}/${srch.item.n} · ` : "";
-  const head = srch && srch.n ? nth + (srch.found ? `found ${srch.text ? `"${srch.text}" ` : ""}at view ${srch.k}, grasping`
-                                            : `searching${srch.text ? ` for "${srch.text}"` : ""}… view ${srch.k}/${srch.n}`)
-    : d.sweep && d.sweep.n ? `scanning table… pose ${d.sweep.k}/${d.sweep.n}`
-    : m && m.cleared_s_ago != null && !(m.objects || []).length ? `map cleared ${agoText(m.cleared_s_ago)} · 0 objects`
-    : m ? `map updated ${agoText(m.age_s)} · ${(m.objects || []).length} objects`
-          + (m.swept_s_ago != null ? ` · whole table scanned ${agoText(m.swept_s_ago)}` : "")
-          + (m.cleared_s_ago != null ? ` · cleared ${agoText(m.cleared_s_ago)}` : "") : "no table map yet";
-  const nSeen = (d.sightings || []).length;
-  // Every frame folded into the map is kept as an observation (the map is rebuilt from them after a crash)
-  const nObs = d.observations;
-  // The paper may be moved at any time (user): a square seen only in part is a state, never a request to move it
-  const sqNote = m && m.square && m.square.partial
-    ? ` · square partial${m.square.confidence != null ? ` (${Math.round(100 * m.square.confidence)}% sure)` : ""} — looking for full view` : "";
-  // A dead map must be visible: every update failing (sfhack4: KeyError 'next_id' on every frame)
-  const lv = d.live, dead = lv && lv.failing ? `⚠ map not updating (${lv.errors} failed: ${lv.last_error}) · ` : "";
-  $("map-head").textContent = dead + head + (nSeen ? ` · ${nSeen} sighting${nSeen === 1 ? "" : "s"}` : "")
-    + sqNote + (nObs ? ` · ${nObs} observation${nObs === 1 ? "" : "s"} stored` : "");
+  placeLabels(svg, marks, labels, fixed);
+  const n = ((m && m.objects) || []).filter((o) => !o.in_square && !o.superseded).length;
+  $("map-meta").textContent = d.map_failing ? "⚠ map not updating" : !m ? "no map yet"
+    : m.cleared_s_ago != null && !n ? `cleared ${agoText(m.cleared_s_ago)} ago` : `${n} object${n === 1 ? "" : "s"} · updated ${agoText(m.age_s)} ago`;
 }
 
-// Known objects from the view library: shows the audience what it can ask for; a click fills the box
-async function refreshLabels() {
-  const list = await api("/api/labels");
-  const box = $("known-list"); box.replaceChildren();
-  for (const [label, ...aliases] of list) {
-    const chip = el("button", label, "chip");
-    chip.type = "button";
-    if (aliases.length) chip.title = "also: " + aliases.join(", ");
-    chip.addEventListener("click", () => { $("t").value = label; $("t").focus(); });
-    box.appendChild(chip);
-  }
-  $("known").hidden = !list.length;
+// ---- commands ------------------------------------------------------------------------------------------
+async function send(text, what) {
+  try { await post("/api/commands", { text }); $("more-msg").textContent = ""; }
+  catch (e) { $("more-msg").textContent = `${what}: ${e.message}`; $("more").open = true; }
+  tickLive();
 }
+$("f").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const text = $("t").value.trim();
+  if (text) { send(text, "grasp"); $("t").value = ""; }
+});
+$("b-reset").onclick = () => send("__reset__", "reset");
+$("b-scan").onclick = () => send("__scan__", "scan");
+$("b-clearmap").onclick = async () => {
+  try { const r = (await post("/api/clear_map", {})).module || {}; $("more-msg").textContent = r.ok ? `map cleared: ${r.cleared_objects ?? 0} objects forgotten` : (r.error || r.reason || "not cleared"); }
+  catch (e) { $("more-msg").textContent = "clear map: " + e.message; }
+};
+$("b-prev").onclick = async () => {
+  const text = $("t").value.trim();
+  if (!text) { $("more-msg").textContent = "type what to preview in the box first"; return; }
+  try {
+    const r = (await post("/api/preview", { text })).module || {};
+    const one = (x) => x.target ? `${x.text ? x.text + " → " : ""}${x.target.label || "#" + x.target.id} (in view)` : x.label ? `${x.text ? x.text + " → " : ""}${x.label} (on the map)` : `${x.text || text}: ${x.reason || x.status || "not found"}`;
+    $("more-msg").textContent = r.items ? r.items.map(one).join(" · ") : one(r);
+  } catch (e) { $("more-msg").textContent = "preview: " + e.message; }
+  tickLive();
+};
+// Teach: a click on the picture says which object (0-1 of the picture)
+let teachPoint = null;
+$("cam").addEventListener("click", (ev) => {
+  if ($("teach-form").hidden || !$("more").open) return;
+  const r = ev.currentTarget.getBoundingClientRect(), m = camMeta || { w: 16, h: 9 };
+  const ar = m.w / m.h, w = Math.min(r.width, r.height * ar), h = w / ar;
+  const u = (ev.clientX - r.left - (r.width - w) / 2) / w, v = (ev.clientY - r.top - (r.height - h) / 2) / h;
+  if (u < 0 || u > 1 || v < 0 || v > 1) return;
+  teachPoint = [u, v];
+  $("teach-pick").textContent = "object picked in the picture";
+});
+$("more").addEventListener("toggle", () => $("cam").classList.toggle("pick", $("more").open && !$("teach-form").hidden));
+$("teach-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const name = $("teach-name").value.trim();
+  if (!name) return;
+  try {
+    const r = (await post("/api/teach", { name, alias_of: $("teach-alias").value.trim() || null, point: teachPoint })).module || {};
+    $("more-msg").textContent = r.accepted ? `teaching “${name}”: the arm looks from above and does not touch it` : (r.reason || r.error || "not accepted");
+    if (r.accepted) { $("teach-name").value = ""; $("teach-alias").value = ""; teachPoint = null; $("teach-pick").textContent = "click the object in the picture, or leave it to the best match"; }
+  } catch (e) { $("more-msg").textContent = "teach: " + e.message; }
+  tickLive();
+});
 
-const safe = (fn) => () => fn().catch(() => {});
-refreshCam(); refreshStatus(); safe(refreshCommands)(); safe(refreshStats)(); safe(refreshAttempts)();
-setInterval(refreshCam, 1000);
-setInterval(refreshStatus, 2000);
-setInterval(safe(refreshCommands), 1500);
-setInterval(safe(refreshStats), 3000);
-setInterval(safe(refreshAttempts), 3000);
-safe(refreshLabels)();
-safe(refreshMap)();
-setInterval(safe(refreshMap), 2000);
-setInterval(safe(refreshLabels), 30000);  // the library changes only when objects are scanned
+tickLive();
+tickCam();
 </script>
 </body>
 </html>

@@ -28,6 +28,8 @@ DoCommand:
   {"status": true}                   busy / running / last / warm / seen / library / store mode / live map stats
   {"seen_image": true}               last idle frame as base64 JPEG (<= 640 px) with the seen boxes scaled to it
   {"table_map": true}                the live table map (no embeddings; each object's seen_ts), sightings, sweep progress
+  {"dashboard": {"since": ts}}       the dashboard's one call: status, live map, arm pose, E-stop, phase, and the newest
+                                     picture (any source, boxes, table footprint) if newer than since (dashboard_view.py)
   {"clear_map": true}                forget the table (someone rearranged it): live map + sightings + cached frame;
                                      the old map and sightings go to the Store's history. Refused while a job runs.
   {"observations": {"since": ts, "until": ts, "images": false, "limit": 200, "source": "idle"}}
@@ -77,6 +79,7 @@ from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
 from viam.utils import ValueTypes, struct_to_dict
 
+from module import dashboard_view
 from module.live_map import LiveMap
 from sorter import teach
 
@@ -254,6 +257,7 @@ class GraspByDescription(Generic, EasyResource):
         self.seen: Dict[str, Any] = {}  # summary of the latest idle look, for status / dashboard
         self._seen_raw = None  # {"ts", "recs", "objs", "rgb", "depth", "pose"} behind self.seen, for a fast grasp
         self._jpeg_cache = (None, None, 1.0)  # (frame ts, base64 jpeg, scale) for seen_image
+        self.view = dashboard_view.DashboardView()  # the newest picture of the table, for {"dashboard"}
         self._look_lock = asyncio.Lock()  # one look at a time: the idle loop and a grasp that needs a fresh frame
         self.live: Optional[LiveMap] = None  # the live table map, once warm and if AGENT3's update_map exists
         self._intr: Optional[dict] = None  # camera intrinsics for update_map, read once through the Rig
@@ -328,15 +332,17 @@ class GraspByDescription(Generic, EasyResource):
         otherwise at most one per MAP_TASK_EVERY_S while no update runs, so update_map's 150-300 ms per frame
         does not compete with every servo probe for the CPU. The source is the executor's phase (servo, check...).
         """
+        rt = _runtime()
+        phase = rt.executor.phase_now(rig) if hasattr(rt.executor, "phase_now") else "task"
+        # Every executor frame is the dashboard's picture during a job (only a reference is kept here)
+        self.view.put(time.time(), rgb, pose, "sweep" if self._sweeping else phase)
         if self.live is None or depth is None:
             return
         if not self._sweeping:
             if self.live.busy() or time.time() - self._task_map_at < MAP_TASK_EVERY_S:
                 return
             self._task_map_at = time.time()
-        rt = _runtime()
         intr = self._intr or {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}
-        phase = rt.executor.phase_now(rig) if hasattr(rt.executor, "phase_now") else "task"
         self.live.offer(rgb, depth, pose, intr, "sweep" if self._sweeping else phase, keep=self._sweeping)
 
     async def _forget_table(self, reason: str) -> dict:
@@ -599,6 +605,7 @@ class GraspByDescription(Generic, EasyResource):
                           "pose": pose}
         self.seen = {"ts": t_cap, "at_observe": True, "pose": pose, "objects": objects, "intruders": intruders,
                      "seen_ms": ms, "watch_period_s": self.watch_period}
+        self.view.put(t_cap, rgb, pose, "idle", dashboard_view.boxes_from_seen(objects, intruders))
         if self.live is not None and self._idle_changed(all_recs, seg):  # reusing this frame's recognition
             self.live.offer(rgb, depth, pose, await self._intrinsics(), "idle", recognised=all_recs, seg=seg)
         # Arm confirmed still: keep each recognised object's last-seen table xy current (AGENT3's where_is)
@@ -1402,6 +1409,11 @@ class GraspByDescription(Generic, EasyResource):
     async def _do_command(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
         if command.get("status"):
             return self._status()
+        if "dashboard" in command:
+            # The dashboard's one call (module/dashboard_view.py). A frame is grabbed for it only while idle, no look is
+            # running and perception keeps up: a slow look means a loaded robot
+            grab = self.warm and not self._busy() and self.watch_period <= WATCH_PERIOD_S and not self._look_lock.locked()
+            return await dashboard_view.answer(self, _runtime() if self.warm else None, command.get("dashboard"), grab)
         if command.get("seen_image"):
             return self._seen_image()
         if "observations" in command:
@@ -1438,7 +1450,7 @@ class GraspByDescription(Generic, EasyResource):
             return await self._start("reset", None, bool(command.get("wait")))
         return {"error": "unknown command; use {\"grasp\": \"<description>\"}, {\"preview\": \"<description>\"}, "
                          "{\"reset\": true}, {\"scan_table\": true}, {\"clear_map\": true}, {\"rebuild_map\": {}}, "
-                         "{\"observations\": {}}, {\"teach\": \"<name>\"}, "
+                         "{\"observations\": {}}, {\"teach\": \"<name>\"}, {\"dashboard\": {}}, "
                          "{\"status\": true}, "
                          "{\"seen_image\": true} or {\"table_map\": true}"}
 

@@ -164,12 +164,15 @@ await sorter.do_command({"reset": True})                    # empty the square (
   `too_close` = too near the arm base, please move it out, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
 - A hand or arm reaching into the workspace pauses the robot; it resumes 2 s after the workspace is clear.
 
-From our web dashboard (no Atlas needed): start it with `DASH_COMMAND_PATH=module` (and `DASH_MODULE_NAME` if
-your service is not called `sorter`). Its "Grasp" box and "Clear square" button then call this DoCommand, and
-the worker panel and command list show `{"status": true}`: the running job, then the result.
+Our web dashboard (no Atlas needed; `DASH_MODULE_NAME` if your service is not called `sorter`) shows three live
+views: the command box (Grasp, Reset; Preview, Scan table, Clear map and Teach under "more") with the job's state,
+progress and per-item results; the arm camera with the recognised boxes; and the module's map of the table with the
+bucket, the arm and what the camera sees. Its robot link sends this module one `{"dashboard": {"since": ts}}` at most
+twice a second, however many browsers are open; the picture is the newest of the idle look, every executor frame of a
+job, and a colour frame grabbed for the call while idle (`module/dashboard_view.py`).
 
 ```bash
-DASH_COMMAND_PATH=module VIAM_MACHINE_ADDRESS=... VIAM_API_KEY_ID=... VIAM_API_KEY=... python dashboard/app.py
+VIAM_MACHINE_ADDRESS=... VIAM_API_KEY_ID=... VIAM_API_KEY=... python dashboard/app.py
 ```
 
 ## Calibrate (once per camera mount)

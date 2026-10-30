@@ -1,80 +1,57 @@
 """
-Demo dashboard: live camera, "grasp ..." command box, command status, attempts and success-rate chart.
+Demo dashboard: three live views of the robot through our Viam module: the command box, what the arm's camera sees,
+and the module's own map of the table.
 
-WHY: the demo is "type grasp green square, watch the arm do it, see it logged in Atlas". The dashboard only
-reads the camera and writes commands to the Store; the arm worker (AGENT1) claims and executes them, so
-this process can never move the arm. The camera runs in a child process (dashboard/camera_worker.py) that
-is restarted if the Viam SDK aborts, so the page itself never goes down.
+WHY: the user: "for the dashboard i just want three things, one is the command stuff, one is the view of the arm and
+one is the map of the objects it internal record", then "all dynamic" and "also optimize the dashboard" (VIAM CENTERAL
+2026-10-30). The robot link runs in a child process (dashboard/camera_worker.py, restarted if the Viam SDK aborts) that
+asks the module one {"dashboard"} DoCommand at most twice a second however many browsers are open; this server only
+reads the files it writes. The page asks /api/live once a second (status, command, map, all in one) and /api/frame.jpg
+for the picture, which answers 304 until there is a new one. The page never moves the arm: commands go to the module.
 
-Run from the repo root (laptop):
-  python -m uvicorn dashboard.app:app --port 8000          # or: python dashboard/app.py
-Env: VIAM_* (camera), MONGODB_URI (Atlas; else data/*.jsonl), SORTER_DATA (JSONL dir),
-     ATLAS_CHART_URLS (comma-separated Atlas Charts embed URLs), HOST / PORT for `python dashboard/app.py`,
-     DASH_DIRECT_CAMERA=0 to never connect to the robot from this machine (use the worker's frames only),
-     DASH_COMMAND_PATH=queue|module (default queue), DASH_MODULE_NAME (default "sorter").
-
-Command path: "queue" writes commands to the Store for a worker to claim (needs Atlas when the worker runs on
-another machine). "module" sends them straight to our Viam module's DoCommand ({"grasp": text} / {"reset":
-true}) over the robot link and shows its {"status": true} answers, so the demo needs no Atlas at all.
-
-Picture source: the arm worker's latest frame from the Store (Store.put_frame) when it is under 30 s old,
-else this machine's own camera connection, else the stale worker frame. Once Atlas is live and the worker
-runs on the Linux box next to the arm, the laptop needs no robot connection at all.
+Run from the repo root (laptop): python dashboard/app.py
+Env: VIAM_MACHINE_ADDRESS, VIAM_API_KEY_ID, VIAM_API_KEY; DASH_MODULE_NAME (default "sorter"); SORTER_DATA (where the
+link files go, default <repo>/data); HOST / PORT; DASH_LINK=0 starts no robot link (something else writes the files,
+e.g. a simulator).
 """
 import asyncio
-import io
 import json
 import os
-import pickle
 import sys
 import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
 from typing import List, Optional
+from urllib.parse import quote
 
-import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-from sorter.store import Store  # noqa: E402
-
-RESET_COMMAND = "__reset__"  # EXEC_PLAN "Clear square" button; executed by the arm worker
-SCAN_COMMAND = "__scan__"  # "Scan table" button: the module scans the whole table into its live map (module mode)
-MAX_TEXT = 200
-PREVIEW_HIGHLIGHT_S = 15.0
-STALE_S = 5.0  # camera state older than this means the camera process is down or restarting
-WORKER_FRAME_FRESH_S = 30.0  # prefer the worker's frame over our own camera while it is this fresh
-WORKER_OFFLINE_S = 15.0  # agreed with AGENT1: heartbeat at least every 5 s
-DIRECT_CAMERA = os.environ.get("DASH_DIRECT_CAMERA", "1") != "0"
-COMMAND_PATH = "module" if os.environ.get("DASH_COMMAND_PATH", "queue") == "module" else "queue"
-MODULE_MODE = COMMAND_PATH == "module"
+CAM_DIR = Path(os.environ.get("SORTER_DATA") or ROOT / "data") / "camera"
 MODULE_NAME = os.environ.get("DASH_MODULE_NAME", "sorter")
-MODULE_STALE_S = 6.0  # status is polled every 1.5 s; older than this = link or module down
-MODULE_CALL_TIMEOUT_S = 25.0  # one DoCommand round trip through the robot-link process
+RESET_COMMAND = "__reset__"  # Reset button: the module clears the drop target
+SCAN_COMMAND = "__scan__"  # "Scan table": the module looks over the whole table into its live map
+MAX_TEXT = 200
+LINK_STALE_S = 4.0  # the module answers every 0.5 s; older than this = link or module down
+MODULE_CALL_TIMEOUT_S = 25.0  # one command round trip through the robot-link process
+MAP_HIGHLIGHT_S = 20.0
+FRAME_WAIT_S = 2.0  # a page that has the newest picture waits this long for the next one before a 304
+REACH_MM = (120, 650)  # the half ring the arm code lets the arm reach, drawn on the map
 
-store = Store()
-CAM_DIR = store.data / "camera"
-camproc = {"pid": None, "restarts": 0, "last_exit": None, "enabled": DIRECT_CAMERA or MODULE_MODE}
-module_cmds = deque(maxlen=30)  # module mode: commands sent this session, newest first
-_queue_panel = {"ts": 0.0, "panel": {}}
-_worker_render = {"key": None, "jpeg": None}  # last annotated worker frame, keyed by (worker, ts)
+camproc = {"pid": None, "restarts": 0, "last_exit": None}
+module_cmds = deque(maxlen=5)  # commands sent this session, newest first; the page shows the newest
+_map_highlight = {}  # {"text", "label", "xy", "until"}: what the last preview / grasp resolved to
+_frame_cache = {"mtime": None, "data": None, "etag": None, "meta": None}  # module_frame.* read once per new picture
 
 
-async def supervise_camera() -> None:
-    """
-    Keep dashboard/camera_worker.py running; restart with backoff when it exits.
-
-    Backoff resets after a worker has run for a minute, so a crash every few hours restarts at once.
-    """
+async def supervise_link() -> None:
+    """Keep dashboard/camera_worker.py running; restart with backoff when it exits (reset after a minute up)."""
     CAM_DIR.mkdir(parents=True, exist_ok=True)
-    # What the robot-link process runs: the camera, the module bridge, or both (one shared connection)
-    env = {**os.environ, "DASH_CAMERA": "1" if DIRECT_CAMERA else "0", "DASH_MODULE_NAME": MODULE_NAME if MODULE_MODE else ""}
+    env = {**os.environ, "DASH_MODULE_NAME": MODULE_NAME}
     backoff = 1.0
     while True:
         started = time.time()
@@ -95,7 +72,7 @@ async def supervise_camera() -> None:
 
 @asynccontextmanager
 async def lifespan(_app):
-    task = asyncio.create_task(supervise_camera()) if DIRECT_CAMERA or MODULE_MODE else None
+    task = asyncio.create_task(supervise_link()) if os.environ.get("DASH_LINK", "1") != "0" else None
     yield
     if task:
         task.cancel()
@@ -121,230 +98,11 @@ def _clean(text: str) -> str:
     return text
 
 
-def _cam_state() -> dict:
-    """Latest state of our own camera process, marked disconnected when its heartbeat is stale."""
-    if not DIRECT_CAMERA:
-        return {"connected": False, "error": "direct camera off (DASH_DIRECT_CAMERA=0)", "objects": [],
-                "frame_age_s": None, "process": camproc}
+def _read(name: str) -> dict:
     try:
-        state = json.loads((CAM_DIR / "state.json").read_text())
+        return json.loads((CAM_DIR / name).read_text())
     except (FileNotFoundError, ValueError):
-        state = {"connected": False, "error": "camera process starting", "objects": [], "written": 0}
-    if time.time() - state.get("written", 0) > STALE_S:
-        state["connected"] = False
-        state["error"] = f"camera process restarting (last exit code {camproc['last_exit']})"
-    state["frame_age_s"] = state.get("frame_age_s")
-    return {**state, "process": camproc}
-
-
-def _render_worker_frame(data: bytes, doc: dict, highlight: dict = None) -> bytes:
-    """
-    Worker frame with the worker's boxes (already in this image's pixels), same colours as the direct camera:
-    ignored objects grey, intruders red, targets yellow on top. Shape agreed with AGENT1: meta.objects with
-    "ignored": true for excluded ones, meta.intruders as a separate list. `highlight` {"id", "text", "score"}
-    draws that object thick and green: what a Preview says the arm would pick.
-    """
-    from PIL import Image, ImageDraw
-
-    meta = doc.get("meta") or {}
-    objs, intruders = meta.get("objects") or [], meta.get("intruders") or []
-    if not objs and not intruders:
-        return data
-    im = Image.open(io.BytesIO(data)).convert("RGB")
-    draw = ImageDraw.Draw(im)
-
-    def tag(box, text, fill, width):
-        u0, v0, u1, v1 = [int(x) for x in box]
-        draw.rectangle([u0, v0, u1, v1], outline=fill, width=width)
-        draw.rectangle([u0, max(v0 - 14, 0), u0 + 6 * len(text) + 4, max(v0 - 14, 0) + 14], fill=fill)
-        draw.text((u0 + 2, max(v0 - 13, 1)), text, fill=(0, 0, 0))
-
-    for o in sorted(objs, key=lambda o: not o.get("ignored")):  # ignored first, so targets end up on top
-        if not o.get("bbox"):
-            continue
-        if o.get("ignored"):
-            tag(o["bbox"], "ignored", (170, 170, 170), 1)
-            continue
-        if highlight and o.get("id") is not None and o.get("id") == highlight.get("id"):
-            tag(o["bbox"], f"{highlight['text']} {float(highlight.get('score') or 0):.2f}", (40, 220, 90), 4)
-            continue
-        label = str(o.get("label") or f"#{o.get('id', '')}")
-        if o.get("score") is not None:
-            label += f" {float(o['score']):.2f}"
-        tag(o["bbox"], label, (255, 200, 0), 2)
-    for it in intruders:
-        if it.get("bbox"):
-            tag(it["bbox"], "hand? arm paused", (240, 70, 60), 3)
-    out = io.BytesIO()
-    im.save(out, "JPEG", quality=80)
-    return out.getvalue()
-
-
-MODULE_FRAME_FRESH_S = 3.0  # module mode: show the module's own labelled frame while it is this fresh
-
-
-def _module_frame():
-    """(jpeg with the module's recognised labels drawn, age_s) from module_frame.*, or None."""
-    img, meta_path = CAM_DIR / "module_frame.jpg", CAM_DIR / "module_frame.json"
-    try:
-        meta = json.loads(meta_path.read_text())
-        data = img.read_bytes()
-    except (FileNotFoundError, ValueError):
-        return None
-    age = time.time() - meta_path.stat().st_mtime  # laptop clock: the module's own ts may be skewed
-    try:
-        hl = json.loads((CAM_DIR / "module_highlight.json").read_text())
-        hl = hl if hl.get("until", 0) > time.time() else None
-    except (FileNotFoundError, ValueError):
-        hl = None
-    key = ("module", meta.get("ts"), hl and (hl.get("id"), hl.get("until")))
-    if _worker_render["key"] != key:
-        objs = [{"id": o.get("id"), "bbox": o["bbox"], "label": o.get("label") or "unknown",
-                 "score": o.get("confidence")} for o in meta.get("objects") or []]
-        _worker_render.update(key=key, jpeg=_render_worker_frame(data, {"meta": {"objects": objs,
-                                                                                 "intruders": meta.get("intruders")}}, hl))
-    return _worker_render["jpeg"], age
-
-
-def _pick_frame():
-    """(jpeg, source description, age_s) by the policy in the module docstring, or None."""
-    if MODULE_MODE:
-        # What the module itself sees and recognises, labelled: the audience sees "green square" before typing
-        mf = _module_frame()
-        if mf and mf[1] <= MODULE_FRAME_FRESH_S:
-            return mf[0], f"module {MODULE_NAME} (robot)", mf[1]
-    worker = store.get_frame()
-    worker_age = time.time() - worker[1].get("ts", 0) if worker else None
-    direct = CAM_DIR / "frame.jpg"
-    direct_age = time.time() - direct.stat().st_mtime if DIRECT_CAMERA and direct.exists() else None
-    if worker and (worker_age <= WORKER_FRAME_FRESH_S or direct_age is None):
-        data, doc = worker
-        key = (doc.get("worker"), doc.get("ts"))
-        if _worker_render["key"] != key:
-            _worker_render.update(key=key, jpeg=_render_worker_frame(data, doc))
-        return _worker_render["jpeg"], f"worker {doc.get('worker')}", worker_age
-    if direct_age is not None:
-        return direct.read_bytes(), "direct camera", direct_age
-    return None
-
-
-@app.get("/")
-def index():
-    # no-cache: after a dashboard restart with new code, a plain reload must show it (a cached page did not)
-    return FileResponse(Path(__file__).parent / "static" / "index.html", headers={"Cache-Control": "no-cache"})
-
-
-@app.get("/api/status")
-def status():
-    urls = [u.strip() for u in os.environ.get("ATLAS_CHART_URLS", "").split(",") if u.strip()]
-    cam = _cam_state()
-    cam["objects"] = len(cam.get("objects", []))
-    picked = _pick_frame()
-    frame = {"source": picked[1], "age_s": round(picked[2], 1)} if picked else None
-    out = {"atlas": store.online, "queued": store.queued_counts(), "camera": cam, "frame": frame,
-           "workers": workers(), "command_path": COMMAND_PATH, "charts": urls, "now": time.time()}
-    if MODULE_MODE:
-        # Perception runs on the robot inside the module: report what it sees there, not our (off) camera
-        seen = ((_module_state().get("status") or {}).get("seen") or {})
-        out["module_seen"] = {"objects": len(seen.get("objects") or []), "intruders": len(seen.get("intruders") or []),
-                              "at_observe": seen.get("at_observe")}
-        out.update(_module_atlas())
-    else:
-        out["atlas_panel"] = _queue_atlas()
-    return out
-
-
-def _module_atlas() -> dict:
-    """
-    Module mode: the Atlas state is the robot's, this process has no MONGODB_URI (VIAM CENTERAL: the header said
-    "Atlas offline" with the robot writing to Atlas). atlas: what the module's "store" says; None until it has answered.
-    """
-    st = _module_state()
-    s = st.get("status") or {}
-    fresh = bool(st.get("ok")) and st.get("age_s") is not None and st["age_s"] <= MODULE_STALE_S
-    return {"atlas": s["store"] == "atlas" if s.get("store") else None, "atlas_stale": not fresh,
-            "atlas_panel": {**(s.get("atlas") or {}), "store": s.get("store"), "observations": s.get("observations") or {},
-                            "library": s.get("library") or {}, "teach": s.get("teach") or {}, "stale": not fresh}}
-
-
-def _queue_atlas() -> dict:
-    """Queue mode: the same panel from this process's own Store, asked at most every 5 s."""
-    if time.time() - _queue_panel["ts"] >= 5.0:
-        _queue_panel["ts"] = time.time()
-        try:
-            _queue_panel["panel"] = store.panel()
-        except Exception as e:  # Atlas unreachable: the rest of the dashboard still answers
-            print(f"atlas panel: {type(e).__name__}: {e}")
-    return {**_queue_panel["panel"], "store": "atlas" if store.online else "jsonl", "last_search": store.last_search,
-            "searches": store.search_count, "observations": store.observation_stats(), "teach": {}, "stale": False}
-
-
-def _module_state() -> dict:
-    """Latest {"status": true} answer from the module (written by the robot-link process), with age_s."""
-    try:
-        state = json.loads((CAM_DIR / "module_status.json").read_text())
-    except (FileNotFoundError, ValueError):
-        return {"ok": False, "error": "no answer from the module yet", "age_s": None, "status": {}}
-    state["age_s"] = round(time.time() - state.get("ts", 0), 1)
-    state.setdefault("status", {})
-    return state
-
-
-def _module_worker() -> dict:
-    """The module as a worker-panel row: busy job as phase, link or job errors as error; it takes our commands."""
-    st = _module_state()
-    s = st.get("status") or {}
-    running, last = s.get("running") or {}, s.get("last") or {}
-    online = bool(st.get("ok")) and st["age_s"] is not None and st["age_s"] <= MODULE_STALE_S
-    if s.get("busy"):
-        phase = (f"list {running['progress']}" if running.get("progress")
-                 else f"{running.get('kind')}: {running.get('text') or 'square'}")
-    elif s.get("warm") is False:
-        phase = "warming up"
-    else:
-        # Always-ready module: say what it currently recognises on the table
-        seen = [o.get("label") for o in (s.get("seen") or {}).get("objects") or [] if o.get("label")]
-        phase = "idle · sees " + ", ".join(seen) if seen else "idle"
-    error = None if st.get("ok") else st.get("error")
-    if not error and not s.get("busy") and last.get("status") in ("error", "failed"):
-        error = last.get("error") or last.get("fail_reason")
-    return {"worker": f"module:{MODULE_NAME} (direct)", "phase": phase, "holding": None, "error": error,
-            "age_s": st["age_s"] if st["age_s"] is not None else 1e9, "online": online, "consumer": True}
-
-
-def _learned_note(last: dict) -> Optional[str]:
-    """One line on what a teach or a delivered grasp added to the library, for the command list."""
-    if last.get("kind") == "teach" and last.get("views_added") is not None:
-        when = f", searchable after {last['searchable_s']:.0f} s" if last.get("searchable_s") is not None else ""
-        also = f", {last['views_skipped']:.0f} not kept" if last.get("views_skipped") else ""
-        return f"learned {last.get('label')}: {last['views_added']:.0f} new views{also}{when}"
-    learned = last.get("learned") or {}
-    return f"library: new view of {learned['label']}" if learned.get("view") else None
-
-
-def _sync_module_cmds() -> None:
-    """
-    Update sent commands from the module's status: running while its job is the module's current job, then the
-    module's last result once that names the same job (fallback for an older module without job ids: the
-    first result finished after the command was sent).
-    """
-    s = _module_state().get("status") or {}
-    running, last = s.get("running") or {}, s.get("last") or {}
-    for c in module_cmds:
-        if c["status"] != "running":
-            continue
-        if s.get("busy") and running.get("job") == c.get("job"):
-            if running.get("items"):  # a list of objects: how far it is, and how each item went so far
-                c.update(progress=running.get("progress"), items=running["items"])
-            continue
-        same = last.get("job") == c.get("job") if last.get("job") else (last.get("finished") or 0) >= c["ts"]
-        if last and same:
-            c.update(status=last.get("status") or "done", finished=last.get("finished"), attempt_id=last.get("_id"),
-                     fail_reason=last.get("fail_reason") or last.get("error"), duration_s=last.get("duration_s"),
-                     items=last.get("items"), stopped_by=last.get("stopped_by"), progress=None, note=_learned_note(last),
-                     # A list reports per item instead of one pick
-                     chosen={"label": last.get("label"), "colour": last.get("colour"), "score": last.get("score")}
-                     if (last.get("label") or last.get("colour")) and not last.get("items") else None)
+        return {}
 
 
 async def module_call(command: dict) -> dict:
@@ -366,82 +124,163 @@ async def module_call(command: dict) -> dict:
     raise HTTPException(504, "the robot link did not answer; is the module running and the machine online?")
 
 
-@app.get("/api/workers")
-def workers():
+def _set_map_highlight(res: dict, text: str) -> None:
+    """Remember what a module answer pointed at (map xy or recognised label), to ring it on the map and the picture."""
+    target = res.get("target") or {}
+    xy, label = res.get("target_xy"), res.get("label") or target.get("label")
+    # Every new answer replaces the ring: a miss must not leave the previous hit ringed
+    _map_highlight.clear()
+    if res.get("ok") is not False and (xy or label):
+        _map_highlight.update(text=text, label=label, xy=xy, until=time.time() + MAP_HIGHLIGHT_S)
+
+
+def _sync_command(s: dict) -> Optional[dict]:
     """
-    Each arm worker's latest heartbeat, with `online` = heard from within WORKER_OFFLINE_S and `consumer` =
-    it takes dashboard commands.
-
-    WHY: EXEC_PLAN allows exactly one command consumer; two would race for the arm. A heartbeat may say
-    consumer=true/false; without the flag the command worker (sfhack4-worker) counts as a consumer and the
-    Viam module (module:<name>) does not, because the module heartbeats even with consume_dashboard_commands off.
+    The newest command, updated from the module's status: running while its job is the module's current job (a list
+    with its progress and items so far), then the module's last result once that names the same job.
     """
-    out = [_module_worker()] if MODULE_MODE else []
-    for w in store.worker_status():
-        consumer = w.get("consumer")
-        if consumer is None:
-            consumer = not str(w.get("worker", "")).startswith("module:")
-        out.append({**w, "online": w["age_s"] <= WORKER_OFFLINE_S, "consumer": bool(consumer)})
-    return out
+    if not module_cmds:
+        return None
+    c = module_cmds[0]
+    running, last = s.get("running") or {}, s.get("last") or {}
+    if c["status"] == "running":
+        if s.get("busy") and running.get("job") == c.get("job"):
+            c.update(progress=running.get("progress"), items=running.get("items") or c.get("items"))
+        elif last.get("job") and last.get("job") == c.get("job"):
+            c.update(status=last.get("status") or "done", fail_reason=last.get("fail_reason") or last.get("error"),
+                     duration_s=last.get("duration_s"), items=last.get("items"), stopped_by=last.get("stopped_by"),
+                     progress=None, label=None if last.get("items") else last.get("label"))
+    return c
 
 
-@app.get("/api/snapshot.jpg")
-def snapshot():
-    picked = _pick_frame()
-    if picked is None:
-        raise HTTPException(503, "no frame yet")
-    data, source, age = picked
-    return Response(data, media_type="image/jpeg",
-                    headers={"Cache-Control": "no-store", "X-Frame-Source": source, "X-Frame-Age": f"{age:.1f}"})
+def _slim_map(d: dict) -> Optional[dict]:
+    """The module's live map for drawing: ages on the robot's clock, no observation detail."""
+    m = d.get("map")
+    if not m:
+        return None
+    robot_now = (d.get("now") or time.time()) + (time.time() - (d.get("fetched_at") or time.time()))
+    keep = ("id", "label", "names", "xy", "partial", "in_square", "superseded", "score", "colour")
+    objs = [{**{k: o.get(k) for k in keep}, "age_s": round(robot_now - (o.get("seen_ts") or m.get("ts") or robot_now), 1)}
+            for o in m.get("objects") or [] if o.get("xy")]
+    return {"objects": objs, "square": m.get("square"), "bucket": m.get("bucket"),
+            "age_s": round(robot_now - (m.get("ts") or robot_now), 1),
+            "cleared_s_ago": round(robot_now - m["cleared_ts"], 1) if m.get("cleared_ts") else None}
 
 
-@app.get("/api/objects")
-def objects():
-    return _cam_state().get("objects", [])
+@app.get("/")
+def index():
+    # no-cache: after a dashboard restart with new code, a plain reload must show it
+    return FileResponse(Path(__file__).parent / "static" / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/live")
+def live():
+    """Everything but the picture, in one answer the page asks for once a second."""
+    now = time.time()
+    st, mp, fr, link = _read("module_status.json"), _read("module_table_map.json"), _read("module_frame.json"), _read("link.json")
+    age = now - st["ts"] if st.get("ts") else None
+    s = st.get("status") or {}
+    up = age is not None and age <= LINK_STALE_S and bool(st.get("ok"))
+    running = s.get("running") or {}
+    seen = s.get("seen") or {}
+    hl = dict(_map_highlight) if _map_highlight.get("until", 0) > now else None
+    lib = s.get("library") or {}
+    return {
+        "now": now,
+        "link": {"up": up, "age_s": round(age, 1) if age is not None else None,
+                 "error": None if up else link.get("error") or ("robot link starting" if age is None else "no answer from the module"),
+                 "restarts": camproc["restarts"]},
+        "busy": bool(s.get("busy")), "warm": s.get("warm"), "estop": st.get("estop"), "phase": st.get("phase"),
+        "running": {k: running.get(k) for k in ("kind", "text", "progress", "item", "items", "search", "sweep", "teach",
+                                               "attempt", "attempts_max")} if s.get("busy") else None,
+        "seen": {"objects": len(seen.get("objects") or []), "intruders": len(seen.get("intruders") or []),
+                 "at_observe": seen.get("at_observe")},
+        "command": _sync_command(s),
+        "library": {"store": s.get("store"), "views": (s.get("atlas") or {}).get("views") or lib.get("views")},
+        "teach": bool((s.get("teach") or {}).get("enabled")),
+        "map": _slim_map(mp), "search": mp.get("search") or None, "sweep": mp.get("sweep") or None,
+        "map_failing": bool((mp.get("live") or {}).get("failing")),
+        "arm": st.get("arm"), "view": fr.get("view"), "frame_age_s": round(now - fr["got"], 1) if fr.get("got") else None,
+        "highlight": hl, "reach_mm": REACH_MM}
+
+
+def _frame_mtime() -> Optional[int]:
+    try:
+        return (CAM_DIR / "module_frame.json").stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
+@app.get("/api/frame.jpg")
+async def frame(request: Request):
+    """
+    The newest picture, read from disk once per new picture and shared by every browser. ETag = its capture time.
+    A page that already has it (If-None-Match) waits here until the next one arrives, up to FRAME_WAIT_S, else gets 304:
+    one request per new picture instead of polling, and the picture is on screen as soon as the robot link has it.
+    X-Frame-Meta carries the boxes of this very picture (URL-encoded JSON).
+    """
+    mtime = _frame_mtime()
+    if mtime is None:
+        raise HTTPException(503, "no picture yet")
+    # The picture this page has, by its own ETag: other pages refresh the shared cache meanwhile
+    have = _frame_cache["mtime"] if request.headers.get("if-none-match") == _frame_cache["etag"] else None
+    deadline = time.monotonic() + FRAME_WAIT_S
+    while mtime == have and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+        mtime = _frame_mtime() or mtime
+    if mtime != _frame_cache["mtime"]:
+        meta = _read("module_frame.json")
+        try:
+            data = (CAM_DIR / "module_frame.jpg").read_bytes()
+        except FileNotFoundError:
+            raise HTTPException(503, "no picture yet")
+        slim = {k: meta.get(k) for k in ("ts", "w", "h", "source", "boxes")}
+        _frame_cache.update(mtime=mtime, data=data, etag=f'"{meta.get("ts")}"', meta=quote(json.dumps(slim)))
+    headers = {"ETag": _frame_cache["etag"], "Cache-Control": "no-cache", "X-Frame-Meta": _frame_cache["meta"]}
+    if request.headers.get("if-none-match") == _frame_cache["etag"]:
+        return Response(status_code=304, headers=headers)
+    return Response(_frame_cache["data"], media_type="image/jpeg", headers=headers)
+
+
+def _new_command(text: str) -> dict:
+    entry = {"_id": uuid.uuid4().hex, "text": text, "ts": time.time(), "status": "sending"}
+    module_cmds.appendleft(entry)
+    return entry
+
+
+def _answered(entry: dict, res: dict) -> None:
+    """What the module said at once: a job started, nothing to do (and why), busy, or refused."""
+    if res.get("accepted"):
+        entry.update(status="running", job=res.get("job"), items=res.get("items"), ignored=res.get("ignored"))
+    elif res.get("status"):
+        entry.update(status=res["status"], fail_reason=res.get("reason") or res.get("error"))
+    else:
+        busy = res.get("error") == "busy"
+        entry.update(status="busy" if busy else "rejected", fail_reason=None if busy else res.get("error"))
 
 
 @app.post("/api/commands")
 async def add_command(body: TextIn):
-    """Queue mode: Store command for a worker. Module mode: DoCommand on the module, which runs it in the background."""
+    """Grasp (a description, or several), Reset or Scan table: DoCommand on the module, which runs it in the background."""
     text = body.text.strip()
     text = text if text in (RESET_COMMAND, SCAN_COMMAND) else _clean(text)
-    if not MODULE_MODE:
-        if text == SCAN_COMMAND:
-            raise HTTPException(400, "Scan table needs the Viam module (DASH_COMMAND_PATH=module)")
-        return {"id": store.add_command(text)}
-    entry = {"_id": uuid.uuid4().hex, "text": text, "ts": time.time(), "status": "sending"}
-    module_cmds.appendleft(entry)
+    entry = _new_command(text)
     try:
         res = await module_call({"reset": True} if text == RESET_COMMAND else {"scan_table": True}
                                 if text == SCAN_COMMAND else {"grasp": text})
     except HTTPException as e:
         entry.update(status="error", fail_reason=e.detail)
         raise
-    entry["decide_ms"] = res.get("decide_ms")
     _set_map_highlight(res, text)
-    if res.get("accepted"):
-        target = res.get("target") or {}
-        entry.update(status="running", job=res.get("job"), items=res.get("items"), ignored=res.get("ignored"),
-                     chosen={"label": target.get("label"), "colour": target.get("colour"), "score": target.get("score")}
-                     if target else None)
-    elif res.get("status") in ("not_found", "ambiguous", "already_in_square"):
-        # Always-ready module answers at once from its cached frame: nothing started, here is why
-        entry.update(status=res["status"], fail_reason=res.get("reason"))
-    else:
-        busy = res.get("error") == "busy"
-        # the "busy" badge says it all; a refusal for any other reason shows its message
-        entry.update(status="busy" if busy else "rejected", fail_reason=None if busy else res.get("error"))
+    _answered(entry, res)
     return {"id": entry["_id"], "module": res}
 
 
 @app.post("/api/teach")
 async def teach(body: TeachIn):
-    """Teach button: DoCommand {"teach"} on the module, shown in the command list like a grasp."""
+    """Teach (in "more"): DoCommand {"teach"} on the module, shown like a grasp."""
     name = _clean(body.name)
-    if not MODULE_MODE:
-        raise HTTPException(400, "Teach needs the Viam module (DASH_COMMAND_PATH=module)")
-    entry = {"_id": uuid.uuid4().hex, "text": f"teach: {name}", "ts": time.time(), "status": "sending"}
-    module_cmds.appendleft(entry)
+    entry = _new_command(f"teach: {name}")
     command = {"teach": name}
     if body.alias_of and body.alias_of.strip():
         command["alias_of"] = body.alias_of.strip()
@@ -452,271 +291,24 @@ async def teach(body: TeachIn):
     except HTTPException as e:
         entry.update(status="error", fail_reason=e.detail)
         raise
-    if res.get("accepted"):
-        entry.update(status="running", job=res.get("job"))
-    else:
-        busy = res.get("error") == "busy"
-        entry.update(status="busy" if busy else res.get("status") or "rejected",
-                     fail_reason=None if busy else res.get("reason") or res.get("error"))
+    _answered(entry, res)
     return {"id": entry["_id"], "module": res}
-
-
-@app.get("/api/commands")
-def commands(limit: int = 15):
-    if MODULE_MODE:
-        _sync_module_cmds()
-        return list(module_cmds)[: min(limit, 100)]
-    return store.list_commands(limit=min(limit, 100))
 
 
 @app.post("/api/preview")
 async def preview(body: TextIn):
-    """
-    Rank the objects currently in view against the text (no arm motion) and highlight the best one.
-
-    Shows the audience which object "green square" resolves to before the arm moves. Module mode asks the
-    module ({"preview": text}: its cached frame, CLIP already loaded on the robot), so this laptop never loads
-    CLIP. Queue mode ranks the crops our own camera process saved for the latest frame (objs.pkl).
-    """
+    """What the arm would pick for the text, without moving: the module decides from its cached frame and map."""
     text = _clean(body.text)
-    if MODULE_MODE:
-        res = await module_call({"preview": text})
-        if res.get("ok") and res.get("target"):
-            t = res["target"]
-            (CAM_DIR / "module_highlight.json").write_text(json.dumps(
-                {"id": t.get("id"), "text": text, "score": t.get("score"), "until": time.time() + PREVIEW_HIGHLIGHT_S}))
-        _set_map_highlight(res, text)
-        return {"module": res}
-    try:
-        objs = [SimpleNamespace(**o) for o in pickle.loads((CAM_DIR / "objs.pkl").read_bytes())]
-    except FileNotFoundError:
-        objs = []
-    objs = [o for o in objs if isinstance(o.crop, np.ndarray) and o.crop.size]
-    if not objs:
-        raise HTTPException(409, "no objects detected in the current frame")
-    try:
-        from sorter import clip_embed
-    except Exception as e:
-        raise HTTPException(503, f"clip_embed not available: {e}")
-    ranked = await asyncio.to_thread(clip_embed.rank, objs, text, store)
-    if not ranked:
-        raise HTTPException(409, "nothing ranked")
-    best, score = ranked[0]
-    hl = {"id": best.id, "text": text, "score": float(score), "until": time.time() + PREVIEW_HIGHLIGHT_S}
-    (CAM_DIR / "highlight.json").write_text(json.dumps(hl))
-    return [{"id": o.id, "score": float(s)} for o, s in ranked]
-
-
-MAP_HIGHLIGHT_S = 20.0
-_map_highlight = {}  # {"text", "label", "xy", "until"}: the object the last preview / grasp resolved to
-
-
-def _set_map_highlight(res: dict, text: str) -> None:
-    """Remember what a module answer pointed at (map xy or recognised label), to ring it on the table map."""
-    target = res.get("target") or {}
-    xy, label = res.get("target_xy"), res.get("label") or target.get("label")
-    # Every new answer replaces the ring: a miss ("ghost" not found) must not leave the previous hit ringed
-    _map_highlight.clear()
-    if res.get("ok") is not False and (xy or label):
-        _map_highlight.update(text=text, label=label, xy=xy, until=time.time() + MAP_HIGHLIGHT_S)
-
-
-@app.get("/api/table_map")
-def table_map():
-    """
-    Top-down table view: the live table map (objects with table xy and age, no embeddings), each object's last
-    sighting, and sweep progress. Module mode: from the module (via the robot link), ages on the robot's clock.
-    """
-    if MODULE_MODE:
-        try:
-            d = json.loads((CAM_DIR / "module_table_map.json").read_text())
-        except (FileNotFoundError, ValueError):
-            d = {}
-        since = time.time() - d.get("fetched_at", time.time())  # keep ages counting between fetches
-        robot_now = (d.get("now") or time.time()) + since
-        m = d.get("map") or None
-        sightings = d.get("sightings") or []
-        running = ((_module_state().get("status") or {}).get("running") or {})
-        sweep = running.get("sweep") or None
-        item = running.get("item") or {}  # a list of objects: the one being searched for, and which of how many
-        search = ({**running["search"], "text": item.get("text") or running.get("text"), "item": item or None}
-                  if running.get("search") else None)
-        n_obs, live = d.get("observations"), d.get("live")
-    else:
-        m, sightings, robot_now = store.get_table_map(with_emb=False), store.list_sightings(), time.time()
-        sweep = next((w.get("sweep") for w in workers() if w.get("online") and w.get("sweep")), None)
-        search, n_obs, live = None, store.observation_stats()["count"], None
-    if m:
-        m["age_s"] = round(robot_now - (m.get("ts") or robot_now), 1)
-        # Live map: each object's own age (seen_ts); an older map without it -> the map's age for all
-        for o in m.get("objects") or []:
-            o["age_s"] = round(robot_now - (o.get("seen_ts") or m.get("ts") or robot_now), 1)
-        if m.get("swept_ts"):
-            m["swept_s_ago"] = round(robot_now - m["swept_ts"], 1)
-        if m.get("cleared_ts"):
-            m["cleared_s_ago"] = round(robot_now - m["cleared_ts"], 1)
-    for s in sightings:
-        s["age_s"] = round(robot_now - (s.get("ts") or robot_now), 1)
-    hl = dict(_map_highlight) if _map_highlight.get("until", 0) > time.time() else None
-    return {"map": m, "sightings": sightings, "sweep": sweep, "search": search, "reach_mm": [120, 650], "highlight": hl,
-            "observations": n_obs, "live": live}
+    res = await module_call({"preview": text})
+    _set_map_highlight(res, text)
+    return {"module": res}
 
 
 @app.post("/api/clear_map")
 async def clear_map():
-    """
-    "Clear map" button: someone rearranged the table. Module mode: DoCommand clear_map (live map, sightings and
-    the cached frame; old ones to the Store's history). Queue mode: the same on the Store directly.
-    """
+    """Someone rearranged the table: the module forgets its live map and every last-seen position."""
     _map_highlight.clear()
-    if MODULE_MODE:
-        return {"module": await module_call({"clear_map": True, "reason": "dashboard Clear map"})}
-    empty = store.clear_table_map("dashboard Clear map")
-    return {"ok": True, "cleared_objects": empty["cleared_objects"], "cleared_sightings": store.clear_sightings()}
-
-
-@app.get("/api/labels")
-def labels():
-    """Known objects for the "you can ask for" list: [[label, *aliases], ...] from the view library."""
-    rows = store.list_labels()
-    if MODULE_MODE:  # this process's library is the prepared one: what was taught on the robot is only known there
-        known = {row[0] for row in rows}
-        rows += [[e["label"]] for e in ((_module_state().get("status") or {}).get("atlas") or {}).get("learned") or []
-                 if e.get("label") not in known]
-    return rows
-
-
-@app.get("/api/attempts")
-def attempts(limit: int = 30):
-    """Recent attempts; clip_frames = how many replay frames each has (0 = no Replay button)."""
-    docs = store.list_attempts(limit=min(limit, 200))
-    counts = store.clip_counts([d["_id"] for d in docs])
-    return [{**d, "clip_frames": counts.get(d["_id"], 0)} for d in docs]
-
-
-@app.get("/api/stats")
-def stats():
-    """
-    Success over attempts (cumulative and rolling 10) and per label. Reset passes (clearing the square,
-    EXEC_PLAN "Reset") are not grasps on request, so they are excluded here and counted separately.
-    """
-    every = store.list_attempts(limit=0, newest_first=False)
-    picks = [a for a in every if a.get("mode") != "reset"]
-    resets = [a for a in every if a.get("mode") == "reset"]
-    series, ok = [], 0
-    for i, a in enumerate(picks):
-        ok += bool(a.get("success"))
-        last = picks[max(0, i - 9): i + 1]
-        series.append({"i": i + 1, "ts": a.get("ts"), "success": bool(a.get("success")),
-                       "cum_rate": ok / (i + 1), "roll10": sum(bool(x.get("success")) for x in last) / len(last)})
-    per_label = {}
-    for a in picks:
-        d = per_label.setdefault(a.get("label") or "unknown", {"n": 0, "ok": 0})
-        d["n"] += 1
-        d["ok"] += bool(a.get("success"))
-    times = [a["duration_s"] for a in picks if a.get("success") and a.get("duration_s")]
-    return {"n": len(picks), "ok": ok, "rate": ok / len(picks) if picks else None,
-            "mean_success_s": sum(times) / len(times) if times else None, "series": series,
-            "resets": {"n": len(resets), "ok": sum(bool(a.get("success")) for a in resets)},
-            "per_label": [{"label": k, **v, "rate": v["ok"] / v["n"]} for k, v in sorted(per_label.items())]}
-
-
-@app.get("/api/image/{coll}/{doc_id}/{field}")
-def image(coll: str, doc_id: str, field: str):
-    data = store.get_image(coll, doc_id, field)
-    if data is None:
-        raise HTTPException(404, "no image")
-    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "max-age=3600"})
-
-
-# ---- replay: every frame of an attempt (Store.put_clip_frame) -----------------------------------------
-
-CLIP_MIN_MS, CLIP_MAX_MS = 100, 1500  # per-frame display time in exports: real gaps, clamped to stay watchable
-
-
-def _clip_frames(attempt_id: str) -> list:
-    frames = store.list_clip_frames(attempt_id)
-    if not frames:
-        raise HTTPException(404, "no replay frames for this attempt")
-    return frames
-
-
-def _clip_durations_ms(frames: list) -> list:
-    """How long to show each frame: the real gap to the next one, clamped; the last frame holds 1.5 s."""
-    out = []
-    for a, b in zip(frames, frames[1:] + [None]):
-        gap = (b["ts"] - a["ts"]) * 1000 if b else CLIP_MAX_MS
-        out.append(int(min(max(gap, CLIP_MIN_MS), CLIP_MAX_MS)))
-    return out
-
-
-@app.get("/api/clips/{attempt_id}")
-def clip(attempt_id: str):
-    """Frame list for the player: [{"seq", "phase", "ts", "meta"}, ...]."""
-    return _clip_frames(attempt_id)
-
-
-@app.get("/api/clips/{attempt_id}/{seq}.jpg")
-def clip_frame(attempt_id: str, seq: int):
-    data = store.get_clip_frame(attempt_id, seq)
-    if data is None:
-        raise HTTPException(404, "no such frame")
-    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
-
-
-def _labelled_frames(attempt_id: str) -> tuple:
-    """(PIL frames with "phase  +t s" stamped on them, durations ms), shared by the GIF and MP4 exports."""
-    from PIL import Image, ImageDraw
-
-    frames = _clip_frames(attempt_id)
-    t0, images = frames[0]["ts"], []
-    for f in frames:
-        im = Image.open(io.BytesIO(store.get_clip_frame(attempt_id, f["seq"]))).convert("RGB")
-        text = f"{f['phase']}  +{f['ts'] - t0:.1f} s"
-        draw = ImageDraw.Draw(im)
-        draw.rectangle([0, 0, 8 + 6 * len(text), 16], fill=(0, 0, 0))
-        draw.text((4, 2), text, fill=(255, 255, 255))
-        images.append(im)
-    return images, _clip_durations_ms(frames)
-
-
-@app.get("/api/clips/{attempt_id}/download.gif")
-def clip_gif(attempt_id: str):
-    images, durations = _labelled_frames(attempt_id)
-    buf = io.BytesIO()
-    images[0].save(buf, "GIF", save_all=True, append_images=images[1:], duration=durations, loop=0, optimize=True)
-    return Response(buf.getvalue(), media_type="image/gif",
-                    headers={"Content-Disposition": f'attachment; filename="attempt-{attempt_id}.gif"'})
-
-
-@app.get("/api/clips/{attempt_id}/download.mp4")
-async def clip_mp4(attempt_id: str):
-    """MP4 via ffmpeg's concat demuxer (per-frame durations); 503 when ffmpeg is not installed."""
-    import shutil
-    import tempfile
-
-    if not shutil.which("ffmpeg"):
-        raise HTTPException(503, "ffmpeg is not installed on this machine; use the GIF download")
-    images, durations = _labelled_frames(attempt_id)
-    with tempfile.TemporaryDirectory() as tmp:
-        lines = []
-        for i, (im, ms) in enumerate(zip(images, durations)):
-            name = f"{i:05d}.jpg"
-            im.save(Path(tmp) / name, "JPEG", quality=90)
-            lines += [f"file '{name}'", f"duration {ms / 1000:.3f}"]
-        lines.append(f"file '{len(images) - 1:05d}.jpg'")  # concat demuxer needs the last file twice
-        (Path(tmp) / "list.txt").write_text("\n".join(lines) + "\n")
-        out = Path(tmp) / "out.mp4"
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", "list.txt",
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p", "-r", "25", "-movflags", "+faststart",
-            "out.mp4", cwd=tmp, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _, err = await proc.communicate()
-        if proc.returncode != 0 or not out.exists():
-            raise HTTPException(500, f"ffmpeg failed: {err.decode(errors='replace')[-300:]}")
-        data = out.read_bytes()
-    return Response(data, media_type="video/mp4",
-                    headers={"Content-Disposition": f'attachment; filename="attempt-{attempt_id}.mp4"'})
+    return {"module": await module_call({"clear_map": True, "reason": "dashboard Clear map"})}
 
 
 if __name__ == "__main__":
