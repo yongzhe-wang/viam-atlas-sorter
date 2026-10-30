@@ -1,0 +1,146 @@
+"""
+Regression tests for sorter.table_map: the dynamic map accepts any starting map, and a replay equals the live map.
+
+Synthetic frames (flat table + one 30 mm block) and hand-made recognitions, so no CLIP model, no Store and no
+data/scan frames are needed. Run: python tests/test_table_map.py (or pytest).
+"""
+import copy
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sorter import perception, table_map as TM  # noqa: E402
+
+POSE = {"x": 250.0, "y": 0.0, "z": 400.0, "theta": 0.0}
+
+
+def frame(u0: int = 600, v0: int = 300):
+    """1280x720 frame: wood-coloured table at 380 mm, a green 100x100 px block 30 mm tall at (u0, v0)."""
+    rgb = np.zeros((720, 1280, 3), np.uint8)
+    rgb[:] = (180, 140, 100)
+    depth = np.full((720, 1280), 380, np.uint16)
+    rgb[v0:v0 + 100, u0:u0 + 100] = (40, 180, 60)
+    depth[v0:v0 + 100, u0:u0 + 100] = 350
+    return rgb, depth
+
+
+def recognised(rgb, depth, label="green cube"):
+    """segment_full() plus a fixed recognition per object, standing in for clip_embed.recognise_all()."""
+    seg = perception.segment_full(rgb, depth)
+    emb = np.ones(TM.EMB_DIM, np.float32) / np.sqrt(TM.EMB_DIM)
+    recs = [{"obj": o, "label": label, "names": [label, "green square"], "score": 0.9, "emb": emb, "partial": False}
+            for o in seg.objects]
+    return recs, seg
+
+
+def update(tmap, u0=600, now=1000.0):
+    rgb, depth = frame(u0)
+    recs, seg = recognised(rgb, depth)
+    return TM.update_map(tmap, rgb, depth, POSE, recognised=recs, seg=seg, now=now)
+
+
+def _core(m):
+    """The map without the fields that legitimately differ (wall-clock ts, timings, the logged record)."""
+    m = copy.deepcopy(m)
+    m.pop("ts", None)
+    lu = m.get("last_update") or {}
+    lu.pop("ms", None)
+    lu.pop("observation", None)
+    return json.loads(json.dumps(m))
+
+
+def test_starting_maps():
+    # {VIAM CENTERAL 2026-10-29 "UPDATE_MAP(EMPTY_MAP(), …) AND UPDATE_MAP({}, …) BOTH WORK"}
+    # [CONFIDENCE: CONFIRMED 95% — the KeyError: 'next_id' on sfhack4 came from a {"objects": []} start]
+    cleared = {"ts": 1.0, "objects": [], "frames": [], "cleared_ts": 1.0, "cleared_reason": "test", "cleared_objects": 3}
+    for start in (TM.empty_map(), {}, {"objects": []}, cleared, None):
+        m = update(copy.deepcopy(start))
+        assert [o["label"] for o in m["objects"]] == ["green cube"], (start, m["objects"])
+        assert m["next_id"] == 1 and m["objects"][0]["id"] == 0 and m["objects"][0]["n_seen"] == 1
+
+
+def test_survey_style_map():
+    # A map_from_frames() / stored map: entries without n_seen, misses, emb or partial; ids continue after the max
+    old = {"objects": [{"id": 7, "label": "green cube", "names": ["green cube"], "xy": None, "height_mm": 30.0},
+                       {"id": 4, "label": "green cube", "names": ["green cube"], "height_mm": 30.0, "score": 0.8,
+                        "colour": "green", "frame_ids": ["a", "b"], "size_mm": [40.0, 40.0], "xy": None}]}
+    first = update(None)
+    old["objects"][1]["xy"] = list(first["objects"][0]["xy"])  # same place as the next sighting
+    m = update(old)
+    assert len(m["objects"]) == 1, m["objects"]  # the xy-less entry is dropped, the other one matched by label
+    e = m["objects"][0]
+    assert e["id"] == 4 and e["n_seen"] == 3 and e["emb"] is not None
+    assert m["next_id"] == 5
+
+
+def test_replay_equals_live():
+    # The map is a fold over the logged records: fold_observations() must rebuild exactly the live map
+    # [CONFIDENCE: CONFIRMED 95% — same apply_observation() on both paths; the record survives a JSON round trip]
+    live, log = TM.empty_map(), []
+    for i, u0 in enumerate((600, 610, 900)):  # still, nudged, moved 300 px (~125 mm): the entry jumps
+        live = update(live, u0=u0, now=1000.0 + 2 * i)
+        log.append(json.loads(json.dumps(live["last_update"]["observation"])))
+    assert _core(TM.fold_observations(log)) == _core(live)
+    assert _core(TM.fold_observations(log, {})) == _core(live)
+    assert _core(TM.rebuild_map(log, since_ts=1002.0)) == _core(TM.fold_observations(log[1:]))
+
+
+def test_replay_after_struct_round_trip():
+    # Records exported through a Viam DoCommand lose None fields and get floats for ints (AGENT 2 c1e51c2 / e3606e0)
+    def struct(x):
+        if isinstance(x, dict):
+            return {k: struct(v) for k, v in x.items() if v is not None}
+        if isinstance(x, list):
+            return [struct(v) for v in x]
+        return float(x) if isinstance(x, int) and not isinstance(x, bool) else x
+
+    live, log = TM.empty_map(), []
+    for i, u0 in enumerate((600, 900)):
+        rgb, depth = frame(u0)
+        recs, seg = recognised(rgb, depth, label=None if i else "green cube")  # one unrecognised: label None
+        live = TM.update_map(live, rgb, depth, POSE, recognised=recs, seg=seg, now=1000.0 + 2 * i)
+        log.append(struct(json.loads(json.dumps(live["last_update"]["observation"]))))
+    assert "square" not in log[0] and "label" not in log[1]["detections"][0]
+    assert _core(TM.fold_observations(log)) == _core(live)
+
+
+def test_light_record_refused():
+    live = update(None)
+    rec = {k: v for k, v in live["last_update"]["observation"].items() if k != "depth_valid"}
+    try:
+        TM.fold_observations([rec])
+    except ValueError as e:
+        assert "depth_valid" in str(e)
+    else:
+        raise AssertionError("a record without depth_valid must be refused")
+
+
+def test_stale_duplicate():
+    # The knife delivered into the square left its old entry behind; only the latest sighting of a label counts
+    # {LIVE TABLE_MAP 2026-10-29: "utility knife" at (270.4, 257.6) n=6 and at (385.3, 74.4) in_square}
+    old = {"id": 1, "label": "utility knife", "xy": [270.4, 257.6], "seen_ts": 100.0, "n_seen": 6}
+    new = {"id": 9, "label": "utility knife", "xy": [385.3, 74.4], "seen_ts": 200.0, "n_seen": 23, "in_square": True}
+    other = {"id": 2, "label": "green cube", "xy": [141.6, 106.0], "seen_ts": 50.0}
+    unknown = {"id": 3, "label": None, "xy": [516.0, -295.0], "seen_ts": 10.0}
+    assert TM._current([old, new, other, unknown]) == [new, other, unknown]
+    survey = [dict(old, seen_ts=None), dict(new, seen_ts=None)]  # map_from_frames: no seen_ts, keep both
+    assert TM._current(survey) == survey
+
+
+def test_best_on_minimal_maps():
+    # Queries must not crash on maps made elsewhere either (no objects key, entries without embeddings)
+    assert TM.best_on_map({}, "green cube")["map_obj"] is None
+    m = {"objects": [{"id": 0, "label": "green cube", "names": ["green cube"], "xy": [300.0, 0.0], "height_mm": 30.0,
+                      "colour": "green", "score": 0.9}]}
+    b = TM.best_on_map(m, "green cube")  # no store and no embedding: a refusal is fine, an exception is not
+    assert {"map_obj", "xy", "reason", "already_in_square"} <= set(b)
+
+
+if __name__ == "__main__":
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            print("ok", name)

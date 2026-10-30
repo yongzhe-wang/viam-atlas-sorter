@@ -33,7 +33,7 @@ GRID_X = (220.0, 310.0, 400.0, 490.0)
 GRID_Y = (-330.0, -240.0, -150.0, -60.0, 30.0, 120.0, 210.0, 300.0)
 MERGE_MM = 60.0  # objects closer than this across frames are the same object
 FREE_STEP_PX = 40  # candidate spacing for free spots in each frame
-FREE_CLEAR_PX = 150.0  # ~60 mm at the table depth seen from z=400: object/paper clearance
+FREE_CLEAR_PX = ppa.SPOT_CLEAR_PX  # same clearance as the live check (pick_place_auto.spot_free)
 REACH = (150.0, 600.0)  # flange distance from the base the arm has used safely
 VETO_MM = 15.0  # a "not free" sample this close to a free one (another frame, same place) vetoes it
 
@@ -216,7 +216,7 @@ async def around(points: list, offset: float = 40.0) -> None:
     await shoot(points, ((-offset, -offset), (-offset, offset), (offset, -offset), (offset, offset)), "library")
 
 
-async def shoot(points: list, offsets, kind: str) -> None:
+async def shoot(points: list, offsets, kind: str, theta: float = 0.0, z: float = None) -> None:
     """
     Extra frames: one per (point, offset), flange at (x + dx, y + dy), theta 0, z ALIGN_Z.
 
@@ -236,7 +236,7 @@ async def shoot(points: list, offsets, kind: str) -> None:
                 if not ppa.allowed(x, y) or math.hypot(x, y) < 120.0:
                     print(f"  skip ({x:.0f},{y:.0f}): keep-out or too close to the base")
                     continue
-                await ppa.travel(rig, x, y, theta=0.0)
+                await ppa.travel(rig, x, y, theta=theta, z=z or ppa.ALIGN_Z)
                 await capture(rig, n, kind, {"around": [cx, cy]})
                 print(f"  frame {n:03d} at ({x:.0f},{y:.0f})")
                 n += 1
@@ -252,9 +252,14 @@ if __name__ == "__main__":
     if "--free-only" in sys.argv:
         recompute_free()
     elif "--at" in sys.argv:
-        # --at X,Y [X,Y ...]: one frame exactly at each flange point (e.g. the observe pose for AGENT3's queries)
-        pts = [tuple(map(float, a.split(","))) for a in sys.argv[sys.argv.index("--at") + 1:]]
-        asyncio.run(shoot(pts, ((0.0, 0.0),), "observe"))
+        # --at X,Y [X,Y ...] [--theta T] [--z Z] [--kind K]: one frame exactly at each flange point
+        # (observe pose for AGENT3's queries; theta_test pairs; knife frames)
+        def opt(name, default):
+            return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
+        args = sys.argv[sys.argv.index("--at") + 1:]
+        pts = [tuple(map(float, a.split(","))) for a in args[: next((i for i, a in enumerate(args) if a.startswith("--")), len(args))]]
+        asyncio.run(shoot(pts, ((0.0, 0.0),), opt("--kind", "observe"), float(opt("--theta", 0.0)),
+                          float(opt("--z", ppa.ALIGN_Z))))
     elif "--around" in sys.argv:
         # --around X,Y [X,Y ...]: 4 library views around each flange point
         pts = [tuple(map(float, a.split(","))) for a in sys.argv[sys.argv.index("--around") + 1:]]

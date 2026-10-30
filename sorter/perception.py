@@ -23,6 +23,10 @@ from scipy import ndimage
 MIN_HEIGHT_MM = 8.0  # objects stand at least this far above the fitted table plane
 MAX_OBJ_HEIGHT_MM = 100.0  # taller is not a graspable object (blocks are < 80 mm): hand or arm
 MIN_AREA_PX = 800  # ~12x12 mm at the 378 mm observe depth (about 2.4 px/mm)
+# Pixel-area thresholds are tuned at the z=400 observe pose (table ~376 mm away). Higher sweep poses (z 480-550,
+# table ~460-530 mm) shrink every object by (depth ratio)^2, so areas scale with the measured table depth;
+# capped at 1 so z=400 frames are processed exactly as before.
+REF_TABLE_DEPTH_MM = 380.0
 CROP_MARGIN = 0.15  # crop = bbox grown by this fraction on each side
 # depth -> colour pixel model: colour = scale * (depth - centre) + centre + (tu, tv)
 IDENTITY = (1.0, 0.0, 0.0)  # align_color_depth on
@@ -105,6 +109,7 @@ class Obj:
     colour: str = ""  # dominant colour word of the mask, see colour_name()
     rect_fill: float = 1.0  # top face hull / min-area rectangle: square/rectangle ~1.0, disc ~0.81
     top_centroid_px: tuple = ()  # centroid of the top face: above the object's axis from any view angle
+    colours: dict = field(default_factory=dict)  # share of each saturated colour family in the mask (>= 2%)
 
 
 @dataclass
@@ -261,7 +266,12 @@ def skin_fraction(rgb: np.ndarray, mask: np.ndarray) -> float:
     return float(((cr > 140) & (cr < 175) & (cb > 85) & (cb < 125) & (y > 60)).mean())
 
 
-def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple) -> list:
+def area_scale(table_depth_mm: float) -> float:
+    """Factor for pixel-area thresholds at this table depth: 1 at the observe pose, ~0.5 at z 550."""
+    return min(1.0, (REF_TABLE_DEPTH_MM / max(table_depth_mm, 1.0)) ** 2)
+
+
+def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple, scale: float = 1.0) -> list:
     """
     Hands/arms: large invalid-depth regions that are skin-coloured.
 
@@ -280,7 +290,7 @@ def find_intruders(rgb: np.ndarray, valid: np.ndarray, model: tuple) -> list:
     for i in range(1, n + 1):
         m = lab == i
         area = int(m.sum())
-        if area < INTRUDER_MIN_AREA_PX:
+        if area < INTRUDER_MIN_AREA_PX * scale:
             continue
         vs, us = np.nonzero(m)
         bbox = (int(us.min()), int(vs.min()), int(us.max()), int(vs.max()))
@@ -317,9 +327,13 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
     seeded[np.unique(grp[above])] = True
     seeded[0] = False
     lab_d = np.where(seeded[grp] & low, grp, 0)
+    # No fingertip mask for objects: the fingers are ~140 mm from the camera, inside the depth blind range, so they
+    # never become objects; masking them erased a real 30 mm cube that a z=500 sweep saw in that corner
     lab_c = to_colour(lab_d, model)
-    _mask_fingers(lab_c)
     H, W = d.shape
+    table_depth = float(a * W / 2 + b * H / 2 + c)
+    ascale = area_scale(table_depth)
+    min_area = MIN_AREA_PX * ascale
     poly = load_workspace()
     objs, excluded, intruders = [], [], []
     # Work on each object's bounding sub-array: a full 1280x720 comparison per label (including hundreds of
@@ -331,10 +345,10 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         if sd is None or sc is None:
             continue  # unseeded, or mapped outside the colour view / onto the fingertips
         m_d = lab_d[sd] == i
-        if m_d.sum() < MIN_AREA_PX:
+        if m_d.sum() < min_area:
             continue
         m_s = lab_c[sc] == i
-        if m_s.sum() < MIN_AREA_PX // 2:
+        if m_s.sum() < min_area // 2:
             continue
         cv0, cu0 = sc[0].start, sc[1].start
         top_h = float(np.percentile(height[sd][m_d], 90))
@@ -361,7 +375,7 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
             full_d = np.zeros((H, W), bool)
             full_d[sd] = m_d & (height[sd] >= top_h - TOP_BAND_MM)
             top_s = to_colour(full_d, model)[sc] & m_s
-        if top_s.sum() < 200:
+        if top_s.sum() < 200 * ascale:
             top_s = m_s
         tvs, tus = np.nonzero(top_s)
         e = EDGE_MARGIN_PX
@@ -369,7 +383,8 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         o = Obj(id=0, bbox=bbox, centroid_px=cen, yaw_deg=yaw, length_px=L, width_px=Wd, height_mm=top_h,
                 top_depth_mm=float(np.percentile(d[sd][m_d], 10)), mask=m, crop=crop, touches_edge=edge,
                 colour=colour_name(rgb[sc], m_s)[0], rect_fill=rect_fill(top_s),
-                top_centroid_px=(float(cu0 + tus.mean()), float(cv0 + tvs.mean())))
+                top_centroid_px=(float(cu0 + tus.mean()), float(cv0 + tvs.mean())),
+                colours=colour_fractions(rgb[sc], m_s))
         # Only fully visible objects inside the workspace are targets; the rest is kept for display/debug
         if edge:
             excluded.append((o, "touches the image edge"))
@@ -380,8 +395,8 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
             objs.append(o)
     for k, (o, _) in enumerate(excluded):
         o.id = -1 - k  # negative ids never collide with targets
-    intruders += find_intruders(rgb, valid, model)
-    return Segmentation(table_depth_mm=float(a * W / 2 + b * H / 2 + c), objects=objs, excluded=excluded,
+    intruders += find_intruders(rgb, valid, model, ascale)
+    return Segmentation(table_depth_mm=table_depth, objects=objs, excluded=excluded,
                         intruders=intruders, align=model, plane=(a, b, c))
 
 
@@ -394,8 +409,24 @@ INTRINSICS = {"fx": 909.93, "fy": 909.36, "cx": 645.48, "cy": 365.37}
 # [CONFIDENCE: CONFIRMED 80% — independent check: AGENT1's own pixel->world conversion agrees within 1-15 mm]
 JAW_IN_CAM_MM = (32.9, 48.1)
 # Image +u is world -y and image +v is world -x at theta 0 (arm +y moved the scene +u, arm +x moved it +v).
-# Wrist rotation direction is not verified on hardware: use theta 0 for surveys and look poses.
+# Wrist rotation direction checked on the arm: with -1 the four objects of theta_test 079 (theta -90) land on their
+# 077 (theta 0) positions up to a constant offset; with +1 they scatter by 150-300 mm.
+# {079.JSON "THETA": -90.03} {THETA_CHECK SIGN -1 "GREEN (218, 8)" VS 077 "GREEN (198, 33)"; SIGN +1 "GREEN (220, -286)"}
+# [CONFIDENCE: CONFIRMED 90% — one theta pair, 4 objects; the +90 frame 078 had no fully visible shared object]
 THETA_SIGN = -1.0
+# The wrist turns about the pose point, not about the jaw axis that world_xy() maps to the flange xy: the jaw axis
+# sits TOOL_AXIS_MM from the rotation axis (world frame at theta 0). Fitted so 079 matches 077 (residuals <= 2.5 mm).
+# Zero effect at theta 0, so the map / look / travel convention (map xy = theta-0 flange xy over the point) is kept.
+# Independent check at theta +90: the blue block in 078 lands at (417, -173); the theta-0 frame 080 two minutes
+# later sees it at (419, -175) (uncorrected 078 said (442, -154)).
+# {THETA_FIT "J = [21.74 -3.25]" "RED RESID [-2.5 0.]"} {080 "EDGE BLUE H=30 … XY=(419,-175)"}
+# [CONFIDENCE: CONFIRMED 85% — fitted on theta -90, confirmed within 3 mm at theta +90 on an edge-cut sighting]
+TOOL_AXIS_MM = (21.7, -3.3)
+
+
+def _rot(t: float, x: float, y: float) -> tuple:
+    """Rotate (x, y) by t radians (counter-clockwise in the arm base frame)."""
+    return x * math.cos(t) - y * math.sin(t), x * math.sin(t) + y * math.cos(t)
 
 
 def world_xy(pose: dict, intr: dict, u: float, v: float, depth_mm: float) -> tuple:
@@ -403,13 +434,26 @@ def world_xy(pose: dict, intr: dict, u: float, v: float, depth_mm: float) -> tup
     Table xy (arm base frame, mm) of the point seen at pixel (u, v) at camera distance depth_mm.
 
     Pinhole back-projection to camera coordinates, then the offset from the jaw axis rotated into the
-    world; a point exactly on the jaw axis maps to the flange xy.
+    world; a point exactly on the jaw axis maps to the flange xy at theta 0. At other wrist angles the
+    offset is taken about the real rotation axis (TOOL_AXIS_MM), so every angle agrees with theta 0.
     """
     xc = (u - intr["cx"]) * depth_mm / intr["fx"]
     yc = (v - intr["cy"]) * depth_mm / intr["fy"]
     dx, dy = JAW_IN_CAM_MM[1] - yc, JAW_IN_CAM_MM[0] - xc  # world offset at theta 0
     t = math.radians(THETA_SIGN * float(pose.get("theta", 0.0)))
-    return (pose["x"] + dx * math.cos(t) - dy * math.sin(t), pose["y"] + dx * math.sin(t) + dy * math.cos(t))
+    # Offset from the rotation axis turns with the wrist; subtracting TOOL_AXIS_MM keeps theta 0 unchanged
+    rx, ry = _rot(t, dx + TOOL_AXIS_MM[0], dy + TOOL_AXIS_MM[1])
+    return pose["x"] + rx - TOOL_AXIS_MM[0], pose["y"] + ry - TOOL_AXIS_MM[1]
+
+
+def project_xy(pose: dict, intr: dict, table_xy, depth_mm: float) -> tuple:
+    """Pixel (u, v) where a table point appears at camera distance depth_mm: the inverse of world_xy()."""
+    t = math.radians(THETA_SIGN * float(pose.get("theta", 0.0)))
+    # Undo world_xy(): offset from the rotation axis, rotated back by -t, then back to the jaw-axis offset
+    rx, ry = _rot(-t, table_xy[0] - pose["x"] + TOOL_AXIS_MM[0], table_xy[1] - pose["y"] + TOOL_AXIS_MM[1])
+    dx, dy = rx - TOOL_AXIS_MM[0], ry - TOOL_AXIS_MM[1]
+    yc, xc = JAW_IN_CAM_MM[1] - dx, JAW_IN_CAM_MM[0] - dy
+    return intr["cx"] + xc * intr["fx"] / depth_mm, intr["cy"] + yc * intr["fy"] / depth_mm
 
 
 LOOK_MIN_REACH_MM = 150.0  # the executor refuses flange xy closer than 120 mm to the base; keep a margin
@@ -430,10 +474,211 @@ def look_flange_xy(table_xy: tuple) -> tuple:
     return fx, fy
 
 
+SQUARE_MIN_AREA_PX = 15000  # the white interior is ~290x300 px at the observe pose; scaled with depth like objects
+
+
+def find_drop_square(rgb: np.ndarray, depth: np.ndarray, plane: tuple = None) -> dict:
+    """
+    The drop zone: white interior enclosed by the blue tape. {centroid_px, bbox, area, depth_mm[, partial, cut]} or None.
+
+    Blue tape by hue/saturation, as measured by AGENT1 (tape reads ~(0,64,116), PIL hue ~147).
+    {PICK_PLACE_AUTO.PY "(HSV[..., 0] >= 130) & (HSV[..., 0] <= 165) & (HSV[..., 1] > 120) & (HSV[..., 2] > 50)"}
+    [CONFIDENCE: CONFIRMED 80% — AGENT1's servo uses the same mask on this paper square]
+    The hole must be mostly white paper (low saturation, bright). A hole fully in view wins; otherwise a border-cut
+    one ringed by tape comes back with partial=True (visible part only).
+    """
+    from PIL import Image
+
+    hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+    d = depth.astype(float)
+    a, b, c = plane or fit_table(d)  # reuse segment_full's plane when the caller has it
+    H, W = d.shape
+    min_area = SQUARE_MIN_AREA_PX * area_scale(float(a * W / 2 + b * H / 2 + c))
+    # Strict tape mask first; one looser retry (lower saturation/brightness, wider hue) because the real z=500 sweep
+    # found no square although geometry and a simulated higher view both say it was fully in view: exposure at a
+    # different height is the remaining suspect. The hole checks (enclosed, large, mostly white) stay the same.
+    masks = [(hsv[..., 0] >= hlo) & (hsv[..., 0] <= hhi) & (hsv[..., 1] > smin) & (hsv[..., 2] > vmin)
+             for hlo, hhi, smin, vmin in ((130, 165, 120, 50), (120, 172, 70, 40))]
+    # Closing on an edge-padded mask: plain binary_closing erodes 3 px off the image border (border_value 0), which
+    # opened the tape where it runs off the frame and joined a border-cut hole to the whole table (080)
+    masks = [ndimage.binary_closing(np.pad(m, 4, mode="edge"), iterations=3)[4:-4, 4:-4] for m in masks]
+    # Objects are never tape. The silver knife reads 52-69 % "tape" by colour, so lying in the square it cut the
+    # interior in two and only the part above it was found (live observe frame, 16 mm off). First every raised
+    # pixel is "not tape" (an object on the paper joins the interior); if that finds nothing, raised pixels are
+    # walls instead (an object lying across the tape would otherwise join the interior to the table).
+    # {KNIFE TAPE SHARE 081 "STRICT 0.69 LOOSE 0.84", 083 "0.61 / 0.83"; LIVE SNAPSHOT "HIT BBOX (336, 16, 742, 199)"}
+    # [CONFIDENCE: CONFIRMED 80% — synthetic objects on 076 in tests/test_drop_square.py; no real frame of it yet]
+    vv, uu = np.mgrid[0:H, 0:W]
+    raised = (d > 0) & (a * uu + b * vv + c - d > MIN_HEIGHT_MM)
+    # In the second try the walls also take what is neither paper nor tape: very dark pixels and no depth. The
+    # robot's cable hanging in front of the lens crossed the square at the place look pose; depth sees past it
+    # (375 mm, the table) and it is not blue, so it joined the interior to the table and no square was found.
+    # {SQUARE_CENTERED.NPZ "DARK (CABLE) PIXELS 141694 … DEPTH>0 MEDIAN ON CABLE 375.0" "PX (500,300) V=27"}
+    # [CONFIDENCE: CONFIRMED 85% — that frame now finds the square; no change on the 89 scan frames]
+    occluder = raised | (d <= 0) | (hsv[..., 2] < SQUARE_DARK_V)
+    # (walls, tape, rim): with occluders as walls a bright patch fenced by objects (008: a transparent cup) also looks
+    # enclosed, so there the hole's rim must still be mostly real tape (SQUARE_RIM_TAPE)
+    walls = [(m & ~raised, m, None) for m in masks] + [(m | occluder, m, SQUARE_RIM_TAPE) for m in masks]
+    for wall, tape, rim in walls:
+        hit = _enclosed_white_hole(hsv, wall, min_area, (a, b, c), tape=tape, rim_min=rim)
+        if hit:
+            return hit
+    # Not fully in view: frame 080 (observe pose, after a place pushed the paper ~40 mm) had the hole cut by the
+    # top edge, so the delivered yellow block was not "in the square" on the map. Accept a border-cut hole whose
+    # in-image rim is tape, flagged partial: its centroid/bbox are only the visible part, never a place target.
+    # {SQ_76_80 "080: WHITE INTERIOR V 0-270 (TOUCHES THE TOP EDGE)" VS 076 "V 30-360"}
+    # [CONFIDENCE: CONFIRMED 85% — seen on 080/082/084; partial rim check mirrors AGENT1's find_square ring test]
+    # Strict tape mask only: with the loose one, transparent cups (bluish reflections, paper-like brightness) came
+    # back as border-cut squares on 000/016/032/056 (masks[0]: strict, objects not tape; masks[2]: strict, objects walls)
+    for wall, tape, _ in (walls[0], walls[2]):
+        hit = _enclosed_white_hole(hsv, wall, min_area * SQUARE_PARTIAL_AREA_FRAC, (a, b, c), border_cut=True, tape=tape)
+        if hit:
+            return hit
+    return None
+
+
+# Paper reads light blue to this camera: PIL saturation median 52-60 (010-076), 66 (080), 103 (082), so the old
+# "S < 60" white test failed whole exposures. Tape is S > 120 by the mask itself; brightness tells paper from wood.
+# {PAPER S P50: 076 "60", 080 "69", 082 "103"; WOOD "V P10/50 [86 130]" … "[117 128]" VS V_WHITE 150}
+# [CONFIDENCE: CONFIRMED 85% — measured on 9 frames; wood V>v_white share 0.00-0.09, paper 0.95-1.00]
+SQUARE_WHITE_S = 120
+# A hole whose bbox comes this close to the image border is treated as cut there (partial)
+# {060 "BBOX (376, 427, 818, 718)" "ROWS 700-719 BLUE FRAC … [0.72 … 0.88]"} [CONFIDENCE: CONFIRMED 85% — 060 vs 061/084]
+SQUARE_EDGE_PX = 6
+SQUARE_DARK_V = 60  # PIL brightness below this is an occluder (cable, fingers), never paper (V ~200) or tape (~110)
+SQUARE_PARTIAL_AREA_FRAC = 0.4  # a border-cut hole may show less than the full interior
+# Border-cut hole checks, from 5 real (010/015/019/043/050) vs 7 fake partials (cups, tape strips, a tape roll):
+# real rim 1.00 and rect_fill 0.92-0.99; fakes rect_fill 0.67-0.89 or paper-like V on < 80 % of the region
+# [CONFIDENCE: CONFIRMED 80% — 12 labelled cases, all separated; thresholds sit in the gap]
+SQUARE_RIM_BLUE = 0.9  # share of the in-image rim that must be tape
+# Hole found with occluders as walls: its rim must still be at least this much tape. Real squares 0.78 (the cable
+# frame) to 1.0; the cup patch on 008 0.0. {RIM SHARE "SQUARE_CENTERED … 0.78" "008 … 0.0" "076 … 1.0" "020 … 0.84"}
+# [CONFIDENCE: CONFIRMED 80% — 6 frames measured; 0.5 sits in the wide gap]
+SQUARE_RIM_TAPE = 0.5
+SQUARE_PARTIAL_RECT = 0.9  # rect_fill of the hole-filled region: a clipped rectangle stays a rectangle
+SQUARE_PARTIAL_WHITE_V = 0.8  # share of bright (paper) pixels; 0.6 for a fully seen hole
+
+
+def _enclosed_white_hole(hsv: np.ndarray, blue: np.ndarray, min_area: float, plane: tuple, border_cut: bool = False,
+                         tape: np.ndarray = None, rim_min: float = None):
+    """
+    Largest region not in the wall mask `blue`, >= min_area and mostly white paper; or None.
+
+    border_cut False: the region must not touch the image border (the whole hole in view); still flagged partial
+    when its bbox is within SQUARE_EDGE_PX of the border. rim_min: share of its rim that must be `tape` (None: no check).
+    border_cut True: only regions touching the border, and SQUARE_RIM_BLUE of the rest of their rim must be `tape`;
+    the result carries "partial": True and "cut" (the image sides it runs off). tape None: the walls are the tape.
+    """
+    a, b, c = plane
+    lab, n = ndimage.label(~blue)
+    if not n:
+        return None
+    H, W = blue.shape
+    border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
+    # "White" relative to this frame's exposure: at 60 % brightness the paper fell below a fixed V>150 and the square
+    # was lost at every height in simulation; capped at 150 so normal exposures behave exactly as before
+    v_white = min(150.0, 0.8 * float(np.percentile(hsv[::4, ::4, 2], 95)))
+    best = None
+    for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+        if sl is None or (i in border) != border_cut:
+            continue
+        m = lab[sl] == i
+        area = int(m.sum())
+        if area < min_area or (best and area <= best["area"]):
+            continue
+        bright = SQUARE_PARTIAL_WHITE_V if border_cut else 0.6
+        white = (hsv[sl][..., 1][m] < SQUARE_WHITE_S).mean() > 0.6 and (hsv[sl][..., 2][m] > v_white).mean() > bright
+        if not white:
+            continue
+        vs, us = np.nonzero(m)
+        bbox = (int(sl[1].start + us.min()), int(sl[0].start + vs.min()), int(sl[1].start + us.max()), int(sl[0].start + vs.max()))
+        e = SQUARE_EDGE_PX
+        cut = [s for s, hit in (("top", bbox[1] <= e), ("bottom", bbox[3] >= H - 1 - e),
+                                ("left", bbox[0] <= e), ("right", bbox[2] >= W - 1 - e)) if hit]
+        # The interior (~11x18 cm) is smaller than the view, so it can run off one side or one corner only;
+        # a region off opposite sides is the table/paper around the tape (032-039 false positives)
+        if border_cut and (len(cut) > 2 or {"top", "bottom"} <= set(cut) or {"left", "right"} <= set(cut)):
+            continue
+        need = SQUARE_RIM_BLUE if border_cut else rim_min
+        if need is not None:
+            # Outer rim inside the image (10 px ring around the hole-filled region, slice padded so the ring is
+            # not clipped) must be mostly tape; holes are filled so objects lying in the region do not count as rim
+            pad = (slice(max(sl[0].start - 12, 0), min(sl[0].stop + 12, H)), slice(max(sl[1].start - 12, 0), min(sl[1].stop + 12, W)))
+            mp = ndimage.binary_fill_holes(lab[pad] == i)
+            band = ndimage.binary_dilation(mp, iterations=10) & ~mp
+            ring = (blue if tape is None else tape)[pad][band]
+            if not band.any() or ring.mean() < need or (border_cut and rect_fill(mp) < SQUARE_PARTIAL_RECT):
+                continue
+        u, v = sl[1].start + us.mean(), sl[0].start + vs.mean()
+        best = {"centroid_px": (float(u), float(v)), "area": area, "bbox": bbox,
+                "depth_mm": float(a * u + b * v + c), "_i": i, "_sl": sl}  # flat paper: the table plane at its centre
+        if cut:
+            # Border-cut, or "enclosed" only by a few edge rows: on 060 the vignetted bottom rows of the paper read as
+            # tape, so a hole running off the bottom looked whole and its centroid sat 20 mm off on the map
+            best.update(partial=True, cut=cut)
+    if best is not None:
+        best["hull_px"], best["hull_cut"] = _hole_hull(lab, best.pop("_i"), best.pop("_sl"), plane)
+    return best
+
+
+def _hole_hull(lab: np.ndarray, i: int, sl: tuple, plane: tuple) -> tuple:
+    """
+    Convex hull of the hole (objects on the paper filled in): ([[u, v, depth_mm], ...] counter-clockwise,
+    [cut per edge i -> i+1]). An edge is cut when both ends lie on the same image side (within SQUARE_EDGE_PX):
+    that side of the hull is the frame, not tape. table_map fits the full rectangle from the other edges.
+    """
+    from scipy.spatial import ConvexHull
+
+    a, b, c = plane
+    H, W = lab.shape
+    pad = (slice(max(sl[0].start - 2, 0), min(sl[0].stop + 2, H)), slice(max(sl[1].start - 2, 0), min(sl[1].stop + 2, W)))
+    m = ndimage.binary_fill_holes(lab[pad] == i)
+    vs, us = np.nonzero(m & ~ndimage.binary_erosion(m))  # the rim is enough for the hull
+    pts = np.column_stack([us + pad[1].start, vs + pad[0].start]).astype(float)
+    hp = pts[ConvexHull(pts).vertices]
+    e = SQUARE_EDGE_PX
+    side = [{s for s, hit in (("top", v <= e), ("bottom", v >= H - 1 - e), ("left", u <= e), ("right", u >= W - 1 - e))
+             if hit} for u, v in hp]
+    cut = [bool(side[k] & side[(k + 1) % len(hp)]) for k in range(len(hp))]
+    return [[float(u), float(v), float(a * u + b * v + c)] for u, v in hp], cut
+
+
 def segment(rgb: np.ndarray, depth: np.ndarray) -> tuple:
     """(table_depth_mm, objects), the EXEC_PLAN contract. Use segment_full() for intruders and alignment."""
     s = segment_full(rgb, depth)
     return s.table_depth_mm, s.objects
+
+
+HUE_BINS = [(0, 15, "red"), (15, 40, "orange"), (40, 70, "yellow"), (70, 165, "green"),
+            (165, 200, "cyan"), (200, 260, "blue"), (260, 330, "purple"), (330, 361, "red")]
+
+
+def _hue_sat(rgb: np.ndarray, mask: np.ndarray) -> tuple:
+    """(hue degrees, saturated?, max channel) per masked pixel, 0-1 scale."""
+    px = rgb[mask].astype(float) / 255.0
+    mx, mn = px.max(1), px.min(1)
+    d = np.maximum(mx - mn, 1e-6)
+    s = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0)
+    r, g, b = px[:, 0], px[:, 1], px[:, 2]
+    hue = np.where(mx == r, ((g - b) / d) % 6, np.where(mx == g, (b - r) / d + 2, (r - g) / d + 4)) * 60.0
+    # Dark pixels carry a faint hue from white balance; a black charger read "blue" before this
+    return hue, (s > 0.35) & (mx > 0.3), mx
+
+
+def colour_fractions(rgb: np.ndarray, mask: np.ndarray) -> dict:
+    """
+    Share of the mask in each saturated colour family (only families >= 2%).
+
+    WHY: the dominant colour of both screwdrivers is "black" (handles), so only the secondary colour tells the
+    blue one (blue 0.33-0.38) from the red one (red 0.31, blue 0.00); stray hue on black objects stays <= 0.06.
+    """
+    if not mask.any():
+        return {}
+    hue, sat, _ = _hue_sat(rgb, mask)
+    out = {}
+    for lo, hi, nm in HUE_BINS:
+        out[nm] = out.get(nm, 0.0) + float((sat & (hue >= lo) & (hue < hi)).mean())
+    return {k: round(v, 3) for k, v in out.items() if v >= 0.02}
 
 
 def colour_name(rgb: np.ndarray, mask: np.ndarray) -> tuple:
@@ -443,22 +688,14 @@ def colour_name(rgb: np.ndarray, mask: np.ndarray) -> tuple:
     Saturated pixels vote by hue (degrees); low saturation splits into white / grey / black by value.
     Hue bins chosen by eye on sfhack4 frames (the yellow block is ~55 deg, the blue tape ~210 deg).
     """
-    px = rgb[mask].astype(float) / 255.0
-    if len(px) == 0:
+    if not mask.any():
         return "unknown", 0.0
-    mx, mn = px.max(1), px.min(1)
-    d = np.maximum(mx - mn, 1e-6)
-    s = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0)
-    r, g, b = px[:, 0], px[:, 1], px[:, 2]
-    hue = np.where(mx == r, ((g - b) / d) % 6, np.where(mx == g, (b - r) / d + 2, (r - g) / d + 4)) * 60.0
-    names = np.full(len(px), "grey", dtype=object)
-    # Dark pixels carry a faint hue from white balance; a black charger read "blue" before this
-    sat = (s > 0.35) & (mx > 0.3)
+    hue, sat, mx = _hue_sat(rgb, mask)
+    names = np.full(len(hue), "grey", dtype=object)
     names[~sat & (mx > 0.8)] = "white"
     names[mx <= 0.3] = "black"
-    for lo, hi, nm in [(0, 15, "red"), (15, 40, "orange"), (40, 70, "yellow"), (70, 165, "green"),
-                       (165, 200, "cyan"), (200, 260, "blue"), (260, 330, "purple"), (330, 361, "red")]:
+    for lo, hi, nm in HUE_BINS:
         names[sat & (hue >= lo) & (hue < hi)] = nm
     vals, counts = np.unique(names, return_counts=True)
     k = int(np.argmax(counts))
-    return str(vals[k]), float(counts[k] / len(px))
+    return str(vals[k]), float(counts[k] / len(hue))

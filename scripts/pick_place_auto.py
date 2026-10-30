@@ -26,6 +26,7 @@ import asyncio
 import io
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -48,7 +49,18 @@ TIP_BELOW_CAM = 155.0 - CAM_T[2]  # fingertips are this far past the camera alon
 JAW_TIP_PX = (864.0, 685.0)  # midpoint between the fingertips in the colour image (measured)
 APPROACH_GAP = 70.0  # fingertips this far above the block top for the second, close-range alignment (mm)
 GRIP_DEPTH = 15.0  # how far below the block top the fingertips close (mm)
-TIP_CLEARANCE = 8.0  # fingertips never get closer than this to the measured table (mm)
+TIP_CLEARANCE = 10.0  # fingertips never get closer than this to the table under the jaws (mm)
+# Absolute flange floor for a grasp or release on this table: every real grasp at z >= 173 worked, both at 171
+# (silver box cutter, black tape) stopped the arm on overcurrent with the fingertips on the table.
+# {VIAM CENTERAL 2026-10-29 "成功 X5: 175、173、173、174、174 ... OVERCURRENT X2: 171、171"}
+# [CONFIDENCE: CONFIRMED 85% — 7 grasps on this table; valid while the table height does not change]
+MIN_GRASP_Z = 174.0
+# Thin objects (< THIN_MM tall) may go 1 mm lower: at 174 the red box cutter (16 mm) slipped out on the lift; 173 is
+# the lowest height that has worked (3x), 171 hit the table (2x). Not lower on a retry: stability first for the demo.
+# {VIAM CENTERAL 2026-10-29 "物体 HEIGHT < 18 MM 时，允许下到 172.5 ... 如果你觉得不稳，就不改"}
+# [CONFIDENCE: CONFIRMED 80% — 173 seen working 3x; 172.5 untested, so not used]
+MIN_GRASP_Z_THIN = 173.0
+THIN_MM = 18.0
 PLACE_GAP = 10.0  # block bottom height above the table when released (mm)
 ALIGN_Z = 400.0  # observation height; sees the whole table scene
 SANITY_MIN_Z = 120.0  # absolute flange floor; Viam's own collision check refuses below ~132
@@ -59,7 +71,41 @@ TOL_PX = 7.0
 # hangs into the bottom-right (it hid the hole twice on 2026-10-29); then one J^-1 step to the real target
 CARRY_OFFSET_PX = (-276.0, -232.0)
 GRAB_TRIES = 3  # first grab + 2 retries
-SETTLE_S = 1.0  # wait after every move before trusting a camera frame
+# Final approach is open loop: pose, yaw and identity are fixed at standoff (ALIGN_Z, ~350 mm depth: whole object
+# and valid depth in view), then one straight descent. The close-range servo (depth blind < ~280 mm, colour-only
+# tracking) followed parts of objects: the screwdriver's blue end cap, then the blue block (clips_sd2/sd3).
+# {VIAM CENTERAL 2026-10-29 "MAKE THE FINAL APPROACH OPEN-LOOP FOR ALL OBJECTS, FIXING POSE AND IDENTITY AT STANDOFF"}
+# {ARXIV 2001.05650 (HAVILAND ET AL.) RGB-D MIN RANGE ~30 CM; DEPTH-BASED GRASPING FAILS IN THE FINAL PHASE}
+# [CONFIDENCE: SINGLE-SRC 70% — literature + our clips; open-loop accuracy on the arm not measured yet]
+CLOSE_SERVO = False  # True restores the close-range re-alignment at APPROACH_GAP, for A/B on the arm
+# Servo steps from the camera model's image Jacobian (model_jacobian) instead of two 15 mm probe moves per
+# iteration: the yellow block's far servo took 8 iterations x ~4.6 s (530 -> 383 -> 236 -> 82 -> 12 -> 2 px, the
+# 60 mm cap and the probes) and the carry-offset square servo 5. The model is the one THETA_SIGN/TOOL_AXIS_MM were
+# fitted for; a step that does not cut the error below 30% switches that servo back to probing.
+# {VIAM CENTERAL 2026-10-29 "ANALYTIC IMAGE JACOBIAN FROM INTRINSICS, DEPTH AND THE CAMERA ROTATION AT THE CURRENT THETA"}
+# [CONFIDENCE: INFERRED 75% — matches the measured nominal Jacobian at theta 0 (+x -> +v, +y -> +u, f/depth px/mm)]
+SERVO_MODEL_J = True
+# A servo that has not converged by now will not: give up and let the caller retry from a fresh look. The black
+# tape's servo probed for 65.5 s before failing. {VIAM CENTERAL 2026-10-29 "BLOCK SERVO 最多 N 轮就 GIVE UP，在 10 S 内结束"}
+SERVO_MAX_S = 12.0
+MODEL_STEP_CAP_MM = 200.0  # one model step may cross most of the view; goto() still enforces MAX_STEP_MM
+
+
+def model_jacobian(fx: float, fy: float, cx: float, cy: float, theta: float, depth: float) -> np.ndarray:
+    """
+    Image Jacobian (px per mm of flange x, y; columns = arm x, arm y) of a table point seen at `depth`, from
+    sorter.perception's camera model at wrist angle `theta`. A flange translation moves every point the same.
+    """
+    from sorter.perception import project_xy
+
+    k = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
+    base = {"x": 0.0, "y": 0.0, "z": ALIGN_Z, "theta": float(theta)}
+    u0 = np.array(project_xy(base, k, (300.0, 0.0), depth))
+    ux = np.array(project_xy({**base, "x": 1.0}, k, (300.0, 0.0), depth))
+    uy = np.array(project_xy({**base, "y": 1.0}, k, (300.0, 0.0), depth))
+    return np.column_stack([ux - u0, uy - u0])
+# Wait after every move before trusting a camera frame: the lag test measured ~0.5 s of stale frames
+SETTLE_S = 0.6
 # Jaw-axis model fitted from released blocks (data/jaw_calib.json); None until `jaw_calib.py fit` has run
 JAW_CAL = jaw_calib.load()
 
@@ -90,14 +136,14 @@ async def observe_release(rig, z1: float, table: float, height: float) -> None:
     Record where the just-released block appears, as jaw-axis calibration samples.
 
     WHY: the block was clamped centred between the jaws, so right after release it sits on the real jaw
-    axis; its pixel at a known depth measures the jaw-axis pixel the servo relies on. Seen from the close
-    servo height and from ALIGN_Z, so each place gives two depths. Moves only straight up. Never raises:
-    calibration must not break a run.
+    axis; its pixel at a known depth measures the jaw-axis pixel the servo relies on. Seen from ALIGN_Z only,
+    where the open-loop grasp is aimed, on the lift the place makes anyway: the extra stop at the close-servo
+    height cost a move per place and its samples were the biased ones (jaw_calib_candidate rejected). Moves
+    only straight up. Never raises: calibration must not break a run.
     """
     top1 = table - height  # block-top depth when the flange was at z1 (where the table was measured)
-    z_close = z1 - (top1 - TIP_BELOW_CAM - APPROACH_GAP)
     p = await rig.pose()
-    for z in (z_close, ALIGN_Z):
+    for z in (ALIGN_Z,):
         try:
             await rig.goto(p.x, p.y, max(z, (await rig.pose()).z))
             q = await rig.pose()
@@ -300,13 +346,27 @@ INTRUDER_BLIND_PX = 40000  # invalid-depth patch this big = something within ~28
 INTRUDER_TALL_PX = 5000  # valid depth this many px > 100 mm above the table = hand/arm (blocks are < 80 mm)
 
 
-def intruder(depth: np.ndarray, near_uv=None, radius: float = 300.0) -> bool:
+# A hand or arm reaching in is thick in the image; the arm's own cable hanging in front of the lens is a thin strip
+# (reset 2026-10-29: "hand/arm in the workspace: pausing" until the 120 s timeout, the cable down the right side of
+# the view, reset4.jpg). Only blobs this wide count: a 20 mm cable at ~200 mm is ~90 px across at most, a hand at
+# 100-250 mm several hundred.
+# {VIAM CENTERAL 2026-10-29 "在不削弱真人手检测的前提下排除 SELF-CABLE ... 细长暗条带只记一条 WARNING，不暂停"}
+# [CONFIDENCE: INFERRED 70% — cable frames thin by inspection; no real hand frame recorded yet]
+INTRUDER_MIN_HALF_WIDTH_PX = 60
+WAIT_TELL_S = 20.0  # paused this long: the status asks for whatever is in front of the camera to be moved
+
+
+def intruder_why(depth: np.ndarray, near_uv=None, radius: float = 300.0, rgb: np.ndarray = None):
     """
-    True if a hand or arm seems to be in the workspace around `near_uv` (whole view if None).
+    Why a hand or arm seems to be in the workspace around `near_uv` (whole view if None), or None.
 
     WHY: people reach into the table while the arm works (the block was moved mid-servo on 2026-10-29).
     At ALIGN_Z a hand 100 mm above the table is closer than the RealSense minimum range, so it shows as a
-    large patch of invalid depth rather than as a tall blob; both signals count.
+    large patch of invalid depth rather than as a tall blob; both signals count, per blob, and only blobs at least
+    2 x INTRUDER_MIN_HALF_WIDTH_PX wide somewhere (thin strips such as the arm's cable are logged, not counted).
+    With `rgb`, a blind blob that is dark in colour is a black object or the cable, not a hand: the black tape roll
+    reads no depth at all (matte black, 64611 px, 219 px wide on square_centered.npz), and the reset paused on it
+    under the jaws until the timeout.
     {BASELINE 2026-10-29 "LARGEST INVALID BLOB ABOVE ROW 600: 13158 PX"} vs a hand ~200k px at 250 mm
     [CONFIDENCE: INFERRED 75% — thresholds from 4 baseline frames and geometry, no real hand tested yet]
     """
@@ -319,15 +379,40 @@ def intruder(depth: np.ndarray, near_uv=None, radius: float = 300.0) -> bool:
     valid = depth[depth > 0]
     hist, edges = np.histogram(valid, bins=np.arange(100, 1500, 4))
     table = float(edges[np.argmax(hist)] + 2)
-    tall = (depth > 0) & (depth < table - 100) & roi
     # The gripper and anything it holds hang in from the bottom edge and are always too close for depth:
     # drop blind patches touching the bottom row (a held block paused the arm as a "hand" for 120 s)
     blind_all, _ = ndimage.label(depth == 0)
     held = np.isin(blind_all, np.unique(blind_all[-1][blind_all[-1] > 0]))
-    blind = (depth == 0) & ~held & roi
-    lab, n = ndimage.label(blind)
-    biggest = int(ndimage.sum(blind, lab, range(1, n + 1)).max()) if n else 0
-    return int(tall.sum()) > INTRUDER_TALL_PX or biggest > INTRUDER_BLIND_PX
+    blind = (depth == 0) & ~held
+    # The stereo sensor never reads its left edge: that band joined the black tape roll and the KIND bar into one
+    # "hand" (perception.find_intruders drops it too)
+    from sorter.perception import DEPTH_LEFT_INVALID_U
+    blind[:, :DEPTH_LEFT_INVALID_U] = False
+    for name, mask, limit in (("tall", (depth > 0) & (depth < table - 100), INTRUDER_TALL_PX),
+                              ("blind", blind, INTRUDER_BLIND_PX)):
+        lab, n = ndimage.label(mask & roi)
+        if not n:
+            continue
+        areas = ndimage.sum(mask & roi, lab, range(1, n + 1))
+        for i in np.nonzero(areas > limit)[0]:
+            # Half-width = largest distance from the blob's inside to its edge
+            comp = lab == i + 1
+            half = float(ndimage.distance_transform_edt(comp).max())
+            if name == "blind" and rgb is not None:
+                # A black object's blob is largely dark (a ring's hole reads no depth either, but is not dark)
+                dark = float((np.asarray(Image.fromarray(rgb).convert("HSV"))[..., 2][comp] < 70).mean())
+                if dark >= 0.3:  # the tape roll read 46% (its hole is blind but light); skin is never this dark
+                    print(f"  dark blind blob {int(areas[i])} px ({dark:.0%} dark): a black object or cable, not a hand")
+                    continue
+            if half >= INTRUDER_MIN_HALF_WIDTH_PX:
+                return f"{name} blob {int(areas[i])} px, {2 * half:.0f} px wide"
+            print(f"  thin {name} strip {int(areas[i])} px, {2 * half:.0f} px wide in view (cable?): ignored")
+    return None
+
+
+def intruder(depth: np.ndarray, near_uv=None, radius: float = 300.0) -> bool:
+    """True if intruder_why() finds a hand or arm around `near_uv`."""
+    return intruder_why(depth, near_uv, radius) is not None
 
 
 def bbox_near(bbox, uv, radius: float) -> bool:
@@ -372,6 +457,10 @@ RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)  # waits before each reconnect attempt
 CONNECT_TIMEOUT_S = 30.0  # one connect attempt; a timeout counts as a dropped link and is retried
 # Per-call limits (s). A trial hung > 10 min inside one SDK call after a release; a timeout now counts as a
 # dropped link (retryable), so call() reconnects and repeats it. Moves are absolute, so repeating is safe.
+# Wrist-turned frames feed the live map too: AGENT3 confirmed perception.THETA_SIGN on theta_test 077/079
+# {A93820E "WITH -1 THE FOUR OBJECTS OF THETA_TEST 079 (THETA -90) LAND ON THEIR 077 (THETA 0) POSITIONS"}
+# [CONFIDENCE: SINGLE-SRC 85% — one theta pair, residuals <= 2.5 mm after TOOL_AXIS_MM; 078 (+90) not fitted]
+MAP_ONLY_THETA0 = False
 CALL_TIMEOUT_S = {"move": 45.0, "get images": 10.0, "get pose": 10.0, "open": 15.0, "grab": 15.0,
                   "holding": 10.0, "frame system": 15.0, "geometries": 15.0}
 
@@ -388,8 +477,44 @@ def retryable(e: Exception) -> bool:
     if isinstance(e, (StreamTerminatedError, ConnectionError, OSError, asyncio.TimeoutError)):
         return True
     if isinstance(e, GRPCError):
-        return e.status.name in ("UNAVAILABLE", "UNKNOWN", "CANCELLED", "DEADLINE_EXCEEDED") or "SESSION_EXPIRED" in str(e.message)
+        msg = str(e.message or "")
+        # A planner/IK/collision refusal comes back as UNKNOWN too: "grasp green square" (cube 198 mm from the base)
+        # was retried as a dropped link 4 times inside the module, where there is no network link, and failed as
+        # "link still down". Refusals are never retried.
+        # {VIAM CENTERAL 2026-10-29 "A GRPCERROR WITH STATUS UNKNOWN / FAILED_PRECONDITION, OR A MESSAGE CONTAINING
+        #  'IK', 'CONSTRAINT', 'COLLISION' OR 'PLAN', IS A NON-RETRYABLE REFUSAL"}
+        # [CONFIDENCE: SINGLE-SRC 80% — module log; exact planner wording not captured]
+        if REFUSAL_WORDS.search(msg):
+            return False
+        if "SESSION_EXPIRED" in msg:
+            return True
+        if e.status.name in ("UNAVAILABLE", "CANCELLED", "DEADLINE_EXCEEDED"):
+            return True
+        # UNKNOWN only when the message says the transport broke
+        return e.status.name == "UNKNOWN" and bool(LINK_WORDS.search(msg))
     return False
+
+
+# Planner refusals vs transport breaks, by gRPC message (case-insensitive)
+REFUSAL_WORDS = re.compile(r"\bik\b|inverse kinematics|constraint|collision|\bplan|solution|unreachable|joint limit|"
+                           r"out of reach|obstacle", re.IGNORECASE)
+LINK_WORDS = re.compile(r"connection|stream|transport|closed|reset|broken pipe|eof|unavailable|goaway", re.IGNORECASE)
+
+
+class MoveRefused(RuntimeError):
+    """The arm refused a call (planner, IK, collision, limits): the arm did not move; retrying will not help."""
+
+
+class EStop(MoveRefused):
+    """The xArm's emergency stop is pressed: no arm command until a person releases it and resets."""
+
+
+# Set when the arm reports its emergency stop; every later arm command (not reads) is refused here, without
+# reaching the arm, and clear_error is never sent, until Reset (executor.clear_square) clears it.
+# {VIAM CENTERAL 2026-10-29 "FAIL_REASON 里出现 'EMERGENCY STOP' 时，立刻停止所有重试和 RECOVER ... 不做 CLEAR_ERROR"}
+ESTOP = {"on": False, "why": ""}
+ESTOP_STATUS = "E-STOP pressed — release it, then press Reset on the dashboard"
+READ_CALLS = ("get pose", "get images", "holding", "frame system", "geometries")
 
 
 class Rig:
@@ -409,6 +534,19 @@ class Rig:
         self.last_depth = None  # depth map of the latest frame(), for finders that need it
         self.last_pose = None  # latest pose read, for status reports
         self.status = None  # "reconnecting" / "paused_person" while that is happening, else None
+        self.on_frame = None  # optional recorder(phase, rgb, meta), set per attempt by sorter.executor
+        # Live table map: on_map_frame(rgb, depth, pose) gets EVERY frame with the pose it was taken at; set by the
+        # map's single owner (the Viam module, which adds the source from executor.phase_now). self.at is that
+        # pose: the last read pose, or the last commanded one (probe frames are taken right after goto()).
+        self.on_map_frame = None
+        self.at = None
+        # () -> the live table map dict ({"objects", "square"}) or None; set by the module next to on_map_frame.
+        # The executor reads it for drop spots (avoid mapped objects) and the newest square position.
+        self.live_map = None
+        # (x, y, theta) of the flange at the last successful grab: the one spot known to be free for this object,
+        # where a failed carry or reset puts it back instead of opening the gripper anywhere else
+        self.picked_at = None
+        self.tables = []  # table depths measured at ALIGN_Z, newest last (measure keeps 5)
 
     async def connect(self) -> None:
         # The SDK's own reconnect loop is off: it fought call()'s backoff, and its native layer can abort the
@@ -469,6 +607,8 @@ class Rig:
 
     async def call(self, what: str, fn):
         """Run `fn()` (a zero-arg coroutine factory using self.arm/cam/gripper), reconnecting on a dropped link."""
+        if ESTOP["on"] and what not in READ_CALLS:
+            raise EStop(f"{what} not sent: {ESTOP_STATUS}")
         last = None
         for wait in (0.0,) + RETRY_BACKOFF_S:
             if wait:
@@ -487,13 +627,38 @@ class Rig:
                 return await asyncio.wait_for(fn(), CALL_TIMEOUT_S.get(what, 20.0))
             except Exception as e:
                 if not retryable(e):
+                    if isinstance(e, GRPCError):
+                        msg = str(e.message or e.status.name)
+                        if "emergency stop" in msg.lower():
+                            # A person stopped the arm: nothing more is sent, not even clear_error
+                            ESTOP.update(on=True, why=msg)
+                            print(f"  EMERGENCY STOP: {msg}; no arm commands until Reset")
+                            raise EStop(f"{what}: {msg}") from e
+                        # A collision stop leaves the xArm in an error state that refuses every later move (the
+                        # recovery lift too): clear it, so recover() can lift and put the object back
+                        # {VIAM CENTERAL 2026-10-29 "RECOVER 前先对 ARM 发 {'CLEAR_ERROR': TRUE}"}
+                        if "overcurrent" in msg or "clear_error" in msg:
+                            await self.clear_error()
+                        # Keep the arm's own words: "move refused: <planner message>"
+                        raise MoveRefused(f"{what} refused: {msg}") from e
                     raise
                 last = e
         raise RuntimeError(f"{what}: link still down after {len(RETRY_BACKOFF_S)} reconnects") from last
 
     async def pose(self):
         self.last_pose = await self.call("get pose", lambda: self.arm.get_end_position())
+        p = self.last_pose
+        self.at = {"x": p.x, "y": p.y, "z": p.z, "theta": p.theta}
         return self.last_pose
+
+    def record(self, phase: str, rgb: np.ndarray, **meta) -> None:
+        """Hand a frame already grabbed to the attempt recorder (no extra photos); never fails the motion."""
+        if self.on_frame is None:
+            return
+        try:
+            self.on_frame(phase, rgb, meta)
+        except Exception as e:
+            print(f"  recording failed: {e}")
 
     async def open(self) -> None:
         await self.call("open", lambda: self.gripper.open())
@@ -504,12 +669,14 @@ class Rig:
     async def holding(self) -> bool:
         return (await self.call("holding", lambda: self.gripper.is_holding_something())).is_holding_something
 
-    async def goto(self, x: float, y: float, z: float, theta: float = None) -> None:
+    async def goto(self, x: float, y: float, z: float, theta: float = None, settle: bool = True) -> None:
         """
         Move the flange to (x, y, z) with the tool pointing straight down.
 
         WHY: single choke point for limits. Refuses anything below the measured floor, outside reach,
         or a jump larger than MAX_STEP_MM, so a bad calculation raises instead of hitting the table.
+        settle=False skips the SETTLE_S wait: only for moves that no frame follows (descend to grab, lift,
+        intermediate travel legs); the wait exists for the camera's stale frame, not for the motion.
         """
         if z < max(self.floor_z, SANITY_MIN_Z):
             raise RuntimeError(f"refusing z={z:.0f} below floor {max(self.floor_z, SANITY_MIN_Z):.0f}")
@@ -517,20 +684,31 @@ class Rig:
             raise RuntimeError(f"refusing xy=({x:.0f},{y:.0f}) outside safe reach")
         p = await self.pose()
         if math.dist((p.x, p.y, p.z), (x, y, z)) > MAX_STEP_MM:
-            raise RuntimeError("refusing step larger than MAX_STEP_MM")
+            raise RuntimeError(f"refusing step larger than MAX_STEP_MM: ({p.x:.0f},{p.y:.0f},{p.z:.0f}) -> "
+                               f"({x:.0f},{y:.0f},{z:.0f})")
         if theta is not None:
             self.theta = theta
         target = Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=-1, theta=self.theta)
         await self.call("move", lambda: self.arm.move_to_position(target))
+        self.at = {"x": x, "y": y, "z": z, "theta": self.theta}
         # get_images() right after a move returns a stale frame; servo on stale frames diverged (68->142->297 px)
         # {LAGTEST 2026-10-29 "T+0S: BLOCK=(107, 475, 34)" "T+0.5S: BLOCK=(107, 496, 34)"}
         # [CONFIDENCE: CONFIRMED 90% — measured on sfhack4; 1 s gives margin over the observed ~0.5 s]
-        await asyncio.sleep(SETTLE_S)
+        if settle:
+            await asyncio.sleep(SETTLE_S)
 
     async def frame(self) -> tuple:
         res = await self.call("get images", lambda: self.cam.get_images())
         rgb, depth = decode(res[0] if isinstance(res, tuple) else res)
         self.last_depth = depth
+        if self.on_map_frame is not None and depth is not None and self.at is not None:
+            # Until the wrist-angle sign of the pixel->table map is verified on the arm, only theta-0 frames
+            # update the map: a wrong sign would mirror objects seen during the wrist-turned servo
+            if not MAP_ONLY_THETA0 or abs(self.at["theta"]) <= 1.0:
+                try:
+                    self.on_map_frame(rgb, depth, dict(self.at))
+                except Exception as e:
+                    print(f"  map update failed: {e}")
         return rgb, depth
 
     async def detect_depth_shift(self) -> None:
@@ -571,23 +749,59 @@ class Rig:
         """
         (flange z, table depth, object-top depth) at the current pose, and tighten the floor.
 
-        Floor: fingertips stop TIP_CLEARANCE above the table seen right now. `finder` locates the target
-        in colour so the matching depth blob is used.
+        Floor: fingertips stop TIP_CLEARANCE above the table under the jaws: the fitted table plane at the jaw-axis
+        pixel when that is higher than the frame's table depth (the table tilts ~6 mm across a frame). The silver box
+        cutter (14 mm tall) was grasped at the old floor, 8 mm over the frame's table, and the arm stopped with
+        "collision caused overcurrent". `finder` locates the target in colour so the matching depth blob is used.
         """
+        from sorter.perception import fit_table
+
         p = await self.pose()
         rgb, depth = await self.frame()
         if depth is None:
             raise RuntimeError("no depth map")
         table, top = table_and_near(depth, finder(rgb) if finder else None, shift=self.depth_shift)
-        self.floor_z = p.z - (table - TIP_BELOW_CAM - TIP_CLEARANCE)
+        a, b, c = fit_table(depth.astype(float))
+        au, av = axis_pixel(self.fx, self.fy, self.cx, self.cy, table)
+        if abs(p.z - ALIGN_Z) < 5.0:
+            self.tables.append(table)
+            del self.tables[:-5]
+        # Highest table of: this frame, the plane under the jaws, the median of the last 5 readings at ALIGN_Z (one
+        # frame read 378 instead of ~374 and the floor dropped 4 mm onto the table). Smaller depth = higher floor.
+        under = min(table, float(a * au + b * av + c), float(np.median(self.tables)) if self.tables else table)
+        self.floor_z = p.z - (under - TIP_BELOW_CAM - TIP_CLEARANCE)
         return p.z, table, top
 
-    async def lift(self) -> None:
-        """Straight up to ALIGN_Z; the safe response to any failure."""
-        p = await self.pose()
-        await self.goto(p.x, p.y, ALIGN_Z)
+    async def clear_error(self) -> None:
+        """Clear the xArm's error state (after a collision/overcurrent stop) so the next move is accepted; never fails."""
+        if ESTOP["on"]:
+            print("  clear_error not sent: the emergency stop is pressed")
+            return
+        try:
+            res = await asyncio.wait_for(self.arm.do_command({"clear_error": True}), 10.0)
+            print(f"  arm error cleared: {res}")
+        except Exception as e:
+            print(f"  clear_error failed: {type(e).__name__}: {e}")
 
-    async def servo(self, finder, use_top: bool, label: str, plane_at=None, offset=(0.0, 0.0)) -> None:
+    async def lift(self, settle: bool = True) -> None:
+        """Straight up to ALIGN_Z; the safe response to any failure."""
+        await self.rise(ALIGN_Z, settle=settle)
+
+    async def rise(self, z: float, settle: bool = True) -> None:
+        """
+        Straight up to z at the current xy, in steps the MAX_STEP_MM guard accepts (a rise from near the table to
+        ALIGN_Z can be longer than one step). Never sideways: after a collision the reset could not get back
+        ("refusing step larger than MAX_STEP_MM") and stayed at z 186 over the table.
+        {VIAM CENTERAL 2026-10-29 "RECOVER / BACK_TO_OBSERVE 从低位回去时，必须先竖直升到 ALIGN_Z"}
+        """
+        p = await self.pose()
+        cur = p.z
+        while cur < z - 0.5:
+            cur = min(z, cur + MAX_STEP_MM - 10.0)
+            await self.goto(p.x, p.y, cur, settle=settle and cur >= z - 0.5)
+
+    async def servo(self, finder, use_top: bool, label: str, plane_at=None, offset=(0.0, 0.0),
+                    blind_step: bool = True) -> None:
         """
         Bring the target found by `finder` onto the gripper axis, closed loop.
 
@@ -598,9 +812,13 @@ class Rig:
         `offset` (px): servo the target to axis pixel + offset instead, then make one open-loop move of
         J^-1 (-offset) with the last measured Jacobian. Used while carrying: the held object covers the
         bottom-right of the image, where the axis pixel is, so the square is aligned somewhere visible.
+        blind_step=False stops at the offset alignment (the caller picks the final spot from that view).
         """
-        J = None
+        J, probing, prev = None, not SERVO_MODEL_J, None  # prev: error before an uncapped model step
+        t_end = time.monotonic() + SERVO_MAX_S
         for it in range(8):
+            if time.monotonic() > t_end:
+                break
             p = await self.pose()
             rgb, depth = await self.frame()
             hit = finder(rgb)
@@ -615,58 +833,73 @@ class Rig:
             tu, tv = axis_pixel(self.fx, self.fy, self.cx, self.cy, plane)
             tu, tv = tu + offset[0], tv + offset[1]
             e = np.array([hit[0] - tu, hit[1] - tv])
-            print(f"  {label} iter {it}: px=({hit[0]:.0f},{hit[1]:.0f}) want=({tu:.0f},{tv:.0f}) depth={plane:.0f} err={np.linalg.norm(e):.0f}px")
-            if np.linalg.norm(e) < TOL_PX and (J is not None or not any(offset)):
-                if any(offset):
+            err = float(np.linalg.norm(e))
+            print(f"  {label} iter {it}: px=({hit[0]:.0f},{hit[1]:.0f}) want=({tu:.0f},{tv:.0f}) depth={plane:.0f} err={err:.0f}px")
+            self.record(label, rgb, iter=it, px=[round(hit[0]), round(hit[1])], want=[round(tu), round(tv)],
+                        err_px=round(err, 1), depth_mm=round(float(plane)))
+            # A model step that did not cut the error to < 30% means the model is off here: probe instead
+            if not probing and prev is not None and err > max(TOL_PX, 0.3 * prev):
+                print(f"  {label}: model Jacobian step left {err:.0f}px of {prev:.0f}px; probing from here")
+                probing = True
+            if not probing:
+                J = model_jacobian(self.fx, self.fy, self.cx, self.cy, p.theta, plane)
+            if err < TOL_PX and (J is not None or not any(offset)):
+                if any(offset) and blind_step:
                     # Final blind step from the visible alignment point onto the real axis pixel
                     move = np.linalg.solve(J, -np.array(offset, float))
                     print(f"  {label}: offset step ({move[0]:.0f},{move[1]:.0f}) mm")
                     await self.goto(p.x + move[0], p.y + move[1], p.z)
                 return
-            # Probe +15 mm along arm x then y, record how the target moves in the image
-            probe = 15.0
-            cols = []
-            for dx, dy in ((probe, 0.0), (0.0, probe)):
-                await self.goto(p.x + dx, p.y + dy, p.z)
-                h2 = finder((await self.frame())[0])
-                await self.goto(p.x, p.y, p.z)
-                if h2 is None:
-                    break
-                cols.append([(h2[0] - hit[0]) / probe, (h2[1] - hit[1]) / probe])
-            if len(cols) == 2:
-                J = np.array(cols).T  # px per mm, columns = arm x, arm y
-            elif J is None:
-                # A probe lost the target (the held object covered it): fall back to the nominal Jacobian,
-                # valid at wrist theta 0: arm +x moves the image +v, arm +y moves it +u, at f/depth px/mm
-                # {SHIFT TEST 2026-10-29 "+40 X: DU=0 DV=60" "+40 Y: DU=87 DV=-3"}
-                # [CONFIDENCE: CONFIRMED 80% — measured at another height; only the signs and rough scale matter]
-                if abs(self.theta) > 1.0:
-                    raise RuntimeError(f"{label}: lost during probe (no Jacobian at theta {self.theta:.0f})")
-                k = self.fx / plane
-                J = np.array([[0.0, k], [k, 0.0]])
-                print(f"  {label}: probe lost the target; using the nominal Jacobian")
-            # Arm move that cancels the pixel error (damped); the image moves by J @ move
-            move = np.linalg.solve(J, -e) * 0.85
+            if probing:
+                # Reusing one probed Jacobian made the servo oscillate on the arm (414 -> 476 -> 326 -> 372 ...
+                # px); fresh probes converged in 2-3 iterations. Probe +15 mm along arm x then y.
+                probe = 15.0
+                cols = []
+                for dx, dy in ((probe, 0.0), (0.0, probe)):
+                    await self.goto(p.x + dx, p.y + dy, p.z)
+                    h2 = finder((await self.frame())[0])
+                    await self.goto(p.x, p.y, p.z)
+                    if h2 is None:
+                        break
+                    cols.append([(h2[0] - hit[0]) / probe, (h2[1] - hit[1]) / probe])
+                if len(cols) == 2:
+                    J = np.array(cols).T  # px per mm, columns = arm x, arm y
+                elif J is None:
+                    # A probe lost the target (the held object covered it): the camera model's Jacobian
+                    J = model_jacobian(self.fx, self.fy, self.cx, self.cy, p.theta, plane)
+                    print(f"  {label}: probe lost the target; using the model Jacobian")
+            # Arm move that cancels the pixel error; the image moves by J @ move. A probed J is noisy (damped,
+            # short steps); the model J is exact up to calibration, so it goes the whole way in one move
+            gain, cap = (0.85, 60.0) if probing else (1.0, MODEL_STEP_CAP_MM)
+            try:
+                move = np.linalg.solve(J, -e) * gain
+            except np.linalg.LinAlgError:
+                # Degenerate probes (the target did not move between them): the camera model's Jacobian instead
+                J = model_jacobian(self.fx, self.fy, self.cx, self.cy, p.theta, plane)
+                move = np.linalg.solve(J, -e) * gain
             n = np.linalg.norm(move)
             # Cap each correction so one bad Jacobian cannot throw the target out of view
-            if n > 60:
-                move *= 60 / n
+            if n > cap:
+                move *= cap / n
+            # Only a full (uncapped) model step is expected to land; a capped one says nothing about the model
+            prev = err if n <= cap else None
             await self.goto(p.x + move[0], p.y + move[1], p.z)
-        raise RuntimeError(f"{label}: did not converge")
+        raise RuntimeError(f"{label}: did not converge (8 iterations or {SERVO_MAX_S:.0f} s)")
 
-    async def align_wrist(self, finder=find_block) -> None:
+    async def align_wrist(self, finder=find_block) -> bool:
         """
         Rotate the wrist so the block's long axis is vertical in the image (jaws close along image u).
 
         WHY: the finger axis was seen along image u, so the jaws then clamp across the block's short side.
         The sign of theta is not assumed: try one direction, keep it only if the angle error shrank.
+        Returns False when it was already aligned (no move: the caller's alignment still holds).
         """
         hit = finder((await self.frame())[0])
         if hit is None:
             raise RuntimeError("block: not visible for wrist alignment")
         err = ((90.0 - hit[2] + 90.0) % 180.0) - 90.0  # signed distance to vertical, in [-90, 90)
         if abs(err) < 4:
-            return
+            return False
         p = await self.pose()
         await self.goto(p.x, p.y, p.z, theta=self.theta + err)
         hit2 = finder((await self.frame())[0])
@@ -676,11 +909,14 @@ class Rig:
         print(f"  wrist: angle err {err:.0f} -> {err2:.0f}")
         if abs(err2) > abs(err) * 0.5:
             await self.goto(p.x, p.y, p.z, theta=self.theta - 2 * err)
+        return True
 
-    async def wait_clear(self, near_uv=None, timeout_s: float = 120.0) -> None:
+    async def wait_clear(self, near_uv=None, timeout_s: float = 300.0) -> None:
         """
         Pause while something reaches into the workspace near `near_uv`; resume after 2 s clear.
 
+        Status "paused_person"; after WAIT_TELL_S "waiting: something in front of the camera", so the dashboard says
+        what to do instead of the task just failing (the reset gave up after 120 s on the arm's own cable).
         Raises RuntimeError if it does not clear within timeout_s (the caller lifts and reports).
         """
         from sorter.perception import segment_full
@@ -688,7 +924,8 @@ class Rig:
         t0, clear_since, paused = time.monotonic(), None, False
         while True:
             rgb, depth = await self.frame()
-            busy = depth is not None and intruder(depth, near_uv)
+            why = intruder_why(depth, near_uv, rgb=rgb) if depth is not None else None
+            busy = why is not None
             if depth is not None and not busy:
                 # AGENT3's detector: skin-coloured blind holes / tall blobs reaching into the workspace
                 # Static tall things (the ~110 mm transparent cups read "blob 112 mm tall, skin 0%") are not
@@ -704,25 +941,48 @@ class Rig:
                     return
             else:
                 if not paused:
-                    print("  hand/arm in the workspace: pausing")
+                    print(f"  hand/arm in the workspace: pausing ({why or 'skin-coloured intruder'})")
                 paused, clear_since = True, None
-                self.status = "paused_person"
+                waited = time.monotonic() - t0
+                self.status = "paused_person" if waited < WAIT_TELL_S else "waiting: something in front of the camera"
             if time.monotonic() - t0 > timeout_s:
                 self.status = None
                 raise RuntimeError("workspace not clear for too long")
             await asyncio.sleep(0.5)
 
-    async def descend(self, z_target: float) -> None:
-        """Straight down in <=50 mm steps so a wrong target can be interrupted before contact."""
+    async def descend(self, z_target: float, settle: bool = True) -> None:
+        """
+        Straight down to z_target, in as few moves as MAX_STEP_MM allows (one, in practice).
+
+        Was 50 mm steps; the hand pause (wait_clear) runs before every descent and goto() still enforces the
+        measured floor, so the steps only added move/settle time. settle=False when a grab/release follows.
+        """
         p = await self.pose()
         z = p.z
         while z > z_target + 0.5:
-            z = max(z_target, z - 50.0)
-            await self.goto(p.x, p.y, z)
+            z = max(z_target, z - (MAX_STEP_MM - 10.0))
+            await self.goto(p.x, p.y, z, settle=settle and z <= z_target + 0.5)
 
 
 class PickFailed(RuntimeError):
     """The grab closed on nothing; the gripper has been opened and the arm lifted."""
+
+
+class TooClose(PickFailed):
+    """The object is too close to the arm base to reach down to; the arm did not descend."""
+
+
+# Below this flange distance from the base axis a grasp is refused up front: the green cube at r=198 mm had its
+# descent refused by the planner (seen as "link still down" before MoveRefused). Refusals at larger r are caught at
+# the descent and reported the same way when r < NEAR_BASE_R_MM, so the real limit can be read off the logs.
+# {VIAM CENTERAL 2026-10-29 "THE CUBE IS ~198 MM FROM THE BASE AXIS, SO THE DESCENT WAS MOST LIKELY AN IK / COLLISION REFUSAL"}
+# [CONFIDENCE: INFERRED 60% — one refusal at 198 mm; the boundary itself is not measured]
+MIN_GRASP_R_MM = 205.0
+NEAR_BASE_R_MM = 260.0
+
+
+def too_close_msg(x: float, y: float) -> str:
+    return f"too close to the arm base (r={math.hypot(x, y):.0f} mm), please move it out"
 
 
 def mark(times: dict, phase: str, t0: float) -> float:
@@ -732,27 +992,47 @@ def mark(times: dict, phase: str, t0: float) -> float:
     return now
 
 
-async def pick(rig: Rig, times: dict = None, finder=None) -> tuple:
+async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None, align: bool = True,
+               slipped=None) -> tuple:
     """
     Steps 1-2: align over the block, measure it, descend and grab. Returns (block height, grip depth).
 
     `times` receives seconds per phase (servo, descend, grab) and times["at"] names the phase in progress,
     so a caller can log where a failure happened. Raises PickFailed if the grab closes on nothing.
     `finder` picks which object (default: largest yellow blob; pass a Tracker when other yellow things
-    are on the table).
+    are on the table). Identity (optional coroutine factories -> (ok, why); a False refuses the pick rather
+    than grabbing something else): `verify` once, centred over the object at theta 0 where the whole object
+    is in view; `check` before every descent, after the wrist turn, where a long object is cut off by the
+    fingertips and only continuity can be judged. Before (2026-10-29) one full check ran before each descent
+    and refused the blue screwdriver it was centred on: at theta -50 only its handle was in view.
+    Descent: one straight move from ALIGN_Z to the grasp height measured there (CLOSE_SERVO False).
+    align=False: the caller already turned the wrist (executor.approach): keep that angle, no align_wrist, no
+    re-servo after it. The reset's wrist re-align turned the camera away and the tracker jumped to another object.
+    slipped(rgb, depth, pose) -> (bool, why): after the lift, from a frame at ALIGN_Z, is the object still lying where
+    it was picked? The G2's holding() stays True with the fingers stopped half-closed after the red box cutter slid
+    out, twice; the picture decides.
+    {VIAM CENTERAL 2026-10-29 "确认 RESET 真的走了 APPROACH 的一次 MOVE + OPEN-LOOP，不要再进 ALIGN"}
     """
     times = {} if times is None else times
     finder = finder or find_block
     t = time.monotonic()
     times["at"] = "servo"
+    rig.picked_at = None  # set again only by this pick's successful grab
     await rig.open()
     p = await rig.pose()
-    await rig.goto(p.x, p.y, ALIGN_Z, theta=0.0)
+    await rig.goto(p.x, p.y, ALIGN_Z, theta=None if not align else 0.0)
 
-    print("1/5 find + align over block")
+    print("1/5 find + align over block" if align else "1/5 refine over the target (wrist already turned)")
     await rig.servo(finder, True, "block")
-    await rig.align_wrist(finder)
-    await rig.servo(finder, True, "block")
+    if verify is not None:
+        # Centred at theta 0: the frame where the whole object is visible, so recognition is fair
+        ok, why = await verify()
+        print(f"  identity check: {why}")
+        if not ok:
+            raise PickFailed(f"lost the target, refusing to grab something else: {why}")
+    # Already turned (e.g. approach() applied the yaw with its move): no second servo needed
+    if align and await rig.align_wrist(finder):
+        await rig.servo(finder, True, "block")
     t = mark(times, "servo", t)
 
     print("2/5 measure + descend + grab")
@@ -765,32 +1045,87 @@ async def pick(rig: Rig, times: dict = None, finder=None) -> tuple:
         if not 10.0 <= height <= 80.0:
             raise RuntimeError(f"implausible block height {height:.0f} mm")
         grip = min(GRIP_DEPTH, height / 2)
+        if check is not None:
+            ok, why = await check()
+            print(f"  continuity check: {why}")
+            if not ok:
+                raise PickFailed(f"lost the target, refusing to grab something else: {why}")
         # Never descend into a hand: check the area the jaws are about to enter
         await rig.wait_clear(axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top))
-        # Close range re-alignment: fingertips APPROACH_GAP above the block top, where pixel offsets are larger
-        # and any error in the depth scaling of JAW_TIP_PX shrinks
-        z_mid = z0 - (top - TIP_BELOW_CAM - APPROACH_GAP)
-        print(f"  table={table:.0f}mm top={top:.0f}mm height={height:.0f}mm -> approach z={z_mid:.0f}")
-        await rig.descend(z_mid)
-        # Too close for the RealSense depth range (~280 mm min), so the block-top depth is carried over
-        # from the measurement above; straight vertical moves keep that relation exact
-        await rig.servo(finder, True, "block-close", plane_at=lambda z: top - (z0 - z))
+        print(f"  table={table:.0f}mm top={top:.0f}mm height={height:.0f}mm")
+        if CLOSE_SERVO:
+            # Close range re-alignment: fingertips APPROACH_GAP above the block top, where pixel offsets are
+            # larger and any error in the depth scaling of JAW_TIP_PX shrinks
+            z_mid = z0 - (top - TIP_BELOW_CAM - APPROACH_GAP)
+            print(f"  -> approach z={z_mid:.0f}")
+            await rig.descend(z_mid)
+            # Too close for the RealSense depth range (~280 mm min), so the block-top depth is carried over
+            # from the measurement above; straight vertical moves keep that relation exact
+            if hasattr(finder, "close_target"):
+                # Where the jaws point at this height: the tracker returns it when the close view cuts the object off
+                finder.close_target = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top - (z0 - z_mid))
+            await rig.servo(finder, True, "block-close", plane_at=lambda z: top - (z0 - z))
+        # Open loop from here: straight down the tool axis to the height measured at standoff.
         # Fingertips (TIP_BELOW_CAM past the camera) end `grip` below the block top
         z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
+        hard = MIN_GRASP_Z_THIN if height < THIN_MM else MIN_GRASP_Z
+        if z_grasp < hard:
+            print(f"  grasp z clamped to {hard:.0f} (hard floor{', thin object' if height < THIN_MM else ''}; "
+                  f"computed {z_grasp:.0f})")
+            z_grasp = hard
         print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
-        await rig.descend(z_grasp)
+        try:
+            await rig.descend(z_grasp, settle=False)  # the grab follows, no frame
+        except EStop:
+            raise
+        except MoveRefused as e:
+            # The planner refused the straight descent (the arm did not move): say why instead of retrying
+            q = await rig.pose()
+            await rig.lift()
+            if math.hypot(q.x, q.y) < NEAR_BASE_R_MM:
+                raise TooClose(f"{too_close_msg(q.x, q.y)} ({e})") from e
+            raise PickFailed(f"descent refused at ({q.x:.0f},{q.y:.0f}): {e}") from e
         t = mark(times, "descend", t)
 
         times["at"] = "grab"
         grabbed = await rig.grab()
         print(f"  grab {attempt}/{GRAB_TRIES} returned", grabbed)
         p = await rig.pose()
-        await rig.goto(p.x, p.y, ALIGN_Z)
+        if grabbed:
+            rig.picked_at = (p.x, p.y, rig.theta)
+        else:
+            # Open down here, where the object stands: if the holding sensor missed a thin object, it stays put
+            # instead of falling from ALIGN_Z
+            await rig.open()
+        # First 30 mm as a short, slow move (the fingers leave the table without a jerk), then up to ALIGN_Z.
+        # Holding: the carry follows (no frame). Missed: the re-servo's frame needs the settle
+        await rig.goto(p.x, p.y, min(p.z + 30.0, ALIGN_Z), settle=False)
+        await rig.goto(p.x, p.y, ALIGN_Z, settle=not grabbed or slipped is not None)
         t = mark(times, "grab", t)
         if grabbed:
+            # Held at the grab, gone after the lift: the red box cutter (16 mm, gripped by its top 3-4 mm) slipped
+            # and the reset went on to "place" an empty gripper. The caller's retry looks again.
+            # {VIAM CENTERAL 2026-10-29 "滑落检查改用画面 ... HOLDING() 只作为辅助"}
+            # The picture decides when there is one: the G2's holding() is wrong both ways (True with the knife
+            # gone, False with the blue block still held, which then dropped back into the square when opened)
+            held = await rig.holding()
+            if slipped is not None:
+                q = await rig.pose()
+                rgb, depth = await rig.frame()
+                gone, why = slipped(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
+                print(f"  after the lift: holding() {held}; picture: {why}")
+            else:
+                gone, why = not held, "the gripper reports nothing held"
+            if gone:
+                rig.picked_at = None
+                await rig.open()
+                raise ObjectLost(f"slipped out of the gripper during the lift ({why})")
+        if grabbed:
             break
-        # Missed (or the object was moved): open, re-align from the observation height, try again
-        await rig.open()
+        # Missed (or the object was moved): re-align from the observation height, try again
+        if hasattr(finder, "back_to_far"):
+            # Re-align against the last FAR sighting, never a close-range pixel (that pulled in the blue block)
+            finder.back_to_far()
         if attempt < GRAB_TRIES:
             times["at"] = "servo"
             await rig.servo(finder, True, "block")
@@ -809,16 +1144,17 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
     z1, table, _ = await rig.measure()
     await rig.wait_clear(axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table))
     # Block bottom hangs (height - grip) below the fingertips; release it PLACE_GAP above the table
-    z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z)
+    z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z, MIN_GRASP_Z)
     print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
-    await rig.descend(z_place)
+    await rig.descend(z_place, settle=False)  # the release follows, no frame
     await rig.open()
     save_state(False)
     if observe:
         # Free calibration data: the released block marks where the jaw axis really is
         await observe_release(rig, z1, table, height)
     q = await rig.pose()
-    await rig.goto(q.x, q.y, ALIGN_Z)
+    if q.z < ALIGN_Z - 1.0:  # observe_release already lifted there: no zero-length move + settle
+        await rig.goto(q.x, q.y, ALIGN_Z)
 
 
 async def locate_square(rig: Rig) -> tuple:
@@ -835,41 +1171,175 @@ async def locate_square(rig: Rig) -> tuple:
     return p.x, p.y
 
 
-async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None) -> None:
-    """
-    Steps 3-4: carry to the square, release over its hole (with calibration samples).
+TABLE_DEPTH_MM = 378.0  # camera -> table at ALIGN_Z (measured 373-379 across a frame)
 
-    With `square_xy` (from locate_square, empty gripper) go there and only refine by servo if the hole is
-    still seen; the paper may have been moved meanwhile, and then the servo follows it. Without it, search
-    and servo while holding (works when the held object does not hide the hole).
+
+def carry_look_xy(rig: Rig, xy: tuple) -> tuple:
+    """
+    Flange xy (ALIGN_Z, theta 0) where the table point `xy` (a hole centre estimate) appears at the carry-offset
+    pixel (axis pixel + CARRY_OFFSET_PX), clear of the held object: from the camera model, no probing.
+    """
+    J = model_jacobian(rig.fx, rig.fy, rig.cx, rig.cy, 0.0, TABLE_DEPTH_MM)
+    d = np.linalg.solve(J, np.array(CARRY_OFFSET_PX, float))
+    return xy[0] + float(d[0]), xy[1] + float(d[1])
+
+
+async def locate_square_carrying(rig: Rig, guesses: list = (), search_poses: list = None, confirm=None) -> tuple:
+    """
+    Leave the arm at ALIGN_Z, theta 0, with the square's FULL interior in view and its centre servoed onto the
+    carry-offset pixel; returns the flange xy over the hole centre. Raises SquareNotFound (still holding).
+
+    WHY (2026-10-29): the user moves the paper around ("WE NEED TO BE ABLE TO MOVE THIS AROUND"), at any rotation,
+    and the square may be seen only cut off by the image edge. So: each guess (a full centre from this task, then
+    a rough one such as the live map's partial square) gets ONE move to the pose that shows it at the carry-offset
+    pixel; a full, enclosed interior there is servoed. Otherwise search like search_and_find: `search_poses`
+    ((x, y, z), e.g. the executor's sweep poses) nearest-first, early exit at the first full view, then one move to
+    its carry-offset pose. The release only ever follows a full view of the interior from this function.
+    {VIAM CENTERAL 2026-10-29 "NEVER RELEASE UNLESS THE FULL INTERIOR WAS SEEN WITHIN THIS TASK"}
+    [CONFIDENCE: SINGLE-SRC 85% — coordinator's rule; find_square only accepts a tape-ringed hole not touching the border]
+    The hole centre is the enclosed region's centroid, the same at any rotation of the paper.
+    confirm(rgb, depth, pose) -> (square estimate or None, why) (the executor's drop_square check) replaces the
+    closed-interior test and its servo: with the blue block hanging in front and a knife across the interior the
+    interior never looked closed and three grasps ended SquareNotFound. The arm then stops at the guess's
+    carry-offset pose with the estimate confirmed; the release spot comes from that frame in table coordinates.
+    """
+    from sorter.perception import world_xy
+
+    if confirm is not None:
+        return await locate_by_estimate(rig, guesses, search_poses, confirm)
+
+    async def confirm() -> tuple:
+        # Full interior in view here: refine onto the carry-offset pixel, return the hole centre's flange xy
+        await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX, blind_step=False)
+        q = await rig.pose()
+        J = model_jacobian(rig.fx, rig.fy, rig.cx, rig.cy, q.theta, TABLE_DEPTH_MM)
+        d = np.linalg.solve(J, -np.array(CARRY_OFFSET_PX, float))
+        return q.x + float(d[0]), q.y + float(d[1])
+
+    for xy in guesses:
+        lx, ly = carry_look_xy(rig, xy)
+        if not reachable(lx, ly) or math.hypot(lx, ly) < 150.0:
+            continue
+        await travel(rig, lx, ly, theta=0.0)
+        if find_square((await rig.frame())[0]) is not None:
+            print(f"  square: full interior at the guess ({xy[0]:.0f},{xy[1]:.0f})")
+            return await confirm()
+        print(f"  square: not fully in view at the guess ({xy[0]:.0f},{xy[1]:.0f}); searching")
+    poses = list(search_poses or [(x, y, ALIGN_Z) for x, y in SEARCH_XY])
+    poses = [q for q in poses if reachable(*q) and math.hypot(q[0], q[1]) >= 150.0]
+    p = await rig.pose()
+    at = (p.x, p.y)
+    while poses:
+        # ALIGN_Z looks (the observe pose) before any z 580 one, nearest first within each
+        x, y, z = min(poses, key=lambda q: (q[2] > ALIGN_Z + 1, math.hypot(q[0] - at[0], q[1] - at[1])))
+        poses.remove((x, y, z))
+        at = (x, y)
+        await travel(rig, x, y, theta=0.0, z=z)
+        rgb, depth = await rig.frame()
+        hit = find_square(rgb)
+        if hit is None or depth is None:
+            continue
+        q = await rig.pose()
+        table, _ = table_and_near(depth)
+        xy = world_xy({"x": q.x, "y": q.y, "z": q.z, "theta": q.theta},
+                      {"fx": rig.fx, "fy": rig.fy, "cx": rig.cx, "cy": rig.cy}, hit[0], hit[1], table)
+        print(f"  square: full view from ({x:.0f},{y:.0f},{z:.0f}) -> centre ({xy[0]:.0f},{xy[1]:.0f})")
+        lx, ly = carry_look_xy(rig, xy)
+        if not reachable(lx, ly):
+            print(f"  square: its carry-offset pose ({lx:.0f},{ly:.0f}) is out of reach")
+            continue
+        await travel(rig, lx, ly, theta=0.0)
+        if find_square((await rig.frame())[0]) is not None:
+            return await confirm()
+    raise SquareNotFound("square: no full view of its interior anywhere on the table")
+
+
+async def locate_by_estimate(rig: Rig, guesses: list, search_poses: list, confirm) -> tuple:
+    """locate_square_carrying with confirm(): guesses, then the early-exit search; returns the square's centre xy."""
+    async def look() -> dict:
+        q = await rig.pose()
+        rgb, depth = await rig.frame()
+        sq, why = confirm(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
+        print(f"  square: {why}")
+        return sq
+
+    async def go(xy) -> bool:
+        lx, ly = carry_look_xy(rig, xy)
+        if not reachable(lx, ly) or math.hypot(lx, ly) < 150.0:
+            return False
+        await travel(rig, lx, ly, theta=0.0)
+        return True
+
+    for xy in guesses:
+        if await go(xy):
+            sq = await look()
+            if sq is not None:
+                return tuple(sq["xy"])
+    poses = list(search_poses or [(x, y, ALIGN_Z) for x, y in SEARCH_XY])
+    poses = [q for q in poses if reachable(*q) and math.hypot(q[0], q[1]) >= 150.0]
+    p = await rig.pose()
+    at = (p.x, p.y)
+    while poses:
+        x, y, z = min(poses, key=lambda q: (q[2] > ALIGN_Z + 1, math.hypot(q[0] - at[0], q[1] - at[1])))
+        poses.remove((x, y, z))
+        at = (x, y)
+        await travel(rig, x, y, theta=0.0, z=z)
+        sq = await look()
+        if sq is not None and await go(sq["xy"]):
+            sq2 = await look()
+            if sq2 is not None:
+                return tuple(sq2["xy"])
+    raise SquareNotFound("square: no view of it that confirms its full interior")
+
+
+async def place_in_square(rig: Rig, height: float, grip: float, times: dict = None, square_xy=None,
+                          choose_spot=None, more_guesses: list = (), search_poses: list = None,
+                          confirm=None) -> tuple:
+    """
+    Steps 3-4: carry to the square, release in its hole; returns the flange xy over the hole's centre.
+
+    locate_square_carrying() with the guesses square_xy (a full centre: a frame of this task) then more_guesses
+    (recent sightings, newest first, e.g. the live map's partial square), then the search; it never returns without a full
+    view of the interior, so nothing is released at an old or guessed spot (before 2026-10-29 an unseen hole at
+    square_xy still got the release there). Raises (still holding) if the hole is nowhere.
+    `choose_spot(rgb, depth, pose) -> (flange xy or None, why)` (the executor's free-spot finder) picks the release
+    point from the carry-offset view, where the hole is clear of the held object; None raises SquareFull (still
+    holding). The blue screwdriver was put down on the yellow block already in the hole (2026-10-29). Without it
+    the release goes to the hole's centre.
     """
     times = {} if times is None else times
     t = time.monotonic()
     print("3/5 carry to the blue square")
     times["at"] = "carry"
-    if square_xy is not None:
-        # Wrist back to 0 so the nominal Jacobian holds if a probe loses the square behind the held object
-        await travel(rig, *square_xy, theta=0.0)
-        if find_square((await rig.frame())[0]):
-            try:
-                await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX)
-            except RuntimeError as e:
-                print(f"  refine skipped ({e}); placing at the located square")
-                await travel(rig, *square_xy)
-    else:
-        # The square is on paper that people move around: never assume where it is
+    guesses = [g for g in [square_xy, *more_guesses] if g is not None]
+    centre = await locate_square_carrying(rig, guesses, search_poses, confirm)
+    spot = centre
+    if choose_spot is not None:
         q = await rig.pose()
-        await rig.goto(q.x, q.y, ALIGN_Z, theta=0.0)
-        await search_square(rig)
-        await rig.servo(find_square, False, "square", offset=CARRY_OFFSET_PX)
+        rgb, depth = await rig.frame()
+        spot, why = choose_spot(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
+        rig.record("square-spot", rgb, spot=None if spot is None else [round(spot[0]), round(spot[1])], why=why)
+        print(f"  drop spot in the square: {why}")
+        if spot is None:
+            raise SquareFull(f"square is full, clear it first ({why})")
+    await travel(rig, *spot, theta=0.0)
     t = mark(times, "carry", t)
 
     if not await rig.holding():
         raise ObjectLost("object no longer in the gripper during the carry")
     print("4/5 lower + release")
     times["at"] = "place"
-    await release_here(rig, height, grip, observe=True)
+    await release_here(rig, height, grip)
     mark(times, "place", t)
+    return centre
+
+
+class SquareNotFound(RuntimeError):
+    """No full view of the square's interior anywhere on the table; still holding the object."""
+
+
+class SquareFull(RuntimeError):
+    """No free part of the square's interior fits the held object; still holding it."""
 
 
 # Observation points for finding the square, flange x/y mm, inside the reach the arm has used safely
@@ -877,6 +1347,11 @@ SEARCH_XY = [(x, y) for x in (250.0, 380.0, 500.0) for y in (-300.0, -150.0, 0.0
              if 150.0 <= math.hypot(x, y) <= 600.0]
 SQUARE_CLEAR_PX = 145.0  # ~60 mm at the 378 mm observe depth (~2.4 px/mm)
 SPOT_MIN_H_MM = 4.0  # anything this far above the fitted table plane occupies a drop spot
+# One clearance radius for the live check (spot_free) and the survey map (survey_scan): ~83 mm at the 378 mm
+# table depth = block half-length ~45 mm + ~40 mm gap. They differed (220 vs 150 px), so the survey offered
+# spots the live check had to reject.
+SPOT_CLEAR_PX = 200.0
+REJECTED_DIR = Path(__file__).resolve().parent.parent / "data" / "scan" / "rejected"
 
 
 # Horizontal reach of the tool around the flange axis: camera body ~85 mm out (cam frame -83, 14) plus its
@@ -955,7 +1430,7 @@ def near_square(rgb: np.ndarray, uv, radius: float = SQUARE_CLEAR_PX) -> bool:
     return bool(((blue | paper) & disk).sum() > 400)
 
 
-def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = 220.0) -> tuple:
+def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = SPOT_CLEAR_PX) -> tuple:
     """
     (free?, reason) for putting an object down where pixel `uv` meets the table.
 
@@ -996,6 +1471,20 @@ def spot_free(rgb: np.ndarray, depth: np.ndarray, uv, radius: float = 220.0) -> 
     return True, "clear"
 
 
+def save_rejected(rgb: np.ndarray, depth: np.ndarray, uv, x: float, y: float, why: str) -> None:
+    """Keep the frame of a refused drop spot (jpg + depth + json) so a false rejection can be inspected."""
+    import json
+
+    try:
+        REJECTED_DIR.mkdir(parents=True, exist_ok=True)
+        stem = REJECTED_DIR / time.strftime("%H%M%S")
+        Image.fromarray(rgb).save(f"{stem}.jpg", quality=85)
+        np.save(f"{stem}_depth.npy", np.clip(depth, 0, 65535).astype(np.uint16))
+        Path(f"{stem}.json").write_text(json.dumps({"xy": [x, y], "uv": [float(uv[0]), float(uv[1])], "why": why}))
+    except OSError as e:
+        print(f"  could not save rejected spot frame: {e}")
+
+
 async def search_square(rig: Rig) -> None:
     """
     Leave the arm at ALIGN_Z with the whole tape hole in view; raise if it is nowhere on the table.
@@ -1018,25 +1507,59 @@ async def search_square(rig: Rig) -> None:
     raise RuntimeError("square: not found anywhere on the table")
 
 
-async def travel(rig: Rig, x: float, y: float, theta: float = None) -> None:
-    """Move at ALIGN_Z to (x, y) in legs short enough for the MAX_STEP_MM guard."""
+# Horizontal flange reach by height: the black tape grasp at r ~573 mm could not rise to z 580 ("zero IK solutions"),
+# while (400, +-180, 580) (r 439) and every z 400 pose out to r ~560 were reached. Linear between the two heights.
+# {VIAM CENTERAL 2026-10-29 "GOALPOSE {X:499.9 Y:282.2 Z:580 ...} -> ZERO IK SOLUTIONS PRODUCED"}
+# [CONFIDENCE: INFERRED 65% — one refusal at 574 mm / z 580; the true envelope is not measured]
+REACH_R_MM = ((ALIGN_Z, 600.0), (580.0, 470.0))
+
+
+def reachable(x: float, y: float, z: float = ALIGN_Z) -> bool:
+    """Flange (x, y) within the horizontal reach at height z (REACH_R_MM), outside keep-outs."""
+    (z0, r0), (z1, r1) = REACH_R_MM
+    r_max = r0 if z <= z0 else r1 if z >= z1 else r0 + (r1 - r0) * (z - z0) / (z1 - z0)
+    return allowed(x, y) and math.hypot(x, y) <= r_max
+
+
+async def travel(rig: Rig, x: float, y: float, theta: float = None, z: float = ALIGN_Z, settle: bool = True) -> None:
+    """
+    Move to (x, y) at height z (default ALIGN_Z) in legs short enough for the MAX_STEP_MM guard.
+
+    Order of the height change: from below ALIGN_Z straight up first (never sweep low over objects); going DOWN,
+    at the start xy, then across; going UP, across at the current height, then up at the target xy. The black tape
+    carry rose at its grasp xy (r ~573 mm) to z 580 and the planner had no IK solution; the target (a sweep pose)
+    is reachable high, the far grasp xy is not. {VIAM CENTERAL 2026-10-29 "上升时在目标 XY 升；下降时在起点 XY 降"}
+    Only the last move waits SETTLE_S (and only with settle=True): no frame follows the others.
+    """
     if not allowed(x, y):
         raise RuntimeError(f"refusing ({x:.0f},{y:.0f}): inside an obstacle keep-out zone")
+    if not reachable(x, y, z):
+        raise MoveRefused(f"refusing ({x:.0f},{y:.0f},{z:.0f}): beyond the arm's reach at that height")
     p = await rig.pose()
-    if p.z < ALIGN_Z - 1:
-        await rig.goto(p.x, p.y, ALIGN_Z)
+    cur = p.z
+    if cur < min(z, ALIGN_Z) - 1:
+        cur = min(z, ALIGN_Z)
+        await rig.rise(cur, settle=False)
+    if z < cur - 1:
+        cur = z
+        await rig.goto(p.x, p.y, cur, settle=False)
+    rise = z > cur + 1
     legs = max(1, math.ceil(math.hypot(x - p.x, y - p.y) / 200.0))
     for i in range(1, legs + 1):
-        await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, ALIGN_Z, theta=theta)
+        await rig.goto(p.x + (x - p.x) * i / legs, p.y + (y - p.y) * i / legs, cur, theta=theta,
+                       settle=settle and i == legs and not rise)
+    if rise:
+        await rig.goto(x, y, z, theta=theta, settle=settle)
 
 
-async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> bool:
+async def place_at(rig: Rig, x: float, y: float, height: float, grip: float, clear_mm: float = None) -> bool:
     """
     Put the held block down at flange (x, y) if the spot is clear; False (still holding, at ALIGN_Z) if not.
 
     WHY: self-reset for unattended trials, so each run starts from a new spot without a person.
-    "Clear" = no depth blob 10-80 mm above the table near where the jaw axis meets the table. The held
-    block itself is closer than the RealSense minimum range (~280 mm) at ALIGN_Z, so it reads as invalid.
+    "Clear" = spot_free() within `clear_mm` of where the jaw axis meets the table (default SPOT_CLEAR_PX,
+    ~83 mm); the held block itself is closer than the RealSense minimum range at ALIGN_Z, so it reads as
+    invalid. Every look is recorded (phase "drop") so a reset's clip shows where it tried and why it refused.
     """
     await travel(rig, x, y)
     rgb, depth = await rig.frame()
@@ -1044,10 +1567,12 @@ async def place_at(rig: Rig, x: float, y: float, height: float, grip: float) -> 
         return False
     table, _ = table_and_near(depth)
     hint = axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table)
-    # ~220 px is ~90 mm at ALIGN_Z: keeps the open jaws (84 mm stroke) clear of neighbours
-    free, why = spot_free(rgb, depth, hint)
+    radius = SPOT_CLEAR_PX if clear_mm is None else clear_mm * rig.fx / table
+    free, why = spot_free(rgb, depth, hint, radius=radius)
+    rig.record("drop", rgb, xy=[round(x), round(y)], radius_px=round(radius), free=free, why=why)
     if not free:
         print(f"  spot ({x:.0f},{y:.0f}) not free: {why}")
+        save_rejected(rgb, depth, hint, x, y, why)
         return False
     await release_here(rig, height, grip)
     return True

@@ -44,6 +44,7 @@ sys.path.insert(0, str(ROOT))
 from sorter.store import Store  # noqa: E402
 
 RESET_COMMAND = "__reset__"  # EXEC_PLAN "Clear square" button; executed by the arm worker
+SCAN_COMMAND = "__scan__"  # "Scan table" button: the module scans the whole table into its live map (module mode)
 MAX_TEXT = 200
 PREVIEW_HIGHLIGHT_S = 15.0
 STALE_S = 5.0  # camera state older than this means the camera process is down or restarting
@@ -221,7 +222,8 @@ def _pick_frame():
 
 @app.get("/")
 def index():
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
+    # no-cache: after a dashboard restart with new code, a plain reload must show it (a cached page did not)
+    return FileResponse(Path(__file__).parent / "static" / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/status")
@@ -290,7 +292,8 @@ def _sync_module_cmds() -> None:
         if last and same:
             c.update(status=last.get("status") or "done", finished=last.get("finished"), attempt_id=last.get("_id"),
                      fail_reason=last.get("fail_reason") or last.get("error"), duration_s=last.get("duration_s"),
-                     chosen={"label": last.get("label"), "score": last.get("score")} if last.get("label") else None)
+                     chosen={"label": last.get("label"), "colour": last.get("colour"), "score": last.get("score")}
+                     if last.get("label") or last.get("colour") else None)
 
 
 async def module_call(command: dict) -> dict:
@@ -350,22 +353,27 @@ def objects():
 async def add_command(body: TextIn):
     """Queue mode: Store command for a worker. Module mode: DoCommand on the module, which runs it in the background."""
     text = body.text.strip()
-    text = RESET_COMMAND if text == RESET_COMMAND else _clean(text)
+    text = text if text in (RESET_COMMAND, SCAN_COMMAND) else _clean(text)
     if not MODULE_MODE:
+        if text == SCAN_COMMAND:
+            raise HTTPException(400, "Scan table needs the Viam module (DASH_COMMAND_PATH=module)")
         return {"id": store.add_command(text)}
     entry = {"_id": uuid.uuid4().hex, "text": text, "ts": time.time(), "status": "sending"}
     module_cmds.appendleft(entry)
     try:
-        res = await module_call({"reset": True} if text == RESET_COMMAND else {"grasp": text})
+        res = await module_call({"reset": True} if text == RESET_COMMAND else {"scan_table": True}
+                                if text == SCAN_COMMAND else {"grasp": text})
     except HTTPException as e:
         entry.update(status="error", fail_reason=e.detail)
         raise
     entry["decide_ms"] = res.get("decide_ms")
+    _set_map_highlight(res, text)
     if res.get("accepted"):
         target = res.get("target") or {}
         entry.update(status="running", job=res.get("job"),
-                     chosen={"label": target.get("label"), "score": target.get("score")} if target else None)
-    elif res.get("status") in ("not_found", "ambiguous"):
+                     chosen={"label": target.get("label"), "colour": target.get("colour"), "score": target.get("score")}
+                     if target else None)
+    elif res.get("status") in ("not_found", "ambiguous", "already_in_square"):
         # Always-ready module answers at once from its cached frame: nothing started, here is why
         entry.update(status=res["status"], fail_reason=res.get("reason"))
     else:
@@ -399,6 +407,7 @@ async def preview(body: TextIn):
             t = res["target"]
             (CAM_DIR / "module_highlight.json").write_text(json.dumps(
                 {"id": t.get("id"), "text": text, "score": t.get("score"), "until": time.time() + PREVIEW_HIGHLIGHT_S}))
+        _set_map_highlight(res, text)
         return {"module": res}
     try:
         objs = [SimpleNamespace(**o) for o in pickle.loads((CAM_DIR / "objs.pkl").read_bytes())]
@@ -418,6 +427,72 @@ async def preview(body: TextIn):
     hl = {"id": best.id, "text": text, "score": float(score), "until": time.time() + PREVIEW_HIGHLIGHT_S}
     (CAM_DIR / "highlight.json").write_text(json.dumps(hl))
     return [{"id": o.id, "score": float(s)} for o, s in ranked]
+
+
+MAP_HIGHLIGHT_S = 20.0
+_map_highlight = {}  # {"text", "label", "xy", "until"}: the object the last preview / grasp resolved to
+
+
+def _set_map_highlight(res: dict, text: str) -> None:
+    """Remember what a module answer pointed at (map xy or recognised label), to ring it on the table map."""
+    target = res.get("target") or {}
+    xy, label = res.get("target_xy"), res.get("label") or target.get("label")
+    # Every new answer replaces the ring: a miss ("ghost" not found) must not leave the previous hit ringed
+    _map_highlight.clear()
+    if res.get("ok") is not False and (xy or label):
+        _map_highlight.update(text=text, label=label, xy=xy, until=time.time() + MAP_HIGHLIGHT_S)
+
+
+@app.get("/api/table_map")
+def table_map():
+    """
+    Top-down table view: the live table map (objects with table xy and age, no embeddings), each object's last
+    sighting, and sweep progress. Module mode: from the module (via the robot link), ages on the robot's clock.
+    """
+    if MODULE_MODE:
+        try:
+            d = json.loads((CAM_DIR / "module_table_map.json").read_text())
+        except (FileNotFoundError, ValueError):
+            d = {}
+        since = time.time() - d.get("fetched_at", time.time())  # keep ages counting between fetches
+        robot_now = (d.get("now") or time.time()) + since
+        m = d.get("map") or None
+        sightings = d.get("sightings") or []
+        running = ((_module_state().get("status") or {}).get("running") or {})
+        sweep = running.get("sweep") or None
+        search = {**running["search"], "text": running.get("text")} if running.get("search") else None
+        n_obs, live = d.get("observations"), d.get("live")
+    else:
+        m, sightings, robot_now = store.get_table_map(with_emb=False), store.list_sightings(), time.time()
+        sweep = next((w.get("sweep") for w in workers() if w.get("online") and w.get("sweep")), None)
+        search, n_obs, live = None, store.observation_stats()["count"], None
+    if m:
+        m["age_s"] = round(robot_now - (m.get("ts") or robot_now), 1)
+        # Live map: each object's own age (seen_ts); an older map without it -> the map's age for all
+        for o in m.get("objects") or []:
+            o["age_s"] = round(robot_now - (o.get("seen_ts") or m.get("ts") or robot_now), 1)
+        if m.get("swept_ts"):
+            m["swept_s_ago"] = round(robot_now - m["swept_ts"], 1)
+        if m.get("cleared_ts"):
+            m["cleared_s_ago"] = round(robot_now - m["cleared_ts"], 1)
+    for s in sightings:
+        s["age_s"] = round(robot_now - (s.get("ts") or robot_now), 1)
+    hl = dict(_map_highlight) if _map_highlight.get("until", 0) > time.time() else None
+    return {"map": m, "sightings": sightings, "sweep": sweep, "search": search, "reach_mm": [120, 650], "highlight": hl,
+            "observations": n_obs, "live": live}
+
+
+@app.post("/api/clear_map")
+async def clear_map():
+    """
+    "Clear map" button: someone rearranged the table. Module mode: DoCommand clear_map (live map, sightings and
+    the cached frame; old ones to the Store's history). Queue mode: the same on the Store directly.
+    """
+    _map_highlight.clear()
+    if MODULE_MODE:
+        return {"module": await module_call({"clear_map": True, "reason": "dashboard Clear map"})}
+    empty = store.clear_table_map("dashboard Clear map")
+    return {"ok": True, "cleared_objects": empty["cleared_objects"], "cleared_sightings": store.clear_sightings()}
 
 
 @app.get("/api/labels")

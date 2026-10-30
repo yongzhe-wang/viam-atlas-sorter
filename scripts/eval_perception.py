@@ -11,12 +11,16 @@ Usage (data in data/eval/, gitignored):
   eval_perception.py label NAME 0="green square" 2=cup missed=1
   eval_perception.py report [--store] [--absent "green square" ...]
   eval_perception.py demo                    rehearsal queries (docs/demo_queries.md) on arm-scan frames
+  eval_perception.py sweep                   AGENT1's high sweep frames (kind sweep_test): timing, map, queries
+  eval_perception.py square                  drop square per frame (whole or border-cut) vs full-view truth
+  eval_perception.py recog                   library recognition, leave-one-frame-out, per label + confusions
 Env for capture: VIAM_MACHINE_ADDRESS, VIAM_API_KEY_ID, VIAM_API_KEY.
 """
 import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -98,10 +102,18 @@ def label(name: str, args: list) -> None:
 # Rehearsal queries (docs/demo_queries.md): (query, label the pick must be recognised as or None = must refuse,
 # arm-scan frames where the target is fully visible at z=400)
 DEMO = [("grasp green square", "green cube", ["033", "034", "035"]),
-        ("pick up the yellow block", "yellow block", ["006", "007", "036", "038"]),
+        # 006/007 dropped: the block is cut by the bottom edge there (an old fingertip mask hid that)
+        ("pick up the yellow block", "yellow block", ["036", "038", "066", "073"]),
         ("trick or treat: candy", "kind bar", ["014", "015", "035"]),
         ("the blue cylinder", "blue cylinder", ["010", "011", "012"]),
-        ("red ball", None, ["032", "035", "036"])]
+        ("red ball", None, ["032", "035", "036"]),
+        # Knives (frames 077-088); 088 (z 580) has both, so "utility knife" / "box cutter" must not pick the red one
+        ("grab the utility knife", "utility knife", ["081", "083", "088"]),
+        ("box cutter", "utility knife", ["082", "088"]),
+        ("pick up the red knife", "red knife", ["085", "087", "088"]),
+        # The user's own wording in the live test; "red box cutter" must not drift to the silver one's "box cutter"
+        ("silver box cutter", "utility knife", ["081", "083", "088"]),
+        ("red box cutter", "red knife", ["085", "087", "088"])]
 
 
 def demo() -> None:
@@ -138,6 +150,43 @@ def demo() -> None:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"demo queries: {passed}/{total} passed")
+
+
+def sweep() -> None:
+    """
+    Evaluate AGENT1's high sweep frames (json "kind": "sweep_test"): per-frame timing and recognition per height,
+    then one table map from the z=500 frames and the demo queries on it.
+
+    WHY: the library views were all taken ~378 mm from the table; at z 480-550 objects are smaller, so recognition
+    confidence can drop. The sweep frames are not in the library, so this is a fair test.
+    """
+    from sorter import table_map
+    from sorter.store import Store
+
+    scan = EVAL.parent / "scan"
+    ids = sorted(p.stem for p in scan.glob("*.json")
+                 if isinstance(m := json.loads(p.read_text()), dict) and m.get("kind") == "sweep_test" and not m.get("skipped"))
+    if not ids:
+        sys.exit("no sweep_test frames in data/scan yet")
+    store = Store()
+    frames = table_map.load_scan_frames(ids)
+    clip_embed.embed_images([np.zeros((50, 50, 3), np.uint8)])  # warm the model so timings are steady-state
+    for f in frames:
+        t = time.perf_counter()
+        recs = clip_embed.recognise_all(f["rgb"], f["depth"], store)
+        ms = (time.perf_counter() - t) * 1000
+        print(f"{f['id']} z={f['pose']['z']:.0f}: {ms:.0f} ms, " + ", ".join(
+            f"{r['label'] or '?'}({r['obj'].height_mm:.0f}mm {r['score']:.2f})" for r in recs))
+    z500 = [f for f in frames if abs(f["pose"]["z"] - 500) < 15] or frames
+    m = table_map.map_from_frames(z500, store)
+    print(f"map from {len(z500)} frames: {len(m['objects'])} objects, {sum(1 for o in m['objects'] if o['label'])} "
+          f"recognised, per frame {m['timing_ms']} ms")
+    for o in sorted((o for o in m["objects"] if o["label"]), key=lambda o: o["label"]):
+        print(f"   {o['label']:18} xy=({o['xy'][0]:.0f},{o['xy'][1]:.0f}) conf={o['score']:.2f} frames={o['frame_ids']}")
+    for q, want, _ in DEMO + [("blue screwdriver", "blue screwdriver", []), ("red screwdriver", "red screwdriver", [])]:
+        b = table_map.best_on_map(m, q, store)
+        got = b["map_obj"]["label"] if b["map_obj"] else None
+        print(f"  {q!r:28} -> {got} {'OK' if got == want else 'MISS'} {b['reason']}")
 
 
 def report(use_store: bool, absent: list) -> None:
@@ -186,6 +235,100 @@ def report(use_store: bool, absent: list) -> None:
         print(f"top-1 ({m}): {hits[m]}/{n_q} = {hits[m] / max(n_q, 1):.0%}")
 
 
+def recog() -> None:
+    """
+    Library recognition, leave-one-frame-out: every view with a frame is recognised (clip_embed.recognise, the real
+    colour / height rules) against the views of all other frames. Prints accuracy per label and the confusions.
+
+    WHY: the height filter decides which labels can win at all (a lying cylinder is 30 mm tall, a standing one 60),
+    so any change to it is checked here on every labelled sighting, not only on the demo queries.
+    """
+    rows = [json.loads(line) for line in (EVAL.parent / "views.jsonl").read_text().splitlines() if line.strip()]
+    rows = [r for r in rows if r.get("embedding")]
+    E = np.asarray([r["embedding"] for r in rows], float)
+    E /= np.linalg.norm(E, axis=1, keepdims=True)
+
+    class _Others:
+        """search_views over the views of other frames only (Store scale: (1 + cos) / 2)."""
+
+        def __init__(self, frame):
+            self.keep = np.array([(r.get("frame") or r.get("obs_ts")) != frame for r in rows])
+
+        def search_views(self, emb, k=8, label=None):
+            s = (1 + E @ (np.asarray(emb, float) / np.linalg.norm(emb))) / 2
+            s[~self.keep] = -1
+            return [{**{k2: v for k2, v in rows[i].items() if k2 != "embedding"}, "score": float(s[i])}
+                    for i in np.argsort(-s)[:k] if s[i] >= 0]
+
+    per, wrong = {}, {}
+    for i, r in enumerate(rows):
+        frame = r.get("frame") or r.get("obs_ts")  # views from the observation log have the record's ts instead
+        if not frame:
+            continue
+        lab, _, _ = clip_embed.recognise(E[i], _Others(frame), colour=r.get("colour"), height_mm=r.get("height_mm"))
+        ok = per.setdefault(r["label"], [0, 0])
+        ok[0] += lab == r["label"]
+        ok[1] += 1
+        if lab != r["label"]:
+            wrong[(r["label"], lab)] = wrong.get((r["label"], lab), 0) + 1
+    tot = [sum(v[0] for v in per.values()), sum(v[1] for v in per.values())]
+    for lab, (a, n) in sorted(per.items()):
+        print(f"  {lab:18s} {a:3d}/{n:<3d}")
+    print("  confusions:", ", ".join(f"{a} -> {b}: {n}" for (a, b), n in sorted(wrong.items(), key=lambda t: -t[1])) or "none")
+    print(f"recognition (leave-one-frame-out): {tot[0]}/{tot[1]} = {tot[0] / max(tot[1], 1):.1%}")
+
+
+def square() -> None:
+    """
+    The drop square on every arm-scan frame that sees it: each view alone, and all views folded in time order.
+
+    WHY: the user moves the paper freely, so a border-cut view must still place the whole square; this measures how
+    far each single view's estimate is from the truth. Truth per placement of the paper ("era": the fold restarted,
+    i.e. the paper moved or turned) = median of that era's views that saw all four tape edges.
+    """
+    import math
+
+    from sorter import drop_square
+
+    scan = EVAL.parent / "scan"
+    recs = []
+    for pj in sorted(scan.glob("[0-9][0-9][0-9].json")):
+        meta = json.loads(pj.read_text())
+        if not isinstance(meta, dict) or "pose" not in meta:
+            continue
+        rgb = np.asarray(Image.open(pj.with_suffix(".jpg")).convert("RGB"))
+        hit = perception.find_drop_square(rgb, np.load(scan / f"{pj.stem}_depth.npy"))
+        if hit:
+            intr = {**perception.INTRINSICS, **meta.get("intrinsics", {})}
+            recs.append((meta.get("ts", 0.0), pj.stem, drop_square.observe(hit, meta["pose"], intr), meta["pose"]))
+    recs.sort()
+    # Fold in time order; an era is one placement of the paper (drop_square restarts on a move/turn: since_ts)
+    sq, eras, folded = None, {}, {}
+    for ts, n, r, _ in recs:
+        sq = drop_square.update(sq, r, ts)
+        eras[n], folded[n] = sq["since_ts"], dict(sq)
+    single = {n: drop_square.update(None, r, ts) for ts, n, r, _ in recs}
+    truth = {}
+    for e in set(eras.values()):
+        full = [single[n]["xy"] for n in eras if eras[n] == e and not single[n]["partial"]]
+        truth[e] = tuple(np.median(full, axis=0)) if full else None
+    errs = []
+    print(f"{'frame':5} {'pose':>22} {'sides':8} {'conf':>4} {'yaw':>6} {'single-view xy':>16} {'err':>5}  {'folded xy':>16} {'err':>5}")
+    for ts, n, r, pose in recs:
+        s, f, t = single[n], folded[n], truth[eras[n]]
+        e1 = math.dist(s["xy"], t) if t else float("nan")
+        e2 = math.dist(f["xy"], t) if t else float("nan")
+        if s["partial"] and t:
+            errs.append(e1)
+        print(f"{n:5} ({pose['x']:4.0f},{pose['y']:5.0f},{pose['z']:3.0f},{pose['theta']:+4.0f}) {''.join(sorted(s['sides'])):8} "
+              f"{s['confidence']:4.2f} {s['yaw_deg']:+6.1f} {str(s['xy']):>16} {e1:5.1f}  {str(f['xy']):>16} {e2:5.1f}"
+              f"{'' if s['partial'] else '  (full view)'}")
+    for e, t in sorted(truth.items()):
+        print(f"era since ts {e:.0f}: truth {np.round(t, 1).tolist() if t else None} from the full views")
+    if errs:
+        print(f"partial single views: {len(errs)}, centre error median {np.median(errs):.1f} mm, max {max(errs):.1f} mm")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "capture":
@@ -196,6 +339,12 @@ if __name__ == "__main__":
         label(sys.argv[2], sys.argv[3:])
     elif cmd == "demo":
         demo()
+    elif cmd == "sweep":
+        sweep()
+    elif cmd == "square":
+        square()
+    elif cmd == "recog":
+        recog()
     elif cmd == "report":
         # report [--store] [--absent "green square" ...]
         rest = sys.argv[2:]

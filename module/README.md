@@ -78,9 +78,60 @@ await sorter.do_command({"reset": True})                    # empty the square (
   that target or answers immediately `{"ok": false, "status": "not_found", "reason": "no 'pumpkin' on the table"}`.
   Otherwise, for example right after a move, it falls back to the executor's own observe (`"why_slow"`).
   `{"seen_image": true}` returns that frame as a small base64 JPEG with the boxes scaled to it.
+- **Live table map** (`module/live_map.py`): every picture the module sees updates one in-memory map through
+  `sorter/table_map.py`'s `update_map` (AGENT3: negative evidence drops what is gone; `partial` = seen only cut by
+  a picture's edge, position approximate). Sources:
+  - idle frames, passed with their `seg` and `recognise_all` output, so the update costs about 40 ms;
+  - executor frames through AGENT1's `Rig.on_map_frame` hook, with the pose each frame was taken at and the
+    executor phase as source. Outside a sweep at most one per second; theta 0 only while
+    `ppa.MAP_ONLY_THETA0`;
+  - every sweep frame, none dropped, applied while the arm moves on.
+
+  One update runs at a time in a worker thread, and a newer frame replaces one still waiting, so a slow update
+  only drops pictures and never holds up the arm. The map is saved with `Store.put_table_map` at most every 2 s.
+  It is **never** loaded back: every module start begins with an empty map, because the table may have changed
+  while the module was down. The old map and the sightings move to the Store's history (logs, Atlas), never to
+  finding. `{"clear_map": true}` (dashboard **Clear map**) does the same on demand when someone rearranges the
+  table; it is refused while a job runs. `{"status": true}` → `"map"` reports objects, `updates`, `dropped` and `last_ms`.
+  Sweep frames are also saved by the executor under `$VIAM_MODULE_DATA/data/sweeps` (the module sets
+  `SORTER_DATA_DIR`). Only the newest 30 sweeps (about 8 MB each) are kept.
+- **Observation log** (user: "all data should be saved to continuously form the map"): every frame folded into the
+  live map is appended with `Store.log_observation`. The record is `update_map`'s own
+  `last_update["observation"]`, unchanged (AGENT3: ts, source, pose, intrinsics, detections with embeddings,
+  square, intruders, depth-validity grid), plus epoch and map version. `table_map.fold_observations` replays it
+  to the same map as live; `module/selftest_map.py` checks that on every build. Next to each record go a JPEG of
+  at most 640 px and a 320×180 16-bit depth PNG, kept for the dashboard and debugging. An idle picture enters
+  the map, and so the log, only when what it shows changed (labels, box centres, intruders), or every 20 s:
+  a still table no longer writes a record a second. Records go to `$VIAM_MODULE_DATA/data/observations/<YYYYMMDD>/`;
+  with Atlas, also to `observations` (images to `observation_images` up to `SORTER_OBS_ATLAS_MB`, default 300).
+  Nothing is ever deleted by Clear map or a restart: they only move the map's epoch. `{"rebuild_map": {"since":
+  ts}}` folds the log since `ts` (default: the epoch) back into the live map with AGENT3's
+  `table_map.fold_observations`, e.g. after a crash. When free disk drops under 5 GB, the images of the oldest idle
+  frames are removed first; their records stay, and search, grasp and sweep frames are never thinned.
+  `{"status": true}` → `"observations"` gives `count`, `bytes` and `free_bytes`. To read the log off the robot
+  (e.g. to make library views from its frames), use the read-only
+  `{"observations": {"since": ts, "until": ts, "images": false, "limit": 200, "source": "idle"}}`. It returns
+  the records as logged, oldest first; with `images`, each record also carries `jpeg_b64` and `depth_png_b64`.
+  A page holds at most 200 records (40 with images) and 3 MB, and `"more"` plus `"next_since"` page on. It never
+  touches the map, a job or the arm, and it answers while busy.
+- **Finding objects anywhere on the table**: a grasp starts picking at once, with no scan first (the user's
+  rule: "just search, and if found just start grasp; do NOT have an initial step").
+  1. Cached idle frame shows it → go.
+  2. The live map saw it within the last 60 s → AGENT1's `search_and_find` looks there first
+     (`"remembered at (x, y) on the table map, seen N s ago · looking there first"`).
+  3. Otherwise → it searches the table pose by pose.
+
+  The search stops at the first view whose match is accepted and the pick starts right there. Status
+  `running.search` = `{k, n, path, found}`: "searching… view k/N", then "found at view k, grasping". Immediate
+  answers come only for two equal matches in the cached frame, or an object already in the drop square.
+  `{"scan_table": true}` (dashboard **Scan table**) scans the whole table into the live map, and only when asked
+  (progress `pose k/N`). The idle loop also records each recognised object's last-seen table position
+  (`Store.log_sighting`). `{"table_map": true}` returns the live map (each object with `seen_ts`), the sightings
+  and the scan / search progress for the dashboard.
 - One job at a time. A request while busy returns `{"accepted": false, "error": "busy", "running": {...}}`.
 - Summaries contain `status` (`done`, `failed`, `not_found`, `ambiguous` = two objects match about equally,
-  `too_wide`, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
+  `already_in_square` = the named object is only in the drop square (answered at once, no sweep), `too_wide`,
+  `too_close` = too near the arm base, please move it out, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
 - A hand or arm reaching into the workspace pauses the robot; it resumes 2 s after the workspace is clear.
 
 From our web dashboard (no Atlas needed): start it with `DASH_COMMAND_PATH=module` (and `DASH_MODULE_NAME` if
@@ -157,14 +208,35 @@ Then set `MONGODB_URI` for the module. Charts: `dashboard/CHARTS.md`. The live d
 
 ```bash
 sh module/build.sh                                    # -> module/dist/archive.tar.gz (run.sh + meta.json at its root)
+PYTHON=.venv/bin/python sh module/build.sh            # same, plus the import check (needs viam-sdk in that Python)
 ```
 
 The archive must contain `meta.json`: `viam module reload-local` rejects a local tarball without one ("local
 tarballs must contain a meta.json with the 'entrypoint' field"). `build.sh` copies it in.
 
+Every build ends with `module/check_archive.py`, which unpacks the archive into a temp dir and fails the build when
+the module could not start from it. It checks:
+- `meta.json` and an executable entrypoint;
+- `requirements.txt`;
+- that every project import in the shipped `.py` files names a shipped file;
+- that no macOS `._*` metadata files are included;
+- with viam-sdk in `$PYTHON`, that `import module.main` works from the unpacked copy;
+- with numpy and Pillow there too, `module/selftest_map.py` from the copy. It runs the shipped live map on the
+  shipped `table_map.update_map` (real segmentation on a synthetic frame) for a just-started and a just-cleared
+  map. On sfhack4 a hand-made empty map once failed every update with `KeyError: 'next_id'`; this catches that.
+
+`build.sh` also lists any uncommitted changes under `module/`, `sorter/` and `scripts/` that go into the archive.
+It packs the working tree, so another agent's half-done edit would otherwise ship unnoticed.
+
+A tarball once shipped without `module/live_map.py` and died on the robot with "ModuleNotFoundError: No module
+named 'module.live_map'"; this check now fails such a build first.
+
 First start on a robot: `run.sh` creates a virtualenv in `$VIAM_MODULE_DATA/venv` (kept across module
-versions), installs **CPU-only** torch from `https://download.pytorch.org/whl/cpu` (the default Linux wheel pulls
-more than 2 GB of CUDA libraries), then `requirements.txt`. On our robot (sfhack4, linux/amd64) this took about
+versions), installs **CPU-only** torch and torchvision as a pair from `https://download.pytorch.org/whl/cpu` (the
+default Linux wheel pulls more than 2 GB of CUDA libraries; a torchvision from PyPI does not match that torch and
+CLIP dies on import with `operator torchvision::nms does not exist`), then `requirements.txt`. Before marking the
+venv installed it imports torch, torchvision and open_clip and runs `torchvision.ops.nms`; if that fails, `run.sh`
+exits with the installed versions on stderr and installs again on the next start. On our robot (sfhack4, linux/amd64) this took about
 10 minutes before the service came up. Restarts and redeploys reuse that venv; it is reinstalled only when
 `requirements.txt` changes (the install marker is keyed on its hash). If viam-server gives up waiting on the
 first start, run `./run.sh` once by hand on the robot.
@@ -177,6 +249,10 @@ generic service `sorter`, and `{"status": true}` returns `{"busy": false, "store
 viam login
 viam module reload-local --file module/dist/archive.tar.gz --part-id <machine-part-id> --model-name sorter-team:sorter:grasp-by-description --resource-name sorter
 ```
+
+Right after a viam-server restart, the CLI path (`reload-local`, `upload` to the machine) can fail for about
+10 minutes with "host appears to be offline" from signaling. During that time the SDK still reaches the machine
+over the LAN, so the robot is fine: wait and retry, rather than restarting it again.
 
 Before publishing, create the module under your registry namespace (Viam app → org Settings → public
 namespace, or the CLI), then put that namespace in **both** `meta.json` (`module_id`, `models[].model`) and

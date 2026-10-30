@@ -41,10 +41,22 @@ SHAPE_BONUS = 0.02  # "long"/"stick" vs footprint aspect; the only shape cue tha
 # [CONFIDENCE: CONFIRMED 75% — 10 clean groups, 100 sightings; see label_scan held-out test]
 KNN_MIN = 0.88  # a view at least this close counts as "same object"
 VIEW_DH_MM = 15.0  # ... and its height within this of the object's
+# Objects that rest in two poses: a cylinder is ~30 mm tall lying (its diameter) and 59-61 mm standing (its length).
+# A view of these labels also admits an object at the other pose's height: the green cylinder slid off during a
+# carry, lay at 30 mm and every standing view (60-62 mm) was filtered out, leaving only the green cube's (29-33 mm).
+# {VIAM CENTERAL 2026-10-29 "CYLINDER 类同时接受直径高度和长度高度（29 和 61 MM 都算）"; LYING NPZ "GREEN H= 30.4 … 61X28MM";
+#  STANDING FOOTPRINT 076 "BLUE H=62 FOOTPRINT 31X28 MM"} [CONFIDENCE: CONFIRMED 80% — eval_perception recog/demo]
+POSE_HEIGHTS_MM = {"green cylinder": (30.0, 61.0), "yellow cylinder": (30.0, 59.0), "blue cylinder": (30.0, 61.0)}
 # Vote weight by view source: phone close-ups are oblique, the wrist camera looks straight down
 SOURCE_WEIGHT = {"phone": 0.5}
 LABEL_BONUS = 0.15  # object recognised as something the query names
 LABEL_PENALTY = 0.10  # object recognised as something else
+# Query is exactly one of the object's names, not just contained in one: "utility knife" is the silver knife's
+# label but is also contained in the red one's "red utility knife" (same for "box cutter"); without this both get
+# LABEL_BONUS and the pick is a coin flip between two look-alike knives. Bare "knife" names neither exactly.
+# {USER VIA VIAM CENTERAL "I ADDED THE KNIVES, INCLUDE THOSE TOO"; ALIASES SILVER "UTILITY KNIFE", RED "RED UTILITY KNIFE"}
+# [CONFIDENCE: INFERRED 80% — 0.05 > AMBIGUOUS_MARGIN and above the CLIP gap between the two knives]
+EXACT_NAME_BONUS = 0.05
 # Below this the best crop is not really what was asked for. On frame t01 the correct objects scored
 # 0.27-0.35 while "green square" (no green object present) topped out at 0.203 on a laptop key.
 # [CONFIDENCE: SINGLE-SRC 60% — one frame, 6 objects; re-tune on the scanned set]
@@ -54,9 +66,24 @@ AMBIGUOUS_MARGIN = 0.02  # top-1 minus top-2 below this: let the user confirm in
 _model = _preprocess = _tokenizer = None
 
 
+COLOUR_PRESENT_FRAC = 0.10  # blue screwdriver 0.33-0.38 blue, red one 0.31 red; stray hue on black objects <= 0.06
+
+
 def colour_ok(query_colours: set, obj_colour: str) -> bool:
     """True if the object's colour is one a person could call by any of the query's colour words."""
     return any(obj_colour in COMPATIBLE.get(c, {c}) for c in query_colours)
+
+
+def colour_present(query_colours: set, obj) -> bool:
+    """
+    The query's colour is the object's dominant colour, or makes up >= COLOUR_PRESENT_FRAC of it.
+
+    WHY: both screwdrivers are dominantly "black" (handles); only the secondary colour tells "blue screwdriver"
+    from "red screwdriver". Objects without colour shares (older records) fall back to the dominant colour.
+    """
+    shares = getattr(obj, "colours", None) or {}
+    return colour_ok(query_colours, obj.colour) or any(
+        f >= COLOUR_PRESENT_FRAC and colour_ok(query_colours, c) for c, f in shares.items())
 
 
 def _load():
@@ -137,7 +164,8 @@ def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm:
 
     Views closer than KNN_MIN vote with their score (phone views at reduced weight), but only if their stored
     colour and height (when present) agree with the object's: CLIP alone confuses same-shape objects of a
-    different colour or height. names = the winning label plus every alias seen.
+    different colour or height. A label with two resting poses (POSE_HEIGHTS_MM) accepts either pose's height.
+    names = the winning label plus every alias seen.
     """
     votes, names = {}, {}
     for v in store.search_views(emb, k=k):
@@ -145,7 +173,8 @@ def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm:
             continue
         if colour and v.get("colour") and not (colour_ok({colour}, v["colour"]) or colour_ok({v["colour"]}, colour)):
             continue
-        if height_mm is not None and v.get("height_mm") is not None and abs(v["height_mm"] - height_mm) > VIEW_DH_MM:
+        if height_mm is not None and v.get("height_mm") is not None and not any(
+                abs(h - height_mm) <= VIEW_DH_MM for h in (v["height_mm"], *POSE_HEIGHTS_MM.get(v["label"], ()))):
             continue
         votes[v["label"]] = votes.get(v["label"], 0.0) + v["score"] * SOURCE_WEIGHT.get(v.get("source"), 1.0)
         names.setdefault(v["label"], {v["label"]}).update(v.get("aliases") or [])
@@ -155,25 +184,28 @@ def recognise(emb: np.ndarray, store, k: int = 8, colour: str = None, height_mm:
     return lab, sorted(names[lab]), votes[lab] / k
 
 
-def recognise_all(rgb: np.ndarray, depth: np.ndarray, store=None, seg=None) -> list:
+def recognise_all(rgb: np.ndarray, depth: np.ndarray, store=None, seg=None, include_partial: bool = False) -> list:
     """
-    Every target in one frame with its library label: [{"obj", "label", "names", "score", "emb"}, ...].
+    Every target in one frame with its library label: [{"obj", "label", "names", "score", "emb", "partial"}, ...].
 
     WHY: the module's idle loop recognises the table about once a second, and a grasp command should not
     embed the crops again. One CLIP batch covers all crops; pass the result to best(..., recognised=...).
     `seg`: a perception.segment_full() result the caller already has (e.g. to check intruders first).
+    `include_partial`: also recognise objects cut by the image edge (partial=True; never grasp candidates, but the
+    dynamic map uses them: a moved KIND bar was only ever seen cut at the edge and otherwise fell off the map).
     label/names are None/[] when the object is not recognised (or there is no store); score = vote confidence.
     """
     from sorter import perception
 
     seg = seg if seg is not None else perception.segment_full(rgb, depth)
-    embs = embed_images([o.crop for o in seg.objects])
+    objs = [(o, False) for o in seg.objects] + ([(o, True) for o, _ in seg.excluded] if include_partial else [])
+    embs = embed_images([o.crop for o, _ in objs])
     out = []
-    for o, e in zip(seg.objects, embs):
+    for (o, partial), e in zip(objs, embs):
         lab, names, conf = (recognise(e, store, colour=o.colour, height_mm=o.height_mm) if store is not None
                             else (None, [], 0.0))
         o.recognised, o.recognised_names = lab, names
-        out.append({"obj": o, "label": lab, "names": names, "score": conf, "emb": e})
+        out.append({"obj": o, "label": lab, "names": names, "score": conf, "emb": e, "partial": partial})
     return out
 
 
@@ -261,7 +293,7 @@ def rank(objs: list, text: str, store=None, recognised: list = None) -> list:
     for o, emb, s in zip(objs, img, sims):
         score = float(s)
         if qcol:
-            if colour_ok(qcol, o.colour):
+            if colour_present(qcol, o):
                 score += COLOUR_BONUS
             elif o.colour in COLOURS - {"grey", "white", "black"}:
                 score -= COLOUR_PENALTY
@@ -276,6 +308,9 @@ def rank(objs: list, text: str, store=None, recognised: list = None) -> list:
             o.recognised, o.recognised_names = lab, names
             if lab is not None:
                 score += LABEL_BONUS if name_matches(q, names) else -LABEL_PENALTY
+                # Exact name beats a name that merely contains the query (see EXACT_NAME_BONUS)
+                if _words(q) and any(_words(q) == _words(n) for n in names):
+                    score += EXACT_NAME_BONUS
         out.append((o, score))
     return sorted(out, key=lambda t: -t[1])
 
@@ -298,7 +333,9 @@ def best(objs: list, text: str, store=None, recognised: list = None, rgb: np.nda
     object found" and "best candidate is recognised as 'yellow cylinder'" are both searchable refusals.
     """
     if objs is None:
-        objs = [r["obj"] for r in recognised or []]
+        # Partly visible (edge-cut) objects are never grasp candidates: their geometry is incomplete
+        recognised = [r for r in recognised or [] if not r.get("partial")]
+        objs = [r["obj"] for r in recognised]
     known = store is not None and any(name_matches(text, n) for n in library_names(store))
     r = rank(objs, text, store, recognised)
     if not r:
@@ -311,9 +348,9 @@ def best(objs: list, text: str, store=None, recognised: list = None, rgb: np.nda
     # The library knows this query ("candy" is an alias of the KIND bar): then only an object recognised as it
     # may be picked. Without this, "candy" with the bar out of view picked an unrecognised cup fragment.
     named = o.recognised is not None and name_matches(text, o.recognised_names)
-    # Recognised as exactly what was named beats the dominant-colour heuristic: the blue screwdriver's handle is
-    # mostly black, and "blue screwdriver" was refused with "no blue object found" while recognised at 0.98
-    if qcol and not colour_ok(qcol, o.colour) and not named:
+    # Colour by presence, not dominance: the blue screwdriver is dominantly black but 0.38 blue, and the red one
+    # (0.31 red, no blue) once got recognised as "blue screwdriver" on the table map; presence rejects that one
+    if qcol and not colour_present(qcol, o):
         out["reason"] = f"no {'/'.join(sorted(qcol))} object found"
     elif o.recognised is not None and not named:
         out["reason"] = f"best candidate is recognised as {o.recognised!r}"
