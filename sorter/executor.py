@@ -366,6 +366,11 @@ async def under_jaws(rig, primitive: str = None) -> tuple:
     return (under if under is not None and off_axis(under) <= 80.0 else None), objs, pose
 
 
+def area_like(ref: dict, ratio: float) -> bool:
+    """Is a footprint `ratio` times the reference's area still that object? (CONT_AREA; a merged one may show as a piece)"""
+    return (MERGED_AREA_MIN if ref.get("merged") else CONT_AREA[0]) <= ratio <= CONT_AREA[1]
+
+
 def near_any(xy, points: list, mm: float = 40.0) -> bool:
     """True if table point xy is within mm of any of `points`."""
     return any(math.hypot(xy[0] - p[0], xy[1] - p[1]) <= mm for p in points)
@@ -377,9 +382,12 @@ def footprint(rig, o, pose: dict) -> dict:
     xy = perception.world_xy(pose, intr(rig), gu, gv, o.top_depth_mm)
     return {"xy": (float(xy[0]), float(xy[1])),
             "area": float(o.mask.sum()) * (o.top_depth_mm / perception.REF_TABLE_DEPTH_MM) ** 2,
-            "colour": getattr(o, "colour", None)}
+            "colour": getattr(o, "colour", None), "merged": getattr(o, "n_fragments", 1) > 1}
 
 
+# A merged object's frame may show only one piece of it (perception joins them frame by frame): the bottle's label alone
+# is 0.21 of the whole, and the slip check read a bottle still lying there as "nothing like it left"
+MERGED_AREA_MIN = 0.1
 SLIP_XY_MM = 40.0  # the picked object counts as still lying there within this of where it was picked
 
 
@@ -399,7 +407,8 @@ def still_on_table(rig, tracker, rgb: np.ndarray, depth: np.ndarray, pose: dict)
         now = footprint(rig, o, pose)
         d = math.hypot(now["xy"][0] - ref["xy"][0], now["xy"][1] - ref["xy"][1])
         ratio = now["area"] / max(ref["area"], 1.0)
-        if d <= SLIP_XY_MM and CONT_AREA[0] <= ratio <= CONT_AREA[1] and ref.get("colour") in (None, o.colour):
+        # A piece of a merged object need not have the colour of the whole
+        if d <= SLIP_XY_MM and area_like(ref, ratio) and (ref.get("merged") or ref.get("colour") in (None, o.colour)):
             return True, f"a {o.colour} object of the same size still lies {d:.0f} mm from the pick point"
     return False, "nothing like it left at the pick point"
 
@@ -423,7 +432,7 @@ async def still_target(rig, text: str, store, tracker) -> tuple:
         now = footprint(rig, under, pose)
         d = math.hypot(now["xy"][0] - ref["xy"][0], now["xy"][1] - ref["xy"][1])
         ratio = now["area"] / max(ref["area"], 1.0)
-        if d <= CONT_XY_MM and CONT_AREA[0] <= ratio <= CONT_AREA[1]:
+        if d <= CONT_XY_MM and area_like(ref, ratio):
             return True, f"same object under the jaws ({d:.0f} mm from the verified spot, area x{ratio:.2f})"
         why = f"object under the jaws {d:.0f} mm from the verified spot, area x{ratio:.2f}"
     ok, why2 = identity(under, objs, text, store)
@@ -961,8 +970,8 @@ def square_in_observe_view(rig, sq: dict) -> bool:
 
 
 def width_mm(obj, fx: float) -> float:
-    """Object width across the jaws (short side) in mm, from pixels at its top-surface depth."""
-    return obj.width_px * obj.top_depth_mm / fx
+    """Object width across the jaws (short side) in mm, from pixels at its top-surface depth (grasp.across_mm)."""
+    return grasp.across_mm(obj, fx)
 
 
 # Something in front of the colour lens only (the arm's cable hanging across the view, 2026-10-29): the colour image
@@ -1379,6 +1388,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
             emb = embedding_of(found, obj)
             if emb is not None:
                 doc["embedding"] = emb
+            rig.picked_obj = obj  # the module's learn-from-grasp (sorter/teach.py) keeps the crop that found it
     except ppa.EStop:
         # A person pressed the emergency stop: no recover, no retries, no move back
         doc.update(status="estop", fail_phase=times.get("at", "start"), fail_reason=ppa.ESTOP_STATUS)

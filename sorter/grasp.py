@@ -229,7 +229,7 @@ def choose_primitives(o, fx: float, depth: np.ndarray = None) -> list:
     `depth`: its frame's, for what the mask alone cannot tell (lying_round).
     """
     mm = o.top_depth_mm / fx
-    length, width = o.length_px * mm, o.width_px * mm
+    length, width = o.length_px * mm, across_mm(o, fx)
     if ring_geometry(o) is not None:
         # A ring's outside width does not matter: it is not gripped across it
         inside = enabled() and INSIDE_MIN_ID_MM <= ring_inner_mm(o, fx) <= INSIDE_MAX_ID_MM
@@ -247,32 +247,51 @@ def choose_primitives(o, fx: float, depth: np.ndarray = None) -> list:
     return ["top"]
 
 
-def section_centre(o, u: float, v: float) -> tuple:
+def on_long_axis(o, u: float, v: float) -> tuple:
     """
-    The middle of the object's mask across its short axis, through (u, v) (stays there if that is off the mask).
+    (u, v) moved across the object onto its long axis (through the whole silhouette's centroid), its place along it kept.
 
     WHY: a body as wide as the bottle leaves each finger ~7 mm when centred. The label's top centroid is ~4 mm off the
     body's midline, which left one finger ~3 mm, about what the servo may still be off by (TOL_PX), and the finger check
-    refused it at 3 mm off to that side. A section can only be centred by its silhouette: the sides have no depth.
+    refused it at 3 mm off to that side. The mask's middle along one row is no better: 687 at row 320, 671 at row 360.
     {VIAM CENTERAL 2026-10-30 "瓶身余量只有每边约 8 MM（84 − 67），REFINE 对不准就拒绝"}
-    [CONFIDENCE: INFERRED 75% — measured on bottle/centered.npz; the silhouette is taken as symmetric about the body]
+    [CONFIDENCE: INFERRED 80% — on bottle/centered.npz the fingers are clear from -7 to +4 mm off; label centre -5 to +6]
     """
     a = math.radians(o.yaw_deg)
-    du, dv = math.sin(a), math.cos(a)
-    h, w = o.mask.shape
+    al = np.array([math.cos(a), -math.sin(a)])
+    c = np.array(o.centroid_px, float)
+    foot = c + float((np.array([u, v], float) - c) @ al) * al
+    return float(foot[0]), float(foot[1])
 
-    def run(sign: float) -> float:
-        t = 0.0
-        while True:
-            x, y = int(round(u + sign * (t + 1.0) * du)), int(round(v + sign * (t + 1.0) * dv))
-            if not (0 <= y < h and 0 <= x < w and o.mask[y, x]):
-                return t
-            t += 1.0
 
-    if not (0 <= int(v) < h and 0 <= int(u) < w and o.mask[int(v), int(u)]):
-        return u, v
-    shift = (run(1.0) - run(-1.0)) / 2.0
-    return u + shift * du, v + shift * dv
+def section_extent(o, u: float, v: float, band_px: float = 15.0):
+    """
+    (min, max) px of the object's mask across its short axis, relative to (u, v), within band_px along its long axis;
+    None if the mask has nothing there. A band and not a line: a see-through body's mask has notches along a single line
+    (164 px at the bottle's label, whose bbox is 187 px).
+    """
+    a = math.radians(o.yaw_deg)
+    vs, us = np.nonzero(o.mask)
+    along = (us - u) * math.cos(a) - (vs - v) * math.sin(a)
+    t = ((us - u) * math.sin(a) + (vs - v) * math.cos(a))[np.abs(along) <= band_px]
+    return (float(t.min()), float(t.max())) if t.size else None
+
+
+def across_mm(o, fx: float) -> float:
+    """
+    The object's width across the jaws, mm. A merged see-through object (perception's MERGE_FRAGMENTS): the silhouette at
+    the grip, at the depth of its equator (where its outline is), if wider: the shape-based width reads the 67 mm bottle as
+    60 mm, and the fingers must clear the real one.
+    {VIAM CENTERAL 2026-10-30 "WIDTH_MM(OBJ) 约 60，而实物是 67：判断 MAX_OPEN 和手指余量时要用实物宽度"}
+    [CONFIDENCE: INFERRED 75% — checked on one bottle frame only]
+    """
+    width = o.width_px * o.top_depth_mm / fx
+    if getattr(o, "n_fragments", 1) <= 1:
+        return width
+    ext = section_extent(o, *(o.top_centroid_px or o.centroid_px))
+    if ext is None:
+        return width
+    return max(width, (ext[1] - ext[0]) * (o.top_depth_mm + o.height_mm / 2.0) / fx)
 
 
 def target_px(primitive, o, pose: dict, k: dict, wall_mm: float = None) -> tuple:
@@ -290,7 +309,7 @@ def target_px(primitive, o, pose: dict, k: dict, wall_mm: float = None) -> tuple
         return along_axis(o, pose, k, *o.centroid_px)
     u, v, yaw = grasp_px(o, pose, k, wall_mm)
     if primitive == "lying_round":
-        u, v = section_centre(o, u, v)
+        u, v = on_long_axis(o, u, v)
     return u, v, yaw
 
 
