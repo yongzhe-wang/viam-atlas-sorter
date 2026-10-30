@@ -26,6 +26,8 @@ from viam.proto.common import Pose  # noqa: E402
 from viam.utils import dict_to_struct, struct_to_dict  # noqa: E402
 
 import module.sorter_service as svc  # noqa: E402
+from module.grasp_policy import Delivered  # noqa: E402
+from sorter.clip_embed import name_matches  # noqa: E402
 from sorter.worker import clean  # noqa: E402
 
 H, W = 720, 1280
@@ -76,7 +78,7 @@ RT = SimpleNamespace(
     executor=SimpleNamespace(execute=execute, back_to_observe=None, clear_square=None, hole_mask=lambda rgb, depth=None: None),
     clean=clean, perception=SimpleNamespace(segment_full=lambda rgb, d: SimpleNamespace(objects=[CUBE], intruders=[])),
     clip_embed=SimpleNamespace(
-        embed_text=lambda t: np.zeros(512), embed_images=lambda c: np.zeros((len(c), 512)), best=best,
+        embed_text=lambda t: np.zeros(512), embed_images=lambda c: np.zeros((len(c), 512)), best=best, name_matches=name_matches,
         recognise_all=lambda rgb, depth, store=None, seg=None: [{"obj": CUBE, "label": "green square", "names": [], "score": 0.9, "emb": None}]),
     table_map=SimpleNamespace(empty_map=lambda: {"ts": time.time(), "objects": [], "next_id": 0, "last_update": None},
                               best_on_map=best_on_map, update_map=lambda m, *a, **k: m or {"objects": []}))
@@ -121,6 +123,8 @@ async def main():
     s.store.list_labels = lambda: [["blue screwdriver"], ["red screwdriver"], ["black tape", "tape"], ["kind bar", "snack bar"],
                                    ["blue and black screwdriver"]]
     assert await wait_for(lambda: s.warm)
+    # Steps 1-10 test the list's mechanics on a table where every object stays: nothing goes into the bucket memory
+    remember, s.in_bucket.add = s.in_bucket.add, lambda *a, **k: None
 
     # The single path is what it was
     for raw, text in (("grasp the green square", "the green square"), ("pumpkin", "pumpkin"), ("i want tape", "tape"),
@@ -249,7 +253,49 @@ async def main():
     assert "items" not in r
     await s.job
     print("10. more than 5 -> the first 5, the rest reported as ignored; repeats and empty parts dropped")
+
+    # Into the bucket: the bucket is cut out of the picture, so the object leaves the map; asked again -> answered at once
+    # {VIAM CENTERAL 2026-10-30 "已经投进桶、并且 MAP 上没再看到它 → 回答 ALREADY_IN_BUCKET，算 DONE，不动 ARM"}
+    s.in_bucket.add = remember
+    s.live.map = {"ts": time.time(), "objects": [MAP["remembered"]]}
+    calls.clear()
+    r = await s.do_command({"grasp": "tape", "wait": True})
+    assert r["status"] == "done" and len(calls) == 1
+    for ask in ("tape", "the black tape"):
+        r = await s.do_command({"grasp": ask})
+        assert r["status"] == "already_in_bucket" and not r["accepted"] and len(calls) == 1 and "'tape' went into the bucket" in r["reason"], r
+    r = await s.do_command({"grasp": "tape and snack", "wait": True})
+    assert st(r) == ["already_in_bucket", "done"] and r["status"] == "done" and [c["text"] for c in calls] == ["tape", "snack"], (r, calls)
+    p = await s.do_command({"preview": "tape"})
+    assert p["status"] == "already_in_bucket", p
+    assert [e["label"] for e in (await s.do_command({"status": True}))["bucket"]] == ["tape", "snack"]
+    print("11. delivered this run, not seen since: already_in_bucket at once (alone, in a list, preview), counts as done; status lists it")
+
+    # Someone takes the tape out: the map sees it after it went in -> grasped as usual, and no longer listed
+    MAP["tape"] = {"label": "tape", "names": ["tape", "black tape"], "xy": [350.0, -60.0], "colour": "black", "seen_ts": time.time() + 1}
+    s.live.map = {"ts": time.time(), "objects": [MAP["remembered"], MAP["tape"]]}
+    calls.clear()
+    r = await s.do_command({"grasp": "tape"})
+    assert r["accepted"] and r["via"] == "map", r
+    await s.job
+    assert len(calls) == 1
+    print("12. seen on the table after it went in (taken out): grasped as usual")
     await s.close()
+
+    # The rule itself: another object of the same name on the table, a reset
+    d = Delivered(name_matches)
+    d.add("red screwdriver", "screwdriver", [["red screwdriver", "flathead screwdriver"]])
+    old_blue = {"label": "blue screwdriver", "names": ["blue screwdriver"], "seen_ts": time.time() - 60}
+    assert d.check("screwdriver", {"objects": [old_blue]}) is None  # another screwdriver is on the table
+    assert d.check("red screwdriver", {"objects": [old_blue]})["label"] == "red screwdriver"
+    assert d.check("flathead screwdriver", {"objects": []})["label"] == "red screwdriver"  # the library's other name
+    old_red = {"label": "red screwdriver", "names": [], "seen_ts": time.time() - 60}
+    assert d.check("red screwdriver", {"objects": [old_red]}) is not None  # its spot from before it went in
+    assert d.check("red screwdriver", {"objects": [{**old_red, "superseded": True, "seen_ts": time.time() + 5}]}) is not None
+    assert [e["label"] for e in d.listing({"objects": [old_red]})] == ["red screwdriver"]
+    d.clear()
+    assert d.check("red screwdriver", {"objects": []}) is None and d.listing(None) == []
+    print("13. another object of the name on the table -> not in the bucket; old spots do not count; a reset forgets")
 
 
 asyncio.run(main())

@@ -199,6 +199,8 @@ def live():
         "library": {"store": s.get("store"), "views": (s.get("atlas") or {}).get("views") or lib.get("views")},
         "teach": bool((s.get("teach") or {}).get("enabled")),
         "map": _slim_map(mp), "search": mp.get("search") or None, "sweep": mp.get("sweep") or None,
+        # What this module run put into the bucket and has not seen on the table since (the bucket hides it from the map)
+        "in_bucket": [e["label"] for e in s.get("bucket") or [] if e.get("label")],
         "map_failing": bool((mp.get("live") or {}).get("failing")),
         "arm": st.get("arm"), "view": fr.get("view"), "frame_age_s": round(now - fr["got"], 1) if fr.get("got") else None,
         "highlight": hl, "reach_mm": REACH_MM}

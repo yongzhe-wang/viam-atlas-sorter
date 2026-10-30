@@ -160,7 +160,10 @@ await sorter.do_command({"reset": True})                    # empty the square (
   - `{"status": true}` has `atlas` (views, labels, attempts, usage, `learned`, `last_search`) for the dashboard's panel.
 - One job at a time. A request while busy returns `{"accepted": false, "error": "busy", "running": {...}}`.
 - Summaries contain `status` (`done`, `failed`, `not_found`, `ambiguous` = two objects match about equally,
-  `already_in_square` = the named object is only in the drop square (answered at once, no sweep), `too_wide`,
+  `already_in_square` = the named object is only in the drop square (answered at once, no sweep),
+  `already_in_bucket` = this module run put it into the bucket and nothing it names has been on the table since (the
+  bucket hides what is inside from the map; answered at once, counts as done in a list; `{"status": true}` lists them
+  as `bucket`; a reset forgets them; `module/grasp_policy.py`), `too_wide`,
   `too_close` = too near the arm base, please move it out, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
 - A hand or arm reaching into the workspace pauses the robot; it resumes 2 s after the workspace is clear.
 

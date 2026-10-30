@@ -46,7 +46,7 @@
   #job { font-size: 13px; }
   #job .top { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
   .badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); }
-  .badge.done { color: var(--ok); } .badge.running, .badge.sending { color: var(--accent); }
+  .badge.done, .badge.already_in_bucket, .badge.already_in_square { color: var(--ok); } .badge.running, .badge.sending { color: var(--accent); }
   .badge.failed, .badge.error, .badge.estop, .badge.rejected, .badge.not_found { color: var(--bad); }
   .items { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 2px; }
   .items li { display: flex; flex-wrap: wrap; gap: 0 8px; } .items .why { color: var(--muted); }
@@ -253,7 +253,8 @@ function stateLine(d) {
   const verb = PHASE[ph] || (s && s.found ? "grasping" : "working on");
   return ["busy", verb === "carrying" ? "🪣" : "✊", `${verb} “${what}”${verb === "carrying" ? " to the bucket" : ""}${nth}${retry}`];
 }
-const ITEM_ICON = { done: "✅", already_in_square: "✅", running: "⏳", pending: "·", skipped: "⏭" };
+const ITEM_ICON = { done: "✅", already_in_square: "✅", already_in_bucket: "✅", running: "⏳", pending: "·", skipped: "⏭" };
+const SATISFIED = ["done", "already_in_square", "already_in_bucket"];
 function renderJob(c) {
   const box = $("job");
   box.replaceChildren();
@@ -265,14 +266,15 @@ function renderJob(c) {
   if (c.duration_s != null) top.appendChild(el("span", `${Number(c.duration_s).toFixed(0)} s`, "muted"));
   if (c.progress) top.appendChild(el("span", c.progress, "muted"));
   box.appendChild(top);
-  if (c.fail_reason && !c.items) box.appendChild(el("div", c.fail_reason, "fail"));
+  if (c.fail_reason && !c.items) box.appendChild(el("div", c.fail_reason, SATISFIED.includes(c.status) ? "muted" : "fail"));
   if (c.items && c.items.length) {
     const ul = el("ul", null, "items");
     for (const i of c.items) {
       const li = el("li");
       li.appendChild(el("span", ITEM_ICON[i.status] || "❌"));
       li.appendChild(el("span", `${i.text}${i.label && i.label !== i.text ? ` → ${i.label}` : ""}`));
-      const why = i.fail_reason || (ITEM_ICON[i.status] ? "" : String(i.status || "").replace(/_/g, " "));
+      const why = i.status === "already_in_bucket" ? "already in the bucket"
+        : i.fail_reason || (ITEM_ICON[i.status] ? "" : String(i.status || "").replace(/_/g, " "));
       if (why) li.appendChild(el("span", why, "why"));
       ul.appendChild(li);
     }
@@ -352,7 +354,8 @@ function drawMap(d) {
   if (d.view && d.view.length >= 3 && (d.frame_age_s ?? 99) < 5)
     svg.appendChild(mk("polygon", { points: d.view.map((c) => mapXY(c[0], c[1]).join(",")).join(" "), fill: "var(--accent)", "fill-opacity": 0.12,
       stroke: "var(--accent)", "stroke-opacity": 0.5, "stroke-dasharray": "4 3" }));
-  const marks = [], labels = [], fixed = [], delivered = [];
+  // In the bucket: what the module put there this run (the bucket hides it from the map), and anything the map marks inside
+  const marks = [], labels = [], fixed = [], delivered = [...(d.in_bucket || [])];
   // The drop target: the bucket (AGENT3's tmap["bucket"]), else a tape square when the map has one
   let dropAt = null;
   if (m && m.bucket && m.bucket.xy) {
@@ -386,7 +389,9 @@ function drawMap(d) {
     if (named) labels.push({ x: px, y: py, prio: hit ? 0 : old ? 3 : 1, cls: old ? "mute" : "",
       text: `${o.partial ? "≈ " : ""}${o.label}${old ? " · old spot" : age > 15 ? ` · ${agoText(age)}` : ""}` });
   }
-  if (dropAt && delivered.length) labels.push({ x: dropAt[0], y: dropAt[1], prio: 0, text: `in the bucket: ${[...new Set(delivered)].join(", ")}` });
+  const inside = `in the bucket: ${[...new Set(delivered)].join(", ")}`;
+  if (dropAt && delivered.length) labels.push({ x: dropAt[0], y: dropAt[1], prio: 0, text: inside });
+  else if (delivered.length) { svg.appendChild(mk("text", { x: 6, y: 16 }, `🪣 ${inside}`)); fixed.push({ x0: 0, y0: 0, x1: MAP.W, y1: 22 }); }
   // The arm: its base, the line to where the flange is now, and the jaws turned by the wrist
   svg.appendChild(mk("rect", { x: bx - 12, y: by - 7, width: 24, height: 12, rx: 3, fill: "var(--muted)" }));
   fixed.push({ x0: bx - 14, y0: by - 9, x1: bx + 14, y1: by + 7 });

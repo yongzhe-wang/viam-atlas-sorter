@@ -79,7 +79,7 @@ from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
 from viam.utils import ValueTypes, struct_to_dict
 
-from module import dashboard_view
+from module import dashboard_view, grasp_policy
 from module.live_map import LiveMap
 from sorter import teach
 
@@ -114,7 +114,6 @@ MAP_PERSIST_S = 2.0  # live map -> Store.put_table_map at most this often (VIAM 
 MAP_TASK_EVERY_S = 1.0  # during a task, at most one executor frame per second goes to the live map (servo keeps CPU)
 IDLE_SIG_PX = 12  # idle pictures differ when a box centre moved this many pixels (or labels / intruders changed)
 IDLE_MAP_KEEPALIVE_S = 20.0  # ... else one idle picture this often still goes into the map and the log
-ITEM_SATISFIED = ("done", "already_in_square")  # a list item that needs nothing more: it is in the drop square
 OBS_PAGE_LIMIT = 200  # {"observations"}: records per page without images ...
 OBS_PAGE_IMAGES_LIMIT = 40  # ... and with them (a JPEG + depth PNG is ~60 KB on top of a ~11 KB record)
 OBS_PAGE_BYTES = 3_000_000  # a page stays under this much JSON: a DoCommand answer goes through one gRPC message
@@ -258,6 +257,9 @@ class GraspByDescription(Generic, EasyResource):
         self._seen_raw = None  # {"ts", "recs", "objs", "rgb", "depth", "pose"} behind self.seen, for a fast grasp
         self._jpeg_cache = (None, None, 1.0)  # (frame ts, base64 jpeg, scale) for seen_image
         self.view = dashboard_view.DashboardView()  # the newest picture of the table, for {"dashboard"}
+        # What this run put into the bucket, so asking again answers at once (module/grasp_policy.py)
+        self.in_bucket = grasp_policy.Delivered(
+            lambda q, names: getattr(_runtime().clip_embed, "name_matches", grasp_policy.words_match)(q, names))
         self._look_lock = asyncio.Lock()  # one look at a time: the idle loop and a grasp that needs a fresh frame
         self.live: Optional[LiveMap] = None  # the live table map, once warm and if AGENT3's update_map exists
         self._intr: Optional[dict] = None  # camera intrinsics for update_map, read once through the Rig
@@ -854,6 +856,12 @@ class GraspByDescription(Generic, EasyResource):
         if refusal and refusal[0] == "ambiguous":
             return {"status": "ambiguous", "reason": refusal[1], "decide_ms": decide_ms, "decided_from_cache": True}
         seen_miss = pick is not None and pick.get("obj") is None
+        # Into the bucket this run and nothing it names on the table: answer now, no search (module/grasp_policy.py)
+        inside = self.in_bucket.check(text, self.live.map if self.live is not None else None)
+        if inside is not None:
+            when = time.strftime("%H:%M:%S", time.localtime(inside["ts"]))
+            return {"status": "already_in_bucket", "decide_ms": decide_ms, "via": "memory",
+                    "reason": f"{inside['label']!r} went into the bucket at {when} and has not been on the table since"}
         found = await self._from_map(text, any_match)
         if found is not None and not found["found"]:  # already in the drop square
             return {"status": found["status"], "reason": found["reason"], "decide_ms": found["decide_ms"], "via": "map"}
@@ -1019,6 +1027,16 @@ class GraspByDescription(Generic, EasyResource):
             if summary.get("label") is not None and chosen:
                 summary.update(label=chosen.get("label") or summary["label"],
                                colour=summary.get("colour") or chosen.get("colour"))
+        if summary.get("status") == "done":
+            # Delivered: remembered for the next request; a reset emptied the drop target
+            if kind == "grasp":
+                try:
+                    rows = self.store.list_labels()
+                except Exception:
+                    rows = []
+                self.in_bucket.add(summary.get("label"), text or "", rows, summary.get("_id"))
+            elif kind == "reset":
+                self.in_bucket.clear()
         return summary
 
     @staticmethod
@@ -1317,27 +1335,6 @@ class GraspByDescription(Generic, EasyResource):
                 "score": s.get("score"), "duration_s": s.get("duration_s"), "via": s.get("via"), "_id": s.get("_id"),
                 "fail_reason": s.get("fail_reason") or s.get("error"), "tries": len(s.get("attempts") or []) or None}
 
-    @staticmethod
-    def _list_stop(item: dict) -> Optional[str]:
-        """
-        Why the rest of a list must not be tried, else None (VIAM CENTERAL): the E-stop, a dead link, an arm stopped
-        by overcurrent, something still in the gripper, or an error that leaves the arm's state unknown. Everything
-        else (not found, ambiguous, too close, too wide, square full, an ordinary failure) moves on to the next item.
-        """
-        status, why = item.get("status"), str(item.get("fail_reason") or "")
-        low = why.lower()
-        if status == "estop":
-            return "E-stop"
-        if status == "error":
-            return f"unexpected error: {why}"
-        if "link still down" in low or "could not connect" in low:
-            return f"robot link down: {why}"
-        if "overcurrent" in low:
-            return f"arm stopped on overcurrent: {why}"
-        if "still holding" in low or "recovery failed" in low:
-            return f"may still be holding something: {why}"
-        return None
-
     async def _run_many(self, text: str, items: list) -> dict:
         """The grasp_many job: item by item, back at the observe pose between them; never raises."""
         t0, n, stop = time.monotonic(), len(items), None
@@ -1358,11 +1355,11 @@ class GraspByDescription(Generic, EasyResource):
                 res = {"text": item, "status": "error", "fail_reason": f"{type(e).__name__}: {e}"[:300]}
             results[k - 1] = res
             self.job_info["items"] = [dict(r) for r in results]
-            stop = self._list_stop(res)
+            stop = grasp_policy.list_stop(res)
             if stop:
                 LOGGER.error(f"list stopped at item {k}/{n} {item!r}: {stop}")
         self._between_items = False
-        ok = [r for r in results if r["status"] in ITEM_SATISFIED]
+        ok = [r for r in results if r["status"] in grasp_policy.ITEM_SATISFIED]
         status = "done" if len(ok) == n else "partial" if ok else "failed"
         summary = {"status": status, "items": results, "done": len(ok), "total": n, "via": "list",
                    "duration_s": round(time.monotonic() - t0, 1),
@@ -1371,7 +1368,7 @@ class GraspByDescription(Generic, EasyResource):
             summary["stopped_by"] = stop
         if status != "done":
             summary["fail_reason"] = stop or "; ".join(f"{r['text']}: {r['status']}" for r in results
-                                                       if r["status"] not in ITEM_SATISFIED)
+                                                       if r["status"] not in grasp_policy.ITEM_SATISFIED)
         self.last = {"kind": "grasp_many", "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
         return summary
 
@@ -1385,6 +1382,7 @@ class GraspByDescription(Generic, EasyResource):
                 "warm_error": self.warm_error, "seen": seen, "timelapse": self._timelapse_stats(),
                 "map": self.live.summary() if self.live is not None else {"live": False},
                 "observations": self.store.observation_stats(), "build": _build_info(),
+                "bucket": self.in_bucket.listing(self.live.map if self.live is not None else None),
                 "atlas": {**self.atlas_panel, "last_search": self.store.last_search,
                           "searches": self.store.search_count},
                 "teach": {"enabled": teach.enabled(), "progress": self.job_info.get("teach") if self._busy() else None},

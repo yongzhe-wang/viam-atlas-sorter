@@ -242,6 +242,8 @@ async def main():
         v = np.random.default_rng(seed).normal(size=512)
         return (v / np.linalg.norm(v)).tolist()
     labels = [["kind bar", "snack bar"], ["granola bar"]]
+    # These grasps deliver the same objects again and again: none goes into the bucket memory (else: already_in_bucket)
+    s.in_bucket.add = lambda *a, **k: None
     with mock.patch.object(executor, "execute", execute), mock.patch.object(s.store, "list_labels", lambda: labels):
         outcome.update(obj=obj, doc={"embedding": unit(1)})
         r = await s.do_command({"grasp": "snack", "wait": True})
