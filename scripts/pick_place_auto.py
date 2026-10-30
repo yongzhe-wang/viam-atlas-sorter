@@ -720,6 +720,34 @@ class Rig:
         except Exception as e:
             print(f"  arm speed {deg:.0f} deg/s not set: {e}")
 
+    async def close_soft(self, torque_pct: float) -> float:
+        """
+        Close the jaws with limited torque, on a soft package; returns where they stopped in mm (None if unread). A plain
+        grab if the module refuses the command. [CONFIDENCE: UNVERIFIED 55% — same command as expand(), not run on the arm]
+        {VIAM CENTERAL 2026-10-30 "软包装不要用全力夹"}
+        """
+        async def send() -> None:
+            cmd = {"grab_with_torque": {"position": 0.0, "speed": EXPAND_SPEED, "torque": torque_pct}}
+            try:
+                await asyncio.wait_for(self.gripper.do_command(cmd), EXPAND_WAIT_S)
+            except asyncio.TimeoutError:
+                print(f"  close: no reply in {EXPAND_WAIT_S:.0f} s, taken as stalled on the object")
+        try:
+            await self.call("close", send)
+        except EStop:
+            raise
+        except MoveRefused as e:
+            print(f"  close: {e}; a plain grab instead")
+            await self.grab()
+            return None
+        try:
+            return float((await self.call("close", lambda: self.gripper.do_command({"get": True})))["pos"]) / 10.0
+        except EStop:
+            raise
+        except (MoveRefused, KeyError, TypeError, ValueError) as e:
+            print(f"  close: position not read ({e})")
+            return None
+
     async def expand(self, mm: float) -> float:
         """
         Open the jaws toward `mm` with limited torque, against whatever stops them; returns where they stopped in mm

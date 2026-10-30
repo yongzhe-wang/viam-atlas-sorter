@@ -8,6 +8,7 @@ its paper core and slipped; a long object needs its handle; a tall one must not 
 
 choose_primitives(o) -> candidates, best first ([] = too wide to grasp):
   ring (hole in the mask)            -> ring_inside (if the hole fits the jaws), ring_wall
+  flat (< 10 mm high)                -> flat, open loop from the found frame (GRASP_PRIMITIVES or SEARCH_V2)
   lying round (long, arched top)     -> lying_round, then as long or plain
   tall and small (> 50 mm high)      -> standing, top
   long (length / width > 2.5)        -> handle, centroid
@@ -47,8 +48,16 @@ REFINE_MARGIN_MM = 5.0  # servo_tolerance: kept between a finger and the object 
 # Also the most a finger may push the object on closing: the formula alone gives 23 mm for a 27 mm block, and that
 # push turns a long handle or knocks a tall block; the 7 mm of the coordinator's case passes
 REFINE_MAX_MM = 8.0
+FLAT_MM = 10.0  # lower than this: no servo and no measured top, the depth map barely tells it from the table
+FLAT_MAX_WIDTH_MM = 150.0  # wider than the jaws open, a soft flat package is pinched at its bulge; beyond this it is no package
+FLAT_TORQUE_PCT = 30.0  # of 0-100, below the G2's default 50%: it holds a bag without crushing what is inside
 FAILS_TO_ESCALATE = 2
 ESCALATION_TTL_S = 180.0
+
+
+def search_v2() -> bool:
+    """SEARCH_V2=1: two-stage search, flat objects, a failed pick moves on to the next candidate. Default off."""
+    return os.environ.get("SEARCH_V2", "0") == "1"
 
 
 def enabled() -> bool:
@@ -223,6 +232,11 @@ def lying_round(o, depth: np.ndarray, fx: float) -> bool:
     return drop >= max(ARCH_MIN_MM, ARCH_FRAC * half * mm)
 
 
+def is_flat(o) -> bool:
+    """Too low for the servo and for measure() to find a top, whatever perception calls it."""
+    return bool(getattr(o, "flat", False)) or (o.height_mm or 0.0) < FLAT_MM
+
+
 def choose_primitives(o, fx: float, depth: np.ndarray = None) -> list:
     """
     Candidate primitives for object `o`, best first, from its geometry alone; [] if it is too wide to grasp.
@@ -234,6 +248,10 @@ def choose_primitives(o, fx: float, depth: np.ndarray = None) -> list:
         # A ring's outside width does not matter: it is not gripped across it
         inside = enabled() and INSIDE_MIN_ID_MM <= ring_inner_mm(o, fx) <= INSIDE_MAX_ID_MM
         return ["ring_inside", "ring_wall"] if inside else ["ring_wall"]
+    # Flat: the top centroid is its bulge, also where a package too wide for the jaws is pinched
+    # {VIAM CENTERAL 2026-10-30 "过宽就夹鼓起的中段或边角"}
+    if (enabled() or search_v2()) and is_flat(o) and width <= FLAT_MAX_WIDTH_MM:
+        return ["flat"]
     if width > MAX_OPEN_MM:
         return []
     if not enabled():
@@ -327,6 +345,62 @@ def servo_tolerance(primitive, o, fx: float):
     across = min(REFINE_MAX_MM, (JAW_OPEN_MM - o.width_px * mm) / 2.0 - REFINE_MARGIN_MM)
     along = min(REFINE_MAX_MM, o.length_px * mm / 2.0 - REFINE_MARGIN_MM)
     return (across, along) if across > 0.0 and along > 0.0 else None
+
+
+async def pick_flat(rig, times: dict, slipped=None, height: float = 7.0) -> tuple:
+    """
+    A flat object, open loop: already over it (executor.approach, from the found frame), down to the lowest allowed height,
+    close gently, lift. Returns (height, grip depth) like ppa.pick; ppa.ObjectLost if the picture shows it stayed behind.
+
+    WHY: the M&M's bag (100 x 75 mm, ~7 mm) failed "block: did not converge" and would then fail "block top not found":
+    neither the servo's tracker nor measure()'s 10-80 mm band can hold on to something this low.
+    {VIAM CENTERAL 2026-10-30 "不 SERVO、不测 TOP（BLOCK TOP NOT FOUND 不能再发生）... 下到 MIN_GRASP_Z_THIN，合拢，抬起后用画面判断"}
+    [CONFIDENCE: SINGLE-SRC 65% — not run on the arm; the jaws land where the camera model says, within its error]
+    The grab's own answer is not asked: on a thin object it says nothing, and the picture decides.
+    """
+    t = time.monotonic()
+    times["at"] = "descend"
+    rig.picked_at, rig.grip_mode = None, "external"
+    await rig.open()
+    print("1/5 flat object: no refine, open loop from the found frame")
+    z0, table, _ = await rig.measure()
+    await rig.wait_clear(ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table))
+    z = max(rig.floor_z, ppa.MIN_GRASP_Z_THIN)
+    print(f"  table={table:.0f}mm -> flat grasp z={z:.0f} (floor {rig.floor_z:.0f})")
+    why = ppa.finger_obstacle(rig.last_depth, rig.fx, rig.fy, rig.cx, rig.cy, z0 - z + ppa.TIP_BELOW_CAM, table)
+    if why is not None:
+        raise ppa.UnsafeGrasp(f"not descending: {why}")
+    try:
+        await rig.descend(z, settle=False)  # the grab follows, no frame
+    except ppa.EStop:
+        raise
+    except ppa.MoveRefused as e:
+        q = await rig.pose()
+        await rig.lift()
+        if math.hypot(q.x, q.y) < ppa.NEAR_BASE_R_MM:
+            raise ppa.TooClose(f"{ppa.too_close_msg(q.x, q.y)} ({e})") from e
+        raise ppa.PickFailed(f"descent refused at ({q.x:.0f},{q.y:.0f}): {e}") from e
+    t = ppa.mark(times, "descend", t)
+    times["at"] = "grab"
+    q = await rig.pose()
+    rig.picked_at = (q.x, q.y, rig.theta)
+    stopped = await rig.close_soft(FLAT_TORQUE_PCT)
+    print(f"  closed gently: jaws stopped at {stopped} mm")
+    await rig.goto(q.x, q.y, min(q.z + 30.0, ppa.ALIGN_Z), settle=False)
+    await rig.goto(q.x, q.y, ppa.ALIGN_Z)
+    ppa.mark(times, "grab", t)
+    if slipped is not None:
+        q = await rig.pose()
+        rgb, depth = await rig.frame()
+        gone, why = slipped(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta})
+        print(f"  after the lift: picture: {why}")
+        if gone:
+            rig.picked_at = None
+            await rig.open()
+            raise ppa.ObjectLost(f"stayed on the table on the lift ({why})")
+    grip = height / 2.0
+    ppa.save_state(True, height, grip)
+    return height, grip
 
 
 def keeps_wrist_at_zero(primitive, o) -> bool:

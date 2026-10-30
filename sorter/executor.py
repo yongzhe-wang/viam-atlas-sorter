@@ -424,6 +424,42 @@ def still_on_table(rig, tracker, rgb: np.ndarray, depth: np.ndarray, pose: dict)
     return False, "nothing like it left at the pick point"
 
 
+FLAT_PATCH_MM = 15.0
+FLAT_SAME_RGB = 30.0  # a patch of the table where it lay looks like the bag, within this per channel: the bag is still there
+
+
+def flat_left_behind(rig, tracker, rgb: np.ndarray, depth: np.ndarray, pose: dict) -> tuple:
+    """
+    still_on_table for an object too low to be segmented every time: else the patch where it lay, compared with the found
+    frame. On the table its depth is the table's; held, it hangs in front of the lens with no depth, so a bag on the jaws
+    that covers that spot in the image does not read as left behind.
+    """
+    gone, why = still_on_table(rig, tracker, rgb, depth, pose)
+    found, ref = getattr(tracker, "found", None), getattr(tracker, "ref", None)
+    if gone or depth is None or not found or not ref:
+        return gone, why
+    k, H, W = intr(rig), rgb.shape[0], rgb.shape[1]
+    table = float(np.median(table_plane(depth)))
+
+    def patch(img: np.ndarray, p: dict, d_mm: float):
+        u, v = perception.project_xy(p, k, ref["xy"], d_mm)
+        r = int(FLAT_PATCH_MM * k["fx"] / d_mm)
+        return (max(0, int(v) - r), min(H, int(v) + r), max(0, int(u) - r), min(W, int(u) + r))
+    fp = found["pose"]
+    fd = float(np.median(table_plane(found["depth"])))
+    v0, v1, u0, u1 = patch(rgb, pose, table)
+    a0, a1, b0, b1 = patch(found["rgb"], fp, fd)
+    if v1 <= v0 or u1 <= u0 or a1 <= a0 or b1 <= b0:
+        return gone, why
+    on_table = np.abs(depth[v0:v1, u0:u1] - table) <= 15.0
+    if on_table.mean() < 0.5:
+        return gone, why  # hidden by what the jaws hold
+    diff = np.abs(np.median(rgb[v0:v1, u0:u1].reshape(-1, 3), axis=0) - np.median(found["rgb"][a0:a1, b0:b1].reshape(-1, 3), axis=0))
+    if float(diff.max()) <= FLAT_SAME_RGB:
+        return True, f"the spot where it lay still looks the same (colour off by {float(diff.max()):.0f})"
+    return gone, why
+
+
 def neighbours_of(rig, tracker) -> list:
     """Table xy of the objects of the target's colour already beside it in the found frame; looked at only when it matters."""
     ref, found = tracker.ref, getattr(tracker, "found", None)
@@ -1063,7 +1099,11 @@ async def grasp_with_primitives(rig, found: dict, esc, times: dict, doc: dict, t
         slipped = lambda c, d, p, t=tracker: still_on_table(rig, t, c, d, p)  # noqa: E731
         try:
             await approach(rig, found, tracker)
-            if primitive == "ring_inside":
+            if primitive == "flat":
+                # Identity was fixed in the found frame: this low, the tracker and still_target cannot follow it
+                flat_slipped = lambda c, d, p, t=tracker: flat_left_behind(rig, t, c, d, p)  # noqa: E731
+                height, grip = await grasp.pick_flat(rig, times, slipped=flat_slipped, height=max(obj.height_mm or 0.0, 3.0))
+            elif primitive == "ring_inside":
                 height, grip = await grasp.pick_inside(rig, times, tracker, check=check, slipped=slipped,
                                                        inner_mm=grasp.ring_inner_mm(obj, rig.fx))
             else:
@@ -1343,6 +1383,9 @@ async def approach(rig, found: dict, tracker) -> None:
     jx, jy = perception.world_xy({"x": 0.0, "y": 0.0, "z": ppa.ALIGN_Z, "theta": theta}, k, au, av, top)
     fx, fy = xy[0] - jx, xy[1] - jy
     if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
+        # What follows relies on a servo to get over it, and a flat object has none
+        if primitive == "flat":
+            raise ppa.UnsafeGrasp(f"the jaws cannot get over the flat object at ({xy[0]:.0f},{xy[1]:.0f})")
         theta = 0.0
         fx, fy = perception.look_flange_xy(xy)
         if not ppa.allowed(fx, fy) or math.hypot(fx, fy) < 120.0:
