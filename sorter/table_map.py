@@ -544,6 +544,15 @@ def best_on_map(table_map: dict, text: str, store=None) -> dict:
                      "emb": np.zeros(EMB_DIM, np.float32) if emb is None else np.asarray(emb, dtype=np.float32)})
     b = clip_embed.best(None, text, store, recognised=recs)
     pick = cands[b["obj"].id] if b["obj"] is not None else None
+    if pick is None:
+        # best() refused (low far score, a tie): an entry named so (label or alias), the latest seen, is still the place to
+        # look first; the close look there decides strictly {USER 2026-10-30 "WHEN YOU DO PLANNING SHOULD FIRST CHECK THE
+        # LOCATION ON THE MAP FOR THAT OBJECT IF NOT FOUND THEN MOVE"}
+        named = [m for m in cands if m.get("label")
+                 and clip_embed.name_matches(text, [m["label"], *(m.get("names") or [])])]
+        if named:
+            pick = max(named, key=lambda m: float(m.get("seen_ts") or 0.0))
+            b = {**b, "ambiguous": False, "score": float(pick.get("score") or 0.0)}
     done = None
     if pick is None:
         done = next((m for m in live if m.get("in_square") and m.get("label")

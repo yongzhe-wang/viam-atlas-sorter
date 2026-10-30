@@ -1294,7 +1294,7 @@ def merge_candidates(table: list, new: list) -> None:
             same.update(c)
 
 
-async def look_here(rig, text: str, store, source: str = "demo", excluded: list = ()) -> dict:
+async def look_here(rig, text: str, store, source: str = "demo", excluded: list = (), wait_clear: bool = True) -> dict:
     """
     One frame from the current pose -> best match for `text` among objects outside the square.
 
@@ -1303,8 +1303,10 @@ async def look_here(rig, text: str, store, source: str = "demo", excluded: list 
     Waits while the camera is blocked (clear_frame), so a cable in front of the lens is not "not found".
     excluded: table xy of objects a failed pick of this job already tried: not candidates.
     SEARCH_V2 with nothing accepted: "candidates" holds view_candidates(), for the search's second stage.
+    wait_clear=False (a coverage view): the frame as it is, no wait while the camera reads blocked; coverage counts
+    only what it saw and the search moves on.
     """
-    rgb, depth = await clear_frame(rig)
+    rgb, depth = await clear_frame(rig) if wait_clear else await rig.frame()
     pose = pose_dict(await rig.pose())
     rig.record("observe", rgb)
     seg = perception.segment_full(rgb, depth)
@@ -1446,6 +1448,13 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
 COVER_MAX_VIEWS = 8  # first-stage views at most ...
 COVER_MAX_S = 25.0  # ... and seconds; then the close looks
 COVER_DONE = 0.98  # share of the table's cells seen that counts as all of it
+# Past this share, a view adding fewer than COVER_PLATEAU_NEW cells ends the coverage stage: the rest is under the bucket or
+# without depth, and the next views added 0-4 cells for ~2 s each (~17 s when the camera read blocked there).
+# {LOG 21:12:01 "SEARCH VIEW 7 (COVER): 0 NEW CELLS, 89%" … 21:12:18 "SEARCH VIEW 8 (COVER): 0 NEW CELLS, 89%"}
+# {USER 2026-10-30 "ALSO ALL RETRIES AND SEARCHS NEED TO BE FASTER"}
+# [CONFIDENCE: CONFIRMED 85% — in all 6 not_found searches of 21:04-21:15 the views after this point added <= 4 cells]
+COVER_PLATEAU_FRAC = 0.85
+COVER_PLATEAU_NEW = 5
 
 
 async def report_progress(progress, views: int, n: int, path: str, found: bool) -> None:
@@ -1487,11 +1496,16 @@ async def coverage_search(rig, text: str, store, hint_xy, progress, skip_current
     table, done, views, square, last = [], [], 0, None, {"obj": None, "reason": "nothing seen"}
     p = await rig.pose()
     at = (p.x, p.y, p.z)
-    plan = [] if skip_current else [("current", None)]
+    plan = []
     if hint_xy is not None:
         fx, fy = perception.look_flange_xy(tuple(hint_xy))
         if ppa.reachable(fx, fy) and math.hypot(fx, fy) >= 120.0:
             plan.append(("hint", (fx, fy, ppa.ALIGN_Z)))
+    # Where the map (or the failed try) last saw it comes first, with no look from here before; the current view only
+    # without such a spot {USER 2026-10-30 "WHEN YOU DO PLANNING SHOULD FIRST CHECK THE LOCATION ON THE MAP FOR THAT
+    # OBJECT IF NOT FOUND THEN MOVE"}
+    if not plan and not skip_current:
+        plan.append(("current", None))
     while views < COVER_MAX_VIEWS and time.monotonic() - t0 < COVER_MAX_S:
         if plan:
             path, q = plan.pop(0)
@@ -1512,7 +1526,10 @@ async def coverage_search(rig, text: str, store, hint_xy, progress, skip_current
             at = q
         else:
             done.append(at)
-        found = await look_here(rig, text, store, source="look" if path == "hint" else "demo", **look_kw)
+        # A coverage view does not wait out a blocked camera (15 s each time, then 0 new cells): the next view is the cure
+        # {LOG 21:08:33 "CAMERA BLOCKED … 17%; WAITING" → 21:08:49 "STILL BLOCKED AFTER 15 S" → "VIEW 7 (COVER): 0 NEW CELLS"}
+        found = await look_here(rig, text, store, source="look" if path == "hint" else "demo",
+                                wait_clear=path != "cover", **look_kw)
         views += 1
         found.update(path=path, views=views)
         square = found.get("square") or square
@@ -1534,6 +1551,9 @@ async def coverage_search(rig, text: str, store, hint_xy, progress, skip_current
         merge_candidates(table, found.get("candidates") or [])
         last = found
         if cov.fraction() >= COVER_DONE:
+            break
+        if path == "cover" and cov.fraction() >= COVER_PLATEAU_FRAC and new < COVER_PLATEAU_NEW:
+            print(f"  search: coverage stopped growing ({new} new cells at {cov.fraction():.0%}): close looks now")
             break
     found, views, last2, notes = await close_looks(rig, text, store, table, look_kw, views, square)
     if found is not None:
