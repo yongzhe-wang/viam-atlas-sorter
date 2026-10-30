@@ -138,10 +138,16 @@ def _frame_row(name: str, pose: dict, res: dict) -> dict:
 
 
 async def _wait_searchable(store, view_id: str, emb) -> tuple:
-    """(seconds until $vectorSearch returned the new view or None, its score): Atlas indexes it a moment after the write."""
+    """
+    (seconds until $vectorSearch returned the new view or None, its score): Atlas indexes it a moment after the write.
+    Atlas not answering is (None, None): the views are written, only the timing is unknown.
+    """
     t0 = time.monotonic()
     while time.monotonic() - t0 <= SEARCHABLE_WAIT_S:
-        hits = await asyncio.to_thread(store.search_views, emb, 5)
+        try:
+            hits = await asyncio.to_thread(store.atlas_search, emb, 5)
+        except Exception:
+            return None, None
         hit = next((h for h in hits if h.get("_id") == view_id), None)
         if hit is not None:
             return round(time.monotonic() - t0, 1), round(float(hit["score"]), 3)

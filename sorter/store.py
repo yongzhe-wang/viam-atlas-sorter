@@ -138,8 +138,7 @@ class Store:
         uri = uri if uri is not None else os.environ.get("MONGODB_URI")
         self.db = None
         self._views_cache = None  # ((mtime_ns, size), views, normalised matrix) for offline search_views
-        self._online_lib = None  # (normalised matrix, labels) loaded once from Atlas by library_matrix()
-        self._mirror = None  # (views without embedding, normalised matrix): the Atlas library held in memory for search
+        self._mirror = None  # (views without embedding, normalised matrix): the Atlas library in memory (_mirror_load)
         self._shadow_ts = 0.0  # when the last background $vectorSearch started
         self.last_search = None  # what the latest search_views did, for the dashboard's Atlas panel
         self.search_count = 0
@@ -240,11 +239,23 @@ class Store:
         self._insert("calib_samples", doc)
 
     def add_view(self, label: str, embedding, jpeg: bytes, meta: dict) -> str:
-        """One labelled view of an object for retrieval; embedding is a 512-d CLIP vector."""
+        """
+        One labelled view of an object for retrieval; embedding is a 512-d CLIP vector.
+
+        Online, a library already in memory (_mirror_load) gets the new row: searchable and named at once, nothing read
+        again from Atlas.
+        """
         vec = [float(x) for x in np.asarray(embedding, dtype=float).ravel()]
         if len(vec) != EMBED_DIM:
             raise ValueError(f"embedding has {len(vec)} dims, expected {EMBED_DIM}")
-        return self._insert("views", {**(meta or {}), "label": label, "embedding": vec, "jpeg": jpeg})
+        view_id = self._insert("views", {**(meta or {}), "label": label, "embedding": vec, "jpeg": jpeg})
+        if self.online and self._mirror is not None:
+            views, matrix = self._mirror
+            row = _normalised([vec])
+            # One new tuple, so a search in another thread sees the old library or the new one, never half of it
+            self._mirror = ([*views, {**(meta or {}), "_id": view_id, "label": label}],
+                            row if matrix is None else np.vstack([matrix, row]))
+        return view_id
 
     def _views_offline(self) -> tuple:
         """
@@ -269,17 +280,24 @@ class Store:
         """
         (N x 512 L2-normalised float32 matrix, [label per row]) of the object library, held in memory.
 
-        Offline it is the same cache search_views uses; online it is loaded from Atlas once per Store (search
-        itself still uses $vectorSearch). The module's warm-up calls this so the library is resident before
-        the first command.
+        The same copy search_views uses: data/views.jsonl offline, the Atlas library in memory online (_mirror_load).
+        The module's warm-up calls this so the library is resident before the first command.
         """
-        if self.online:
-            if self._online_lib is None:
-                rows = list(self.db.views.find({}, {"embedding": 1, "label": 1, "_id": 0}))
-                self._online_lib = (_normalised([r["embedding"] for r in rows]), [r.get("label") for r in rows])
-            return self._online_lib
-        views, matrix = self._views_offline()
+        views, matrix = self._mirror_load() if self.online else self._views_offline()
         return matrix, [v.get("label") for v in views]
+
+    def _mirror_load(self) -> tuple:
+        """
+        (views without embedding or picture, L2-normalised matrix): the Atlas library in memory, loaded once.
+
+        add_view appends to it, so what this process learns is searchable at once without reading the library again
+        (~240 embeddings, about 1.6 MB, from Atlas). Views another process writes show after a restart.
+        """
+        if self._mirror is None:
+            rows = list(self.db.views.find({}, {"jpeg": 0}))
+            self._mirror = ([{a: b for a, b in r.items() if a != "embedding"} for r in rows],
+                            _normalised([r["embedding"] for r in rows]))
+        return self._mirror
 
     def search_views(self, embedding, k: int = 5, label: str = None) -> list:
         """
@@ -328,6 +346,15 @@ class Store:
                     {"$project": {"embedding": 0, "jpeg": 0}}]
         return self._note_search("$vectorSearch", list(self.db.views.aggregate(pipeline)), t0)
 
+    def atlas_search(self, embedding, k: int = 5) -> list:
+        """
+        Atlas $vectorSearch itself online (what Atlas has indexed so far), search_views offline.
+
+        A teach waits on this, since search_views answers from memory and would find a new view before Atlas does.
+        """
+        q = np.asarray(embedding, dtype=float).ravel()
+        return self._vector_search(q, k) if self.online else self.search_views(q, k)
+
     def _shadow_search(self, q, k: int, label: str = None) -> None:
         """A real $vectorSearch beside the in-memory answer; a failure only means the panel shows an older one."""
         try:
@@ -341,14 +368,12 @@ class Store:
 
         WHY: the user: "make it faster for arm and image". One $vectorSearch took 130-260 ms from this table, once per
         object per frame, and one frame's perception went from about 430 ms to about 770-920 ms with Atlas on. It also
-        means a dropped link cannot stop a grasp. Loaded once, reloaded after a view is added.
+        means a dropped link cannot stop a grasp.
         {ATLAS TIMING 2026-10-30 "SEARCH_VIEWS 198 MS / 132 MS / 262 MS / 126 MS"} [CONFIDENCE: CONFIRMED 90% — measured]
         """
-        if self._mirror is None:
-            rows = list(self.db.views.find({}, {"jpeg": 0}))
-            self._mirror = ([{a: b for a, b in r.items() if a != "embedding"} for r in rows],
-                            _normalised([r["embedding"] for r in rows]))
-        views, matrix = self._mirror
+        views, matrix = self._mirror_load()
+        if matrix is None:
+            return []
         scores = (1.0 + matrix @ (q / max(float(np.linalg.norm(q)), 1e-12))) / 2.0
         if label:
             scores = np.where([v.get("label") == label for v in views], scores, -1.0)
@@ -369,8 +394,7 @@ class Store:
 
         Skipped when a view is already within LEARN_DUP_COS (of its own label only with same_label_only: someone teaching
         an object overrules what another label's views say) or the label has `cap` views. dedupe=False keeps it anyway
-        (an alias lives on a view, so a new name needs one). Online the in-memory library
-        gets the new row, so nothing is reloaded from Atlas and a later view of this batch sees it.
+        (an alias lives on a view, so a new name needs one). Through add_view, a later view of this batch sees it.
         """
         v = np.asarray(embedding, dtype=np.float32).ravel()
         v = v / max(float(np.linalg.norm(v)), 1e-12)
@@ -382,11 +406,7 @@ class Store:
                 return {"skipped": "already known", "cos": round(cos, 3)}
         if cap is not None and labels.count(label) >= cap:
             return {"skipped": f"{label!r} already has {cap} views"}
-        view_id = self.add_view(label, v, jpeg, meta)
-        self._mirror = None  # the next search reads the new view too
-        if self.online:
-            self._online_lib = (v[None, :] if matrix is None else np.vstack([matrix, v]), [*labels, label])
-        return {"id": view_id}
+        return {"id": self.add_view(label, v, jpeg, meta)}
 
     def atlas_usage(self) -> dict:
         """
@@ -443,10 +463,8 @@ class Store:
         WHY: clip_embed.library_names() needs which queries the library covers, and the dashboard shows the
         audience what it can ask for; both previously reached into views directly.
         """
-        if self.online:
-            rows = self.db.views.find({}, {"label": 1, "aliases": 1, "_id": 0})
-        else:
-            rows = self._read_offline("views")
+        # Online from the library in memory: best() asks this on every decision, and it now names what was just taught
+        rows = self._mirror_load()[0] if self.online else self._read_offline("views")
         names = {}
         for r in rows:
             label = r.get("label")

@@ -310,16 +310,42 @@ async def main():
     assert {e["label"]: e["new"] for e in on.panel()["learned"]}["tape"] is False
     print("13. Atlas: new view in the library at once, counted in the panel; repeats by source rule")
 
+    # Search answers from memory; $vectorSearch runs beside it for the panel; a teach asks Atlas itself
     hit = [{"_id": "x", "label": "m&m", "score": 0.97, "source": "teach"}]
-    with mock.patch.object(type(on.db.views), "aggregate", lambda self, pipeline: list(hit)):
+    asked = []
+
+    def aggregate(self, pipeline):
+        asked.append(pipeline[0]["$vectorSearch"]["limit"])
+        return list(hit)
+    with mock.patch.object(type(on.db.views), "aggregate", aggregate):
         got = on.search_views(unit(11), k=3)
-    assert got == hit and on.last_search["via"] == "$vectorSearch" and on.last_search["hits"][0]["score"] == 0.97 and on.search_count == 1
-    print("14. the latest $vectorSearch is kept for the panel")
+        assert got[0]["label"] == "m&m" and got[0]["score"] > 0.99 and "embedding" not in got[0], got[0]
+        assert await wait_for(lambda: on.last_search is not None, 2.0)
+        assert on.last_search["via"] == "$vectorSearch" and on.last_search["hits"][0]["score"] == 0.97 and asked == [3]
+        assert on.atlas_search(unit(11), k=5) == hit and asked == [3, 5]
+    print("14. search from memory, $vectorSearch in the background for the panel; atlas_search asks Atlas itself")
+
+    # What this process learns is searchable and named at once, without reading the library from Atlas again
+    reads = []
+    real_find = type(on.db.views).find
+
+    def find(self, *a, **k):
+        reads.append(a[:1])
+        return real_find(self, *a, **k)
+    with mock.patch.object(type(on.db.views), "find", find):
+        new = on.add_learned_view("kitkat", unit(14), jpeg_of(), {"source": "teach", "aliases": ["chocolate bar"]},
+                                  same_label_only=True)
+        assert on.search_views(unit(14), k=1)[0]["_id"] == new["id"]
+        assert ["kitkat", "chocolate bar"] in on.list_labels()
+        matrix, labels3 = on.library_matrix()
+    assert reads == [], reads
+    assert matrix.shape[0] == len(labels3) == on.db.views.count_documents({}) == 5, (matrix.shape, labels3)
+    print("15. a learned view: searchable and named from memory at once, no read from Atlas")
 
     on._atlas_usage = (time.monotonic(), {"used_mb": 460.0, "limit_mb": 512})
     assert on.log_observation({"ts": time.time(), "source": "idle"}, jpeg_of()) and on.db.observations.count_documents({}) == 0
     assert on.add_view("after", unit(13), jpeg_of(), {"source": "teach"})
-    print("15. near the free tier's 512 MB: observations stay on the disk, views still go up")
+    print("16. near the free tier's 512 MB: observations stay on the disk, views still go up")
 
 
 def unit(seed):
