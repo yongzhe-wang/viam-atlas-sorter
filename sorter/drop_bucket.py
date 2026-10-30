@@ -4,8 +4,10 @@ its mouth high enough that the object clears the rim, and let go.
 
 WHY: the user replaced the blue square with a ~180 mm tall Halloween bucket and moves it around; nothing is lowered into it.
 {VIAM CENTERAL 2026-10-30 "找到桶 → 抓起 → 飞到桶口上方 Z400 → 松手"}
-[CONFIDENCE: SINGLE-SRC 70% — offline only; the bucket's position comes from AGENT3's sorter.bucket on two real frames]
-Flow: executor.execute -> (after the pick) known_bucket() -> place_in_bucket() -> release_jaws over the mouth.
+{USER 2026-10-30 "MAKE SURE IT CAN WORK WHERE EVER THE BUCKET IS, THE BUCKET CAN MOVE"}
+[CONFIDENCE: SINGLE-SRC 70% — offline only; the bucket's position comes from AGENT3's sorter.bucket on real frames]
+Flow: executor.execute -> (after the pick) fresh_bucket() or locate() -> place_in_bucket(): over the mouth, a frame there
+confirms it (or moves to where the bucket now is), then release_jaws. Never lets go without a bucket estimate under 5 s old.
 """
 import math
 import sys
@@ -21,7 +23,14 @@ from sorter import bucket  # noqa: E402
 
 RIM_CLEAR_MM = 25.0  # the held object's bottom passes this far above the rim
 MOUTH_MARGIN_MM = 35.0  # the jaws let go this far inside the rim at least: the object falls in, not onto the rim
-BUCKET_MAX_AGE_S = 120.0  # a map sighting older than this may be from before the bucket was moved
+FRESH_S = 5.0  # a bucket estimate older than this is looked for again: people move it
+CONFIRM_MM = 30.0  # the frame over the mouth puts it farther than this from the target: move there
+LOOK_Z = 580.0  # the whole 197 mm bucket fits one view from here
+RELEASE_TRIES = 3  # moves toward a bucket that keeps moving before giving up (still holding)
+
+
+class BucketOutOfReach(ppa.SquareNotFound):
+    """No point of the bucket's mouth is within the arm's reach at the release height; still holding the object."""
 
 
 def enabled() -> bool:
@@ -40,15 +49,55 @@ def from_frame(rgb, depth, pose: dict, k: dict):
         return None
 
 
-def known_bucket(found: dict, live: dict, k: dict):
-    """Where the bucket is without moving: the found frame, else the live map's recent entry; None if neither has one."""
-    b = from_frame(found.get("rgb"), found.get("depth"), found.get("pose"), k) if found else None
-    if b is not None:
-        return dict(b, source="frame")
+def fresh_bucket(found: dict, live: dict, k: dict, now: float = None):
+    """The bucket from the found frame or the live map if seen under FRESH_S ago, else None (look again: it may have moved)."""
+    now = time.time() if now is None else now
+    if found and now - float(found.get("ts") or 0.0) <= FRESH_S:
+        b = from_frame(found.get("rgb"), found.get("depth"), found.get("pose"), k)
+        if b is not None:
+            return dict(b, source="frame", seen_ts=float(found["ts"]))
     m = (live or {}).get("bucket")
-    if m and time.time() - float(m.get("seen_ts") or 0.0) <= BUCKET_MAX_AGE_S:
+    if m and now - float(m.get("seen_ts") or 0.0) <= FRESH_S:
         return dict(m, source="map")
     return None
+
+
+async def look(rig, k: dict):
+    """The bucket in a frame from where the arm is, or None."""
+    q = await rig.pose()
+    rgb, depth = await rig.frame()
+    b = from_frame(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta}, k)
+    return None if b is None else dict(b, source=f"look ({q.x:.0f},{q.y:.0f},{q.z:.0f})", seen_ts=time.time())
+
+
+async def locate(rig, k: dict, poses: list):
+    """
+    Look for the bucket while holding: from here, then from LOOK_Z over here, then from each of `poses` ((x, y, z), nearest
+    first); the first full view wins, else the best partial one; None if no view shows it.
+    {VIAM CENTERAL 2026-10-30 "先在当前位置看一眼，看不到就升到 Z580 看全景"}
+    """
+    best = await look(rig, k)
+    if best is not None and not best["partial"]:
+        return best
+    p = await rig.pose()
+    first = [(p.x, p.y, LOOK_Z)] if ppa.reachable(p.x, p.y, LOOK_Z) else []
+    left = [q for q in poses if ppa.reachable(*q) and math.hypot(q[0], q[1]) >= 150.0]
+    at = (p.x, p.y)
+    while first or left:
+        if first:
+            x, y, z = first.pop()
+            await rig.rise(z)  # straight up where it is: no sideways leg
+        else:
+            x, y, z = min(left, key=lambda q: math.hypot(q[0] - at[0], q[1] - at[1]))
+            left.remove((x, y, z))
+            await ppa.travel(rig, x, y, theta=0.0, z=z)
+        at = (x, y)
+        b = await look(rig, k)
+        if b is not None and not b["partial"]:
+            return b
+        if b is not None and (best is None or b["confidence"] > best["confidence"]):
+            best = b
+    return best
 
 
 def release_z(b: dict, height: float, grip: float) -> float:
@@ -61,69 +110,110 @@ def release_z(b: dict, height: float, grip: float) -> float:
     return max(ppa.ALIGN_Z, ppa.ALIGN_Z + need - tips_at_align)
 
 
-def release_xy(b: dict, z: float):
+def release_xy(b: dict, z: float, off=(0.0, 0.0)):
     """
-    Flange xy (theta 0: the jaw axis is the flange xy) inside the mouth by MOUTH_MARGIN_MM, the centre if the arm reaches it
-    there, else the reachable point nearest the centre; None if no point of the mouth is reachable at z.
+    Flange xy at theta 0 for the release: the held object's centre (`off` from the jaws at theta 0) inside the mouth by
+    MOUTH_MARGIN_MM, nearest the bucket's centre among the points the arm reaches at z, kept as far from the base as a grasp
+    (MIN_GRASP_R_MM + REACH_MARGIN_MM: the people at the table); None if there is none.
     """
+    from sorter.grasp import REACH_MARGIN_MM
+
     c = np.array(b["xy"], float)
     r = max(0.0, float(b.get("radius_mm") or bucket.RADIUS_MM) - MOUTH_MARGIN_MM)
+    near = ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM
     best = None
     for dx in np.arange(-r, r + 0.1, 5.0):
         for dy in np.arange(-r, r + 0.1, 5.0):
-            if math.hypot(dx, dy) > r:
-                continue
-            x, y = c[0] + dx, c[1] + dy
-            if not ppa.reachable(x, y, z) or math.hypot(x, y) < 150.0:
-                continue
             d = math.hypot(dx, dy)
-            if best is None or d < best[0]:
+            if d > r or (best is not None and d >= best[0]):
+                continue
+            x, y = c[0] + dx - off[0], c[1] + dy - off[1]
+            if ppa.reachable(x, y, z) and math.hypot(x, y) >= near:
                 best = (d, float(x), float(y))
     return None if best is None else (best[1], best[2])
 
 
-async def look_for_bucket(rig, k: dict, poses: list):
-    """Carrying: look from each reachable pose (nearest first) until a frame shows the bucket; None if none does."""
-    p = await rig.pose()
-    at = (p.x, p.y)
-    left = [q for q in poses if ppa.reachable(*q) and math.hypot(q[0], q[1]) >= 150.0]
-    while left:
-        x, y, z = min(left, key=lambda q: (q[2] > ppa.ALIGN_Z + 1, math.hypot(q[0] - at[0], q[1] - at[1])))
-        left.remove((x, y, z))
-        at = (x, y)
-        await ppa.travel(rig, x, y, theta=0.0, z=z)
-        q = await rig.pose()
-        rgb, depth = await rig.frame()
-        b = from_frame(rgb, depth, {"x": q.x, "y": q.y, "z": q.z, "theta": q.theta}, k)
-        if b is not None:
-            print(f"  bucket: seen from ({x:.0f},{y:.0f},{z:.0f}) at ({b['xy'][0]:.0f},{b['xy'][1]:.0f})")
-            return dict(b, source="search")
-    return None
+def where_to_move(b: dict, z: float) -> str:
+    """What to tell the person when the arm reaches no point of the mouth: which way to move the bucket and about how far."""
+    from sorter.grasp import REACH_MARGIN_MM
+
+    x, y = b["xy"]
+    d = math.hypot(x, y)
+    (z0, r0), (z1, r1) = ppa.REACH_R_MM
+    far = r0 if z <= z0 else r1 if z >= z1 else r0 + (r1 - r0) * (z - z0) / (z1 - z0)
+    near = ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM
+    mouth = float(b.get("radius_mm") or bucket.RADIUS_MM) - MOUTH_MARGIN_MM
+    if d - mouth > far:
+        return f"move it about {d - mouth - far + 30:.0f} mm closer to the arm"
+    if d + mouth < near:
+        return f"move it about {near - d - mouth + 30:.0f} mm away from the arm"
+    return "move it out of the arm's keep-out area"
 
 
-async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict) -> dict:
+async def place_in_bucket(rig, height: float, grip: float, times: dict, b: dict, k: dict, poses: list,
+                          off=(0.0, 0.0)) -> dict:
     """
-    Carry the held object over the bucket `b` and let go. Returns {"xy" (flange xy of the release), "z", "off_mm" (from the
-    bucket's centre)}; raises ppa.SquareNotFound (still holding) if the arm reaches no point of the mouth.
-    Up first where it is, then across: the object then crosses the rim already above it. No hand check over the mouth: the
-    bucket is in the depth sensor's blind range there and read as an intruder.
+    Carry the held object over the bucket `b` and let go. Returns {"xy" (flange xy of the release), "z", "off_mm" (object
+    centre from the bucket's centre, by the last look), "looks"}. Still holding, raises BucketOutOfReach (no point of the mouth
+    within reach: says which way to move it) or ppa.SquareNotFound (the bucket is nowhere to be seen, or kept moving).
+    Up first where it is, then across: the object then crosses the rim already above it. Over the mouth a frame confirms the
+    bucket within CONFIRM_MM, else the arm follows it; a frame without it sends the arm up to LOOK_Z over here to look, and a
+    look from there that agrees stands as the confirmation. {VIAM CENTERAL 2026-10-30 "松手前再确认一次 ... 不在桶外松手"}
+    No hand check over the mouth: the bucket is in the depth sensor's blind range there and read as an intruder.
     """
     t = time.monotonic()
     times["at"] = "carry"
-    z = release_z(b, height, grip)
-    xy = release_xy(b, z)
-    if xy is None:
-        raise ppa.SquareNotFound(f"bucket at ({b['xy'][0]:.0f},{b['xy'][1]:.0f}): no point of its mouth within reach at z {z:.0f}")
-    print(f"3/5 carry to the bucket ({b.get('source')}): centre ({b['xy'][0]:.0f},{b['xy'][1]:.0f}), "
-          f"release at ({xy[0]:.0f},{xy[1]:.0f}) z {z:.0f}")
-    p = await rig.pose()
-    if p.z < z - 1.0:
-        await rig.rise(z, settle=False)
-    await ppa.travel(rig, xy[0], xy[1], theta=0.0, z=z, settle=False)
+    looks = []
+    for _ in range(RELEASE_TRIES):
+        z = release_z(b, height, grip)
+        xy = release_xy(b, z, off)
+        if xy is None:
+            raise BucketOutOfReach(f"bucket at ({b['xy'][0]:.0f},{b['xy'][1]:.0f}) is out of the arm's reach for a release: "
+                                   f"{where_to_move(b, z)}")
+        print(f"3/5 carry to the bucket ({b.get('source')}): centre ({b['xy'][0]:.0f},{b['xy'][1]:.0f}), "
+              f"release at ({xy[0]:.0f},{xy[1]:.0f}) z {z:.0f}")
+        p = await rig.pose()
+        if p.z < z - 1.0:
+            await rig.rise(z, settle=False)
+        await ppa.travel(rig, xy[0], xy[1], theta=0.0, z=z)
+        seen = await look(rig, k)
+        if seen is None:
+            # Over the mouth the bucket may fill the view: from higher up it is whole
+            print("  bucket: not in the view over its mouth; looking from higher up")
+            q = await rig.pose()
+            if ppa.reachable(q.x, q.y, LOOK_Z):
+                await rig.rise(LOOK_Z)
+                seen = await look(rig, k)
+            if seen is None:
+                seen = await locate(rig, k, poses)
+            if seen is None:
+                raise ppa.SquareNotFound("bucket: not seen again before the release; still holding, nothing let go")
+            d = math.dist(seen["xy"], b["xy"])
+            looks.append(round(d, 1))
+            if d > CONFIRM_MM:
+                print(f"  bucket moved {d:.0f} mm: following it")
+                b = seen
+                continue
+            q = await rig.pose()
+            if math.hypot(q.x - xy[0], q.y - xy[1]) <= 1.0:
+                await rig.descend(z, settle=False)  # back down where it looked from: no sideways leg
+            else:
+                await ppa.travel(rig, xy[0], xy[1], theta=0.0, z=z, settle=False)
+            break
+        d = math.dist(seen["xy"], b["xy"])
+        looks.append(round(d, 1))
+        if d > CONFIRM_MM:
+            print(f"  bucket {d:.0f} mm from where it was thought to be: following it")
+            b = seen
+            continue
+        break
+    else:
+        raise ppa.SquareNotFound(f"bucket kept moving ({looks} mm between looks); still holding, nothing let go")
     times["carry"] = round(time.monotonic() - t, 1)
     times["at"] = "place"
-    print("4/5 release over the bucket")
+    print(f"4/5 release over the bucket (confirmed within {looks[-1]:.0f} mm)")
     await ppa.release_jaws(rig)
     ppa.save_state(False)
     times["place"] = round(time.monotonic() - t - times["carry"], 1)
-    return {"xy": xy, "z": z, "off_mm": math.hypot(xy[0] - b["xy"][0], xy[1] - b["xy"][1])}
+    centre = (xy[0] + off[0], xy[1] + off[1])
+    return {"xy": xy, "z": z, "off_mm": math.dist(centre, b["xy"]), "looks": looks}

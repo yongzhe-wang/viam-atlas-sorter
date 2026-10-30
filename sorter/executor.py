@@ -33,7 +33,7 @@ from scipy.spatial import ConvexHull
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import pick_place_auto as ppa  # noqa: E402  arm library (Rig, pick, place_in_square, place_at, ...)
 
-from sorter import clip_embed, drop_bucket, drop_square, grasp, perception  # noqa: E402
+from sorter import bucket, clip_embed, drop_bucket, drop_square, grasp, perception  # noqa: E402
 from sorter.grasp import REACH_MARGIN_MM, grasp_px, ring_geometry, ring_world  # noqa: E402
 
 COLOUR_TOL = 60.0  # RGB distance that still counts as the object at close range (grey/black/white objects)
@@ -1278,6 +1278,11 @@ async def look_here(rig, text: str, store, source: str = "demo", excluded: list 
         # part of the paper is in view: AGENT3's drop_square), by the grasp point's table xy
         if hole is not None and in_hole(o, hole):
             return True
+        bk = (live_map(rig) or {}).get("bucket")
+        if bk and bucket.TARGET == "bucket":
+            gu, gv, _ = grasp_px(o, pose, k)
+            if bucket.contains(bk, perception.world_xy(pose, k, gu, gv, o.top_depth_mm)):
+                return True
         if not sq:
             return False
         gu, gv, _ = grasp_px(o, pose, k)
@@ -1611,18 +1616,28 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         height, grip, tracker = await grasp_with_primitives(rig, found, esc, times, doc, text, store)
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         doc["grip"] = grip_record(rig, tracker.primitive, height, grip)
-        # The bucket, when there is one (SORTER_TARGET=bucket): known from the found frame or the map, or, with no square
-        # known either, looked for while carrying; no bucket anywhere falls through to the square
-        bk = drop_bucket.known_bucket(found, live_map(rig), intr(rig)) if drop_bucket.enabled() else None
-        if bk is None and drop_bucket.enabled() and not found.get("square") and not square_sightings(rig):
-            bk = await drop_bucket.look_for_bucket(rig, intr(rig), [(*ppa.HOME_XY, ppa.ALIGN_Z)] + [(x, y, SWEEP_Z) for x, y in SWEEP_XY])
-        if bk is not None:
-            put = await drop_bucket.place_in_bucket(rig, height, grip, times, bk)
+        # The bucket (SORTER_TARGET=bucket) when one was seen in the found frame or the map, or when no square is known
+        # either; the square otherwise. Its position is looked at again unless it is under drop_bucket.FRESH_S old.
+        live = live_map(rig) or {}
+        bk = drop_bucket.fresh_bucket(found, live, intr(rig)) if drop_bucket.enabled() else None
+        if drop_bucket.enabled() and (bk is not None or live.get("bucket") or drop_bucket.from_frame(
+                found.get("rgb"), found.get("depth"), found.get("pose"), intr(rig)) or not (found.get("square") or square_sightings(rig))):
+            poses = [(*ppa.HOME_XY, drop_bucket.LOOK_Z)] + [(x, y, SWEEP_Z) for x, y in SWEEP_XY]
+            if bk is None:
+                times["at"] = "carry"
+                bk = await drop_bucket.locate(rig, intr(rig), poses)
+            if bk is None:
+                raise ppa.SquareNotFound("no bucket in view from here or from above; still holding")
+            # Where the object's centre is from the jaws at theta 0: that is what must be over the mouth
+            held = held_ring(rig, obj, found["pose"]) or held_centre(rig, obj, found["pose"], tracker)
+            off = ring_offset_at(held, 0.0) if held else (0.0, 0.0)
+            put = await drop_bucket.place_in_bucket(rig, height, grip, times, bk, intr(rig), poses, off)
             times["at"] = "check"
             rgb, _ = await rig.frame()
-            doc.update(img_after=jpeg(rgb), success=True, status="done", drop="bucket",
-                       bucket_xy=list(bk["xy"]), square_path=f"bucket {bk.get('source')}",
-                       check=f"released over the bucket mouth, {put['off_mm']:.0f} mm from its centre, at z {put['z']:.0f}")
+            doc.update(img_after=jpeg(rgb), success=True, status="done", drop="bucket", bucket_xy=list(bk["xy"]),
+                       square_path=f"bucket {bk.get('source')}",
+                       check=f"released over the bucket mouth, object centre {put['off_mm']:.0f} mm from its centre "
+                             f"(looks agreed within {put['looks']} mm), at z {put['z']:.0f}")
             grasp.forget_escalation(text)
             emb = embedding_of(found, obj)
             if emb is not None:
@@ -1701,6 +1716,10 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
     except ppa.EStop:
         # A person pressed the emergency stop: no recover, no retries, no move back
         doc.update(status="estop", fail_phase=times.get("at", "start"), fail_reason=ppa.ESTOP_STATUS)
+    except drop_bucket.BucketOutOfReach as e:
+        # An answer for the person, not an accident: put it back, say which way to move the bucket
+        doc.update(status="bucket_out_of_reach", fail_phase="place", fail_reason=str(e))
+        await recover(rig, doc)
     except ppa.SquareFull as e:
         # Nothing free in the square: put it back where it came from and say so
         doc.update(status="square_full", fail_phase="place", fail_reason=str(e))
