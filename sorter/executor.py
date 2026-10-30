@@ -33,7 +33,7 @@ from scipy.spatial import ConvexHull
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import pick_place_auto as ppa  # noqa: E402  arm library (Rig, pick, place_in_square, place_at, ...)
 
-from sorter import bucket, clip_embed, drop_bucket, drop_square, grasp, perception  # noqa: E402
+from sorter import bucket, clip_embed, coverage, drop_bucket, drop_square, grasp, perception  # noqa: E402
 from sorter.grasp import REACH_MARGIN_MM, grasp_px, ring_geometry, ring_world  # noqa: E402
 
 COLOUR_TOL = 60.0  # RGB distance that still counts as the object at close range (grey/black/white objects)
@@ -1298,6 +1298,12 @@ async def look_here(rig, text: str, store, source: str = "demo", excluded: list 
     found.update(rgb=rgb, depth=depth, pose=pose, square=square_from_frame(rgb, depth, pose, intr(rig)))
     if grasp.search_v2() and found.get("obj") is None:
         found["candidates"] = view_candidates(seg, delivered, list(excluded), text, store, recs, pose, k)
+        inside = [o for o in seg.objects if not o.touches_edge and delivered(o)]
+        try:
+            if inside and clip_embed.best(inside, text, store).get("obj") is not None:
+                found.update(reason=f"{text!r} is already in the square", delivered=True)
+        except Exception as e:
+            print(f"  delivered check failed: {e}")
     return found
 
 
@@ -1337,6 +1343,8 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
     excluded: objects a failed pick of this job already tried (the module's retry).
     """
     hint_xy = hint_xy if hint_xy is not None else hint_for(text, store)
+    if grasp.search_v2():
+        return await coverage_search(rig, text, store, hint_xy, progress, skip_current, excluded)
     poses = []
     if hint_xy is not None:
         fx, fy = perception.look_flange_xy(tuple(hint_xy))
@@ -1382,24 +1390,137 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
                 found.update(square=square, square_from="search")
             print(f"  search: found at view {views} ({path})")
             return found
+        last = found
+    last["reason"] = f"no {text!r} on the table after {views} views ({last.get('reason')})"
+    return last
+
+
+COVER_MAX_VIEWS = 8  # first-stage views at most ...
+COVER_MAX_S = 25.0  # ... and seconds; then the close looks
+COVER_DONE = 0.98  # share of the table's cells seen that counts as all of it
+
+
+async def report_progress(progress, views: int, n: int, path: str, found: bool) -> None:
+    """The module's search status; never fails the search."""
+    if progress is None:
+        return
+    try:
+        r = progress(views, n, path, found)
+        if inspect.isawaitable(r):
+            await r
+    except Exception as e:
+        print(f"  search progress callback failed: {e}")
+
+
+def target_xy_of(found: dict, rig) -> tuple:
+    """Table xy of an accepted object's grasp point in its frame."""
+    k, pose, o = intr(rig), found["pose"], found["obj"]
+    u, v, _ = grasp_px(o, pose, k)
+    xy = perception.world_xy(pose, k, u, v, o.top_depth_mm)
+    return float(xy[0]), float(xy[1])
+
+
+async def coverage_search(rig, text: str, store, hint_xy, progress, skip_current: bool, excluded: list) -> dict:
+    """
+    SEARCH_V2's search: the current view, the hint, then the view that shows the most unseen table per second of moving
+    (coverage.next_view), until the reachable table was all seen (COVER_DONE), COVER_MAX_VIEWS or COVER_MAX_S; every view's
+    candidates go into one table merged by xy. Then close looks (close_looks), best first.
+    A view at ALIGN_Z whose best() accepts ends the search there (the fast path); accepted from higher up, it is looked at
+    closely first. {VIAM CENTERAL 2026-10-30 "候选一律近看确认（Z400 俯视...）再抓"; "上限 8 个视角或 25 S"}
+    [CONFIDENCE: SINGLE-SRC 70% — offline on recorded frames; straight-down views only (the camera model has no tilt), and no
+    multi-angle vote on the close look]
+    Says why when it ends without the object: already in the square, too close to the base, out of reach, the share of the
+    table seen and how much the bucket hid.
+    """
+    k = intr(rig)
+    cov = coverage.Coverage(k)
+    look_kw = {"excluded": list(excluded)} if excluded else {}
+    t0 = time.monotonic()
+    table, done, views, square, last = [], [], 0, None, {"obj": None, "reason": "nothing seen"}
+    p = await rig.pose()
+    at = (p.x, p.y, p.z)
+    plan = [] if skip_current else [("current", None)]
+    if hint_xy is not None:
+        fx, fy = perception.look_flange_xy(tuple(hint_xy))
+        if ppa.reachable(fx, fy) and math.hypot(fx, fy) >= 120.0:
+            plan.append(("hint", (fx, fy, ppa.ALIGN_Z)))
+    while views < COVER_MAX_VIEWS and time.monotonic() - t0 < COVER_MAX_S:
+        if plan:
+            path, q = plan.pop(0)
+        else:
+            nv = coverage.next_view(cov, at, done)
+            if nv is None:
+                break
+            path, q = "cover", nv[0]
+        if q is not None:
+            done.append(q)
+            try:
+                await ppa.travel(rig, q[0], q[1], theta=0.0, z=q[2])
+            except ppa.MoveRefused as e:
+                if isinstance(e, ppa.EStop):
+                    raise  # an emergency stop ends the task, never skipped like a refused pose
+                print(f"  search: skipping ({q[0]:.0f},{q[1]:.0f},{q[2]:.0f}): {e}")
+                continue
+            at = q
+        else:
+            done.append(at)
+        found = await look_here(rig, text, store, source="look" if path == "hint" else "demo", **look_kw)
+        views += 1
+        found.update(path=path, views=views)
+        square = found.get("square") or square
+        hit = bucket.find_mask(found["rgb"]) if bucket.TARGET == "bucket" and found.get("rgb") is not None else None
+        new = cov.update(found.get("depth"), found["pose"], hit["mask"] if hit else None)
+        print(f"  search view {views} ({path}): {new} new cells, {cov.fraction():.0%} of the table seen")
+        await report_progress(progress, views, COVER_MAX_VIEWS, path, found.get("obj") is not None)
+        if found.get("obj") is not None:
+            if abs(float(found["pose"]["z"]) - ppa.ALIGN_Z) <= 15.0:
+                if found.get("square") is None and square is not None:
+                    found.update(square=square, square_from="search")
+                print(f"  search: found at view {views} ({path})")
+                return found
+            # Accepted from higher up: first in line for a close look, now
+            table.insert(0, {"xy": target_xy_of(found, rig), "score": float("inf"), "why": "accepted from afar"})
+            break
+        if found.get("delivered"):
+            return found
         merge_candidates(table, found.get("candidates") or [])
         last = found
-    # Second stage: closer, the best first
+        if cov.fraction() >= COVER_DONE:
+            break
+    found, views, last2, notes = await close_looks(rig, text, store, table, look_kw, views, square)
+    if found is not None:
+        return found
+    last = last2 or last
+    notes.append(f"{cov.fraction():.0%} of the table seen in {views} views"
+                 + (f", {cov.hidden_cells()} cells hidden by the bucket or without depth" if cov.hidden_cells() else ""))
+    last["reason"] = f"no {text!r} found ({'; '.join(notes)}; last: {last.get('reason')})"
+    return last
+
+
+async def close_looks(rig, text: str, store, table: list, look_kw: dict, views: int, square) -> tuple:
+    """
+    The second stage: from ALIGN_Z over each of the best CAND_LOOKS candidates, best() decides again, strictly.
+    (found or None, views, last look or None, notes on candidates that could not be looked at).
+    """
     table.sort(key=lambda c: -c["score"])
-    looked = 0
+    looked, last, notes = 0, None, []
+    near = ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM
     for c in table:
         if looked >= CAND_LOOKS:
             break
+        if math.hypot(*c["xy"]) < near:
+            notes.append(f"a candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) is too close to the base")
+            continue
         fx, fy = perception.look_flange_xy(c["xy"])
         if not ppa.reachable(fx, fy) or math.hypot(fx, fy) < 120.0:
-            print(f"  search: candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) out of reach for a close look")
+            notes.append(f"a candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) is out of reach")
             continue
         try:
             await ppa.travel(rig, fx, fy, theta=0.0, z=ppa.ALIGN_Z)
         except ppa.MoveRefused as e:
             if isinstance(e, ppa.EStop):
                 raise
-            print(f"  search: skipping candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}): {e}")
+            notes.append(f"a candidate at ({c['xy'][0]:.0f},{c['xy'][1]:.0f}) could not be reached: {e}")
             continue
         looked += 1
         found = await look_here(rig, text, store, source="look", **look_kw)
@@ -1411,11 +1532,11 @@ async def search_and_find(rig, text: str, store, hint_xy=None, progress=None, sk
         if found.get("obj") is not None:
             if found.get("square") is None and square is not None:
                 found.update(square=square, square_from="search")
-            return found
+            return found, views, found, notes
         last = found
-    what = f", {looked} close looks at {len(table)} candidates" if table else ""
-    last["reason"] = f"no {text!r} on the table after {views} views{what} ({last.get('reason')})"
-    return last
+    if table:
+        notes.insert(0, f"{looked} close looks at {len(table)} candidates")
+    return None, views, last, notes
 
 
 def wrist_for(pose: dict, k: dict, u: float, v: float, yaw: float, depth: float) -> float:
