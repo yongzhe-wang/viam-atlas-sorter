@@ -22,6 +22,7 @@ RIM_HEIGHT_MM = 180.0  # measured on this bucket; used while the rim is too clos
 RADIUS_MM = 98.5  # 197 mm mouth
 RADIUS_RANGE_MM = (70.0, 130.0)  # at the rim's depth; anything else orange is not this bucket
 MIN_AREA_PX = 15000  # at the 580 mm view it is ~150000 px; a corner of it in view may be much less
+MIN_AREA_NO_CIRCLE_PX = 40000  # cut out without a circle only when this big: an orange block is < 15000 px
 MIN_INLIERS = 0.45  # share of the contour on the fitted circle (handle lugs, the frame and objects take the rest)
 MASK_GROW_PX = 14  # segmentation stays this far from the bucket: its shadow, and parallax between colour and depth
 ARC_FULL = 0.8  # share of the circle seen for it not to count as partial
@@ -89,12 +90,16 @@ def find_mask(rgb: np.ndarray) -> dict:
         return None
     pts = pts[:: max(1, len(pts) // 800)]
     fit = _fit_circle(pts, tol=max(4.0, 0.012 * math.sqrt(sizes[k] / math.pi)))
-    if fit is None:
-        return None
+    share = float(fit[3].mean()) if fit is not None else 0.0
+    if fit is None or share < MIN_INLIERS:
+        # No circle: a tilted view sees the mouth as an ellipse. A region this big is still the bucket to cut out (else it
+        # is a 170 mm "intruder" and the arm pauses), but there is no centre to put on the map.
+        # {TILT_Y+ "INTR ['BLOB 174 MM TALL, SKIN 7%'…] BUCKET FALSE"} [CONFIDENCE: CONFIRMED 75% — one tilted frame]
+        if sizes[k] < MIN_AREA_NO_CIRCLE_PX:
+            return None
+        mask = ndimage.binary_dilation(region, iterations=MASK_GROW_PX)
+        return {"mask": mask, "center_px": None, "radius_px": None, "arc": 0.0, "inliers": share, "cut": bool((~keep).any())}
     cu, cv, r, inl = fit
-    share = float(inl.mean())
-    if share < MIN_INLIERS:
-        return None
     angles = np.arctan2(pts[inl, 1] - cv, pts[inl, 0] - cu)
     arc = len(np.unique(((angles + math.pi) / (2 * math.pi) * 72).astype(int))) / 72.0
     vv, uu = np.ogrid[:H, :W]
@@ -113,6 +118,8 @@ def locate(hit: dict, depth: np.ndarray, table_depth_mm: float, pose: dict, intr
     """
     from sorter import perception
 
+    if hit.get("center_px") is None:
+        return None  # no circle fitted (tilted view): cut out, but not located
     cu, cv, r = *hit["center_px"], hit["radius_px"]
     H, W = depth.shape
     vv, uu = np.ogrid[:H, :W]

@@ -300,7 +300,7 @@ def observe_frame(rgb: np.ndarray, depth: np.ndarray, pose: dict, intr: dict = N
     sq = perception.find_drop_square(rgb, depth, plane=seg.plane)
     square = drop_square.observe(sq, pose, intr) if sq else None
     bk = None
-    if seg.bucket is not None:
+    if seg.bucket is not None and seg.bucket.get("center_px") is not None:
         a, b, c = seg.plane
         cu, cv = seg.bucket["center_px"]
         bk = bucket.locate(seg.bucket, depth.astype(float), float(a * cu + b * cv + c), pose, intr)

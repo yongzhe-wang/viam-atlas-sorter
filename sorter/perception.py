@@ -158,6 +158,73 @@ def fit_table(depth: np.ndarray) -> tuple:
     return float(a), float(b), float(c)
 
 
+# A tilted camera (the wrist turned ~25 deg to look across the table): the table's depth is no longer near-linear in the
+# pixel (350-640 mm in one frame), the linear fit holds 4 % of it and every object read 120-160 mm tall. The plane is then
+# fitted in camera space and heights are distances from it. Straight-down frames keep the linear fit (>= 58 % inliers).
+# {TILT_Y+ "|RES|<3MM SHARE 0.04" "INTR ['BLOB 149 MM TALL…', 'BLOB 160 MM TALL…']"; SCAN "MIN 0.63"; BUCKET "0.58"}
+# [CONFIDENCE: CONFIRMED 80% — three tilted frames; straight-down frames never take this path]
+TILT_FIT_SHARE = 0.3
+BUCKET_NEAR_PX = 30  # a tall or skin-coloured blob this close to the bucket ...
+BUCKET_PART_SHARE = 0.2  # ... with this share of it there is part of the bucket (handle, shaded wall)
+
+
+def _linear_fit_share(d: np.ndarray, plane: tuple) -> float:
+    """Share of valid pixels within 3 mm of the linear table fit (sampled every 4 px)."""
+    a, b, c = plane
+    vv, uu = np.mgrid[0:d.shape[0]:4, 0:d.shape[1]:4]
+    dd = d[::4, ::4]
+    ok = dd > 0
+    return float((np.abs(dd - (a * uu + b * vv + c))[ok] < 3.0).mean()) if ok.any() else 1.0
+
+
+def fit_table_3d(depth: np.ndarray, intr: dict = None) -> tuple:
+    """
+    (n, k, height, (a, b, c)): the table as a plane n.P = k in camera coordinates (n unit, away from the camera), the
+    height of every pixel above it (mm, along n; 0 where depth is invalid) and a linear depth approximation for callers.
+
+    RANSAC on back-projected points (seeded), then least squares on the inliers in two tightening bands.
+    """
+    intr = intr or INTRINSICS
+    H, W = depth.shape
+    vv, uu = np.mgrid[0:H, 0:W]
+    d = depth.astype(float)
+    valid = (d > 0) & (d < 2000)
+    X = (uu - intr["cx"]) * d / intr["fx"]
+    Y = (vv - intr["cy"]) * d / intr["fy"]
+    sub = valid[::4, ::4]
+    pts = np.column_stack([X[::4, ::4][sub], Y[::4, ::4][sub], d[::4, ::4][sub]])
+    rng = np.random.default_rng(0)
+    best_n, best_k, best_cnt = None, None, -1
+    for _ in range(200):
+        p = pts[rng.choice(len(pts), 3, replace=False)]
+        n = np.cross(p[1] - p[0], p[2] - p[0])
+        norm = np.linalg.norm(n)
+        if norm < 1e-6:
+            continue
+        n = n / norm
+        k = float(n @ p[0])
+        cnt = int((np.abs(pts @ n - k) < 4.0).sum())
+        if cnt > best_cnt:
+            best_n, best_k, best_cnt = n, k, cnt
+    n, k = best_n, best_k
+    for band in (6.0, 3.0):
+        inl = pts[np.abs(pts @ n - k) < band]
+        centre = inl.mean(axis=0)
+        q = inl - centre
+        n = np.linalg.eigh(q.T @ q)[1][:, 0]  # the normal: least-spread direction (a full svd built an N x N matrix: 37 s)
+        k = float(n @ centre)
+    if k < 0:
+        n, k = -n, -k  # n points away from the camera: table points have n.P = k > 0, nearer points less
+    height = np.where(valid, k - (X * n[0] + Y * n[1] + d * n[2]), 0.0)
+    # Linear stand-in for callers that take (a, b, c): the plane's depth along each pixel's ray, fitted over the frame
+    ray = n[0] * (uu[::8, ::8] - intr["cx"]) / intr["fx"] + n[1] * (vv[::8, ::8] - intr["cy"]) / intr["fy"] + n[2]
+    z = np.where(ray > 1e-6, k / np.maximum(ray, 1e-6), np.nan)
+    ok = np.isfinite(z) & (z < 3000)
+    A = np.column_stack([uu[::8, ::8][ok], vv[::8, ::8][ok], np.ones(int(ok.sum()))])
+    (a, b, c), *_ = np.linalg.lstsq(A, z[ok], rcond=None)
+    return n, k, height, (float(a), float(b), float(c))
+
+
 def to_depth_grid(mask: np.ndarray, model: tuple = None) -> np.ndarray:
     """A colour-grid mask on the depth grid (aligned: the same pixels; unaligned: its inverse mapping, a little dilated)."""
     if model is None or model == IDENTITY:
@@ -346,9 +413,14 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         d = np.where(cut, 0.0, d)
         valid_for_intruders = valid | cut
         valid = valid & ~cut
+    near_bucket = ndimage.binary_dilation(bk["mask"], iterations=BUCKET_NEAR_PX) if bk is not None else None
     a, b, c = fit_table(d)
     vv, uu = np.mgrid[0:d.shape[0], 0:d.shape[1]]
-    height = np.where(valid, a * uu + b * vv + c - d, 0.0)
+    if _linear_fit_share(d, (a, b, c)) < TILT_FIT_SHARE:
+        _, _, height, (a, b, c) = fit_table_3d(d)  # tilted view: heights from the plane in camera space
+        height = np.where(valid, height, 0.0)
+    else:
+        height = np.where(valid, a * uu + b * vv + c - d, 0.0)
 
     above = ndimage.binary_opening(valid & (height > MIN_HEIGHT_MM) & (height < 300), iterations=2)
     table = valid & (np.abs(height) < 3)
@@ -395,6 +467,10 @@ def segment_full(rgb: np.ndarray, depth: np.ndarray, align=None) -> Segmentation
         # A tall blob, or a skin-coloured one (a hand resting on the table), is never a target
         sk = skin_fraction(rgb[sc], m_s)
         if top_h > MAX_OBJ_HEIGHT_MM or sk >= 0.5:
+            # The bucket's handle (a black wire loop standing up) and its shaded wall (reads as skin) are the bucket, not a hand
+            # {AFTER_BB "BLOB 86 MM TALL, SKIN 64%" = HANDLE + WALL BESIDE THE CUT} [CONFIDENCE: CONFIRMED 80% — three frames]
+            if near_bucket is not None and near_bucket[sc][m_s].mean() >= BUCKET_PART_SHARE:
+                continue
             # Never a target; an intruder only if it reaches into the workspace (else static scenery)
             if _reaches_inside(bbox, (H, W)):
                 intruders.append({"bbox": bbox, "area": int(m_s.sum()),
