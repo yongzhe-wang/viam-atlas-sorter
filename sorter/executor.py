@@ -2475,9 +2475,12 @@ async def clear_square(rig, store) -> dict:
     return doc
 
 
+RESUME_OPEN_MM = 80.0  # jaws open this far (84 mm stroke) hold nothing, whatever the saved state says
+
+
 async def resume(rig, store):
     """
-    After a restart: if the gripper still holds something, put it in the square first. Returns the doc or None.
+    After a restart: if the gripper still holds something, put it in the bucket (or the square) first. Returns the doc or None.
 
     WHY: the SDK can abort the process mid-carry; the supervisor restarts it with the object still held.
     Height/grip come from data/arm_state.json (pick_place_auto.save_state); defaults fit the yellow block.
@@ -2489,10 +2492,14 @@ async def resume(rig, store):
     if st.get("holding") and st.get("mode") == "internal":
         rig.grip_mode = "internal"
     elif not await rig.holding():
-        if st.get("holding"):
-            ppa.save_state(False)
-        return None
-    print("resume: gripper is holding something; placing it in the square first")
+        # holding() also says False with a block in the jaws (2026-10-29): the jaws' opening decides what the state claims.
+        # Closed on nothing or wide open, nothing is held.
+        jaw = await rig.jaw_mm() if st.get("holding") else None
+        if jaw is None or not ppa.EMPTY_JAW_MM <= jaw < RESUME_OPEN_MM:
+            if st.get("holding"):
+                ppa.save_state(False)
+            return None
+    print("resume: gripper is holding something; placing it first")
     height, grip = st.get("height") or 32.0, st.get("grip") or 15.0
     doc = {"ts": time.time(), "mode": "resume", "target_text": "held after restart", "success": False,
            "status": "failed", "fail_phase": None, "fail_reason": None, "height_mm": height}
@@ -2501,6 +2508,21 @@ async def resume(rig, store):
     start_recording(rig, store, doc)
     t0 = time.monotonic()
     try:
+        # The bucket when there is one: looking for a square that is not on the table left the object on the jaws for good
+        k = intr(rig)
+        live = live_map(rig) or {}
+        bk = None
+        if drop_bucket.enabled():
+            poses = [(*ppa.HOME_XY, drop_bucket.LOOK_Z)] + [(x, y, SWEEP_Z) for x, y in SWEEP_XY]
+            bk = drop_bucket.fresh_bucket(None, live, k) or await drop_bucket.locate(rig, k, poses, hint=drop_bucket.last_known(live))
+        if bk is not None:
+            put = await drop_bucket.place_in_bucket(rig, height, grip, times, bk, k, poses)
+            doc.update(success=True, status="done", drop="bucket", bucket_xy=list(bk["xy"]), check=put.get("why") or "released over the bucket")
+            times.pop("at", None)
+            doc["phase_times"], doc["duration_s"] = times, round(time.monotonic() - t0, 1)
+            finish(rig, store, doc)
+            STATE.update(times=None, error=None)
+            return doc
         await ppa.place_in_square(rig, height, grip, times)
         times["at"] = "check"
         rgb, depth = await rig.frame()
