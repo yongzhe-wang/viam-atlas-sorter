@@ -83,6 +83,26 @@ def _write_atomic(path: Path, data: bytes) -> None:
     tmp.replace(path)
 
 
+def _jsonl_records(path: Path):
+    """
+    Every record of a JSONL file, skipping lines that do not parse.
+
+    WHY: sfhack4 lost power mid-write and obs.jsonl ended in NUL bytes; strip() keeps those, so json.loads raised on
+    every status and every log call and the whole module stopped answering. One bad line must not cost the others.
+    {MODULE LOG 2026-10-30 "OBSERVATION NOT LOGGED: JSONDECODEERROR: EXPECTING VALUE: LINE 1 COLUMN 1 (CHAR 0)"}
+    [CONFIDENCE: INFERRED 85% — the error and the outage match; the robot's file itself was not inspected]
+    """
+    for line in path.read_text(errors="replace").splitlines():
+        # Records appended after the reboot land on the NUL line itself, so strip them rather than skip that line
+        line = line.strip("\x00 \t\r")
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except ValueError:
+            print(f"store: skipped an unreadable line in {path.name} ({len(line)} chars)")
+
+
 def _with_date(doc: dict) -> dict:
     """Add `at` (a BSON Date from `ts`) for Atlas: Charts can bin time only on Date fields, not epoch floats."""
     from datetime import datetime, timezone
@@ -148,10 +168,7 @@ class Store:
         if not path.exists():
             return []
         docs, order = {}, []
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
+        for rec in _jsonl_records(path):
             if rec.get("_op") == "set":
                 if rec["_id"] in docs:
                     docs[rec["_id"]].update(rec["fields"])
@@ -610,11 +627,9 @@ class Store:
         for folder in sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []:
             if folder.name < first or not (folder / "obs.jsonl").exists():
                 continue
-            for line in (folder / "obs.jsonl").read_text().splitlines():
-                if line.strip():
-                    rec = json.loads(line)
-                    if (since is None or rec["ts"] >= since) and (until is None or rec["ts"] < until):
-                        out.append(rec)
+            for rec in _jsonl_records(folder / "obs.jsonl"):
+                if (since is None or rec["ts"] >= since) and (until is None or rec["ts"] < until):
+                    out.append(rec)
         return sorted(out, key=lambda r: r["ts"])
 
     def observation_depth(self, obs: dict):
@@ -639,10 +654,9 @@ class Store:
             n = b = 0
             root = self.data / OBS_DIR
             for f in root.glob("*/obs.jsonl") if root.exists() else []:
-                for line in f.read_text().splitlines():
-                    if line.strip():
-                        n += 1
-                        b += json.loads(line).get("bytes") or 0
+                for rec in _jsonl_records(f):
+                    n += 1
+                    b += rec.get("bytes") or 0
             b -= self._obs_thinned_bytes()
             self._obs_counts = {"count": n, "bytes": max(0, b)}
         if add is not None:
