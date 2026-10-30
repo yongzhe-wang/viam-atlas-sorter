@@ -525,19 +525,50 @@ def raised_in_hole(depth: np.ndarray, hole: np.ndarray) -> int:
     return int((hole & (depth > 0) & (plane - depth > perception.MIN_HEIGHT_MM)).sum())
 
 
-def objects_in_hole(rgb: np.ndarray, depth: np.ndarray) -> tuple:
+def frame_square(rgb: np.ndarray, depth: np.ndarray, pose: dict, k: dict):
     """
-    (hole visible?, [Obj inside the hole], segmentation) from a frame taken above the square at z >= 400.
+    The drop square from this one frame (AGENT3's drop_square on perception.find_drop_square, which tells raised
+    objects from tape by depth): {xy, size_mm, yaw_deg, corners, partial, confidence, ...} or None; never fails.
+    """
+    if depth is None:
+        return None
+    try:
+        hit = perception.find_drop_square(rgb, depth)
+        return drop_square.update(None, drop_square.observe(hit, pose, k), time.time()) if hit else None
+    except Exception as e:
+        print(f"  square estimate failed: {e}")
+        return None
 
-    Inside = in_hole(). Must be looked at from ALIGN_Z: below ~280 mm depth is blind and a block in
+
+def square_mask(sq: dict, pose: dict, k: dict, shape: tuple, depth_mm: float) -> np.ndarray:
+    """The square's estimated interior (its four corners projected at table depth) as a bool image mask."""
+    img = Image.new("L", (shape[1], shape[0]), 0)
+    pts = [perception.project_xy(pose, k, c, depth_mm) for c in sq["corners"]]
+    ImageDraw.Draw(img).polygon([(float(u), float(v)) for u, v in pts], fill=1)
+    return np.asarray(img, dtype=bool)
+
+
+def objects_in_hole(rgb: np.ndarray, depth: np.ndarray, pose: dict = None, k: dict = None) -> tuple:
+    """
+    (hole visible?, [Obj inside the hole], segmentation, interior mask) from a frame taken above the square at
+    z >= 400. Inside = in_hole(). Must be looked at from ALIGN_Z: below ~280 mm depth is blind and a block in
     the square is invisible. Edge-cut objects are counted too (a full square can push one to the border).
+    With the frame's pose and intrinsics the interior is drop_square's full estimate (frame_square), whatever
+    lies in it: a silver knife reads as tape (52-69% of its pixels, AGENT3) and split the colour-based hole, so a
+    reset failed with "square: not visible". Without them, or with no full estimate, the colour-based hole_mask.
     """
     seg = perception.segment_full(rgb, depth) if depth is not None else None
-    hole = hole_mask(rgb, depth)
+    hole = None
+    if pose is not None and k is not None and depth is not None:
+        sq = frame_square(rgb, depth, pose, k)
+        if sq is not None and not sq.get("partial"):
+            hole = square_mask(sq, pose, k, rgb.shape, float(np.median(table_plane(depth))))
+    if hole is None:
+        hole = hole_mask(rgb, depth)
     if hole is None or seg is None:
-        return False, [], seg
+        return False, [], seg, None
     objs = list(seg.objects) + [o for o, _ in seg.excluded]
-    return True, [o for o in objs if in_hole(o, hole)], seg
+    return True, [o for o in objs if in_hole(o, hole)], seg, hole
 
 
 # Clear room a release needs, around the drop point at theta 0 (the jaws close along image u): the fingers open to
@@ -1168,49 +1199,116 @@ async def wipe(rig) -> None:
     await rig.open()
 
 
+async def go_over_square(rig) -> tuple:
+    """
+    Empty gripper: leave the arm at ALIGN_Z, theta 0, with the square's full interior centred in view (the pose
+    perception.look_flange_xy gives for its centre); returns (centre table xy, frame pose). Raises SquareNotFound.
+
+    WHY (2026-10-29): a reset failed with "square: not visible": search_square + a servo on find_square, which
+    reads the silver knife in the square as tape (AGENT3: 52-69% of its pixels) and pulls the square into the
+    fingertip rows. Now as for the place (62e3a76): drop_square's estimate from the current frame, then the recent
+    sightings, then the observe pose before any z 580 pose; each estimate gets one move to centre it, and a second
+    look must show the full interior there (not partial, centre within 15 mm).
+    {VIAM CENTERAL 2026-10-29 "请改成用 AGENT3 的 DROP_SQUARE 估计或 LIVE MAP 的 SQUARE，跟 PLACE 那边用同一套"}
+    [CONFIDENCE: INFERRED 75% — offline on frame 084 and a fake rig; not run on the arm]
+    """
+    k = intr(rig)
+
+    async def look():
+        rgb, depth = await rig.frame()
+        q = pose_dict(await rig.pose())
+        return frame_square(rgb, depth, q, k), q
+
+    async def centre_on(xy):
+        # Up to two moves: centre the estimate, then confirm a full, stable view of the interior there
+        for _ in range(2):
+            fx, fy = perception.look_flange_xy(tuple(xy))
+            if not ppa.reachable(fx, fy):
+                return None
+            p = await rig.pose()
+            if math.hypot(p.x - fx, p.y - fy) > 5.0 or abs(p.z - ppa.ALIGN_Z) > 3.0 or abs(p.theta) > 1.0:
+                try:
+                    await ppa.travel(rig, fx, fy, theta=0.0)
+                except ppa.MoveRefused as e:
+                    print(f"  square: look pose refused: {e}")
+                    return None
+            sq, q = await look()
+            if sq is None:
+                return None
+            if not sq.get("partial") and math.hypot(sq["xy"][0] - xy[0], sq["xy"][1] - xy[1]) <= 15.0:
+                return tuple(sq["xy"]), q
+            xy = sq["xy"]
+        return None
+
+    first, _ = await look()
+    guesses = ([first["xy"]] if first else []) + [xy for xy, _ in square_sightings(rig)]
+    for g in guesses:
+        hit = await centre_on(g)
+        if hit:
+            LAST_SQUARE.update(xy=hit[0], ts=time.time())
+            return hit
+    poses = [(*ppa.HOME_XY, ppa.ALIGN_Z)] + [(x, y, SWEEP_Z) for x, y in SWEEP_XY]
+    poses = [q for q in poses if ppa.reachable(*q)]
+    for x, y, z in poses:
+        try:
+            await ppa.travel(rig, x, y, theta=0.0, z=z)
+        except ppa.MoveRefused as e:
+            print(f"  square search: skipping ({x:.0f},{y:.0f},{z:.0f}): {e}")
+            continue
+        sq, _ = await look()
+        if sq is not None:
+            hit = await centre_on(sq["xy"])
+            if hit:
+                LAST_SQUARE.update(xy=hit[0], ts=time.time())
+                return hit
+    raise ppa.SquareNotFound("square: no full view of its interior anywhere on the table")
+
+
 async def clear_square(rig, store) -> dict:
     """
-    Empty the blue square. Returns the logged attempt doc (mode "reset"); success = hole empty by depth.
+    Empty the blue square. Returns the logged attempt doc (mode "reset"); success = interior empty by depth.
 
-    Raises nothing for ordinary failures; status "failed" means it parked and the next trial must not start.
+    Locates the square with go_over_square() (drop_square, no servo on the tape), counts what stands on its
+    estimated interior (objects_in_hole with the frame pose), picks each out (<= 2 tries) and puts it at a free
+    spot (drop_somewhere); a failed pick -> wipe (<= 2 passes). Raises nothing for ordinary failures; status
+    "failed" means it parked and the next trial must not start.
     """
     doc = {"ts": time.time(), "mode": "reset", "target_text": "__reset__", "success": False, "status": "failed",
            "removed": 0, "wipes": 0, "fail_phase": None, "fail_reason": None}
     t0 = time.monotonic()
     STATE.update(times={"at": "reset"}, error=None)
     start_recording(rig, store, doc)
+    k = intr(rig)
     try:
-        await ppa.search_square(rig)
-        await rig.servo(ppa.find_square, False, "square")
+        centre, _ = await go_over_square(rig)
         for _round in range(6):
             rgb, depth = await rig.frame()
-            seen, inside, seg = objects_in_hole(rgb, depth)
+            q = pose_dict(await rig.pose())
+            rig.record("reset", rgb)
+            seen, inside, seg, hole = objects_in_hole(rgb, depth, q, k)
             if seg is not None:
                 publish_frame(store, rgb, seg, "reset")
             if not seen:
-                raise RuntimeError("square not visible after servo")
-            # Centred over the hole after the servo: drop_somewhere keeps away from here, the next run places here
-            q = await rig.pose()
-            LAST_SQUARE.update(xy=(q.x, q.y), ts=time.time())
+                raise RuntimeError("square interior not in view at its look pose")
             # Done only when nothing stands on the interior at all (a stack segments as one overhanging blob)
-            raised = raised_in_hole(depth, hole_mask(rgb, depth))
+            raised = raised_in_hole(depth, hole)
             doc["raised_px"] = raised
             if not inside and raised < SQUARE_CLEAR_RAISED_PX:
-                doc.update(success=True, status="done", square_xy=[q.x, q.y])
+                doc.update(success=True, status="done", square_xy=[round(centre[0], 1), round(centre[1], 1)])
                 break
             if not inside:
                 print(f"reset: no object segmented but {raised} raised px on the interior: wiping")
                 if doc["wipes"] >= 2:
                     raise RuntimeError(f"square still not empty after 2 wipes ({raised} raised px)")
+                await ppa.travel(rig, *centre, theta=0.0)  # wipe starts with the jaws over the centre
                 await wipe(rig)
                 doc["wipes"] += 1
-                await ppa.search_square(rig)
-                await rig.servo(ppa.find_square, False, "square")
+                centre, _ = await go_over_square(rig)
                 continue
-            obj = inside[0]
+            obj = max(inside, key=lambda o: o.height_mm)  # the top of a stack first
             print(f"reset: {len(inside)} object(s) in the square; removing one ({obj.colour}, {obj.height_mm:.0f} mm)")
             picked = False
-            if width_mm(obj, rig.fx) <= MAX_OPEN_MM:
+            if width_mm(obj, rig.fx) <= MAX_OPEN_MM or ring_geometry(obj) is not None:
                 for _try in range(2):
                     try:
                         height, grip = await ppa.pick(rig, None, ObjTracker(rig, obj, rgb))
@@ -1224,13 +1322,11 @@ async def clear_square(rig, store) -> dict:
             if not picked:
                 if doc["wipes"] >= 2:
                     raise RuntimeError("square still not empty after 2 wipes")
-                await ppa.search_square(rig)
-                await rig.servo(ppa.find_square, False, "square")
+                await ppa.travel(rig, *centre, theta=0.0)
                 await wipe(rig)
                 doc["wipes"] += 1
-            # Back over the square to look again
-            await ppa.search_square(rig)
-            await rig.servo(ppa.find_square, False, "square")
+            # Back over the square to look again (the paper may have been pushed)
+            centre, _ = await go_over_square(rig)
         if not doc["success"]:
             doc.update(fail_phase="verify", fail_reason="objects still in the square")
         doc["img_after"] = jpeg((await rig.frame())[0])
@@ -1268,7 +1364,7 @@ async def resume(rig, store):
         await ppa.place_in_square(rig, height, grip, times)
         times["at"] = "check"
         rgb, depth = await rig.frame()
-        seen, inside, _ = objects_in_hole(rgb, depth)
+        seen, inside, _, _ = objects_in_hole(rgb, depth)
         doc["success"] = bool(seen and inside)
         doc["status"] = "done" if doc["success"] else "failed"
     except Exception as e:
