@@ -104,6 +104,9 @@ SUMMARY_KEYS = ("_id", "status", "label", "colour", "score", "height_mm", "durat
 # search {USER 2026-10-29 "I ALSO WANT RETRY WHEN FAIL"} [CONFIDENCE: SINGLE-SRC 90% — 3 is my pick: a 4th
 # try past ~45 s of retries loses the demo minute anyway]
 GRASP_ATTEMPTS = 3
+# best()'s margin over the runner-up above which the refused object is surely the one named: no search for another
+# [CONFIDENCE: INFERRED 70% — the red box cutter had 0.40; ambiguous picks (blue lolipop 0.005, m&m 0.015) stay below]
+CLEAR_MARGIN = 0.2
 # idle perception: a frame every 0.5 s (the camera is read on the robot itself; a look is ~380 ms)
 # {USER 2026-10-30 "DO MORE FREUYQNECY FOR IMAGES AND REPLANNING, THISIS LOCAL SHOULD WORK"}
 WATCH_PERIOD_S = 0.5
@@ -1033,7 +1036,12 @@ class GraspByDescription(Generic, EasyResource):
             target = target_xy = None
             if v2:
                 failure = summary
-                if summary.get("target_xy"):
+                if not again and self._same_object_again(summary):
+                    # The servo lost the right object (never converged): straight back to it, not left out of the next
+                    # search {SOUR PATCH 14:03:55 "BLOCK: DID NOT CONVERGE" -> 14:04:14 NOT_FOUND AFTER 55.7 S ("THE OBJECT A
+                    # FAILED TRY ALREADY WENT FOR") -> 14:05:11 DONE AT THAT SPOT} {USER 2026-10-30 "THE SOUR PATCH SNACK DIDNT WORK"}
+                    again, target_xy = True, summary.get("target_xy")
+                elif summary.get("target_xy"):
                     excluded.append(summary["target_xy"])
             else:
                 target_xy = summary.get("target_xy")
@@ -1066,8 +1074,21 @@ class GraspByDescription(Generic, EasyResource):
 
     @classmethod
     def _retryable_v2(cls, summary: dict) -> bool:
-        """SEARCH_V2: a refusal names one object, and the next candidate may not have its problem."""
-        return summary.get("status") in ("unsafe_grasp", "too_close", "too_wide") or cls._retryable("grasp", summary)
+        """
+        SEARCH_V2: a refusal names one object, and the next candidate may not have its problem. Not when that object
+        was clearly the one named (margin >= CLEAR_MARGIN): no other object is it, so the refusal is the answer now.
+        {RED BOX CUTTER 14:11:31 TOO_CLOSE R=223, MARGIN 0.401 -> 14:11:45 NOT_FOUND AFTER 40.8 S OF SEARCHING THE REST}
+        {USER 2026-10-30 "WHY IT CANNOT FIND THE RED BOX CUTTER"}
+        """
+        if summary.get("status") in ("unsafe_grasp", "too_close", "too_wide"):
+            return float(summary.get("margin") or 0.0) < CLEAR_MARGIN
+        return cls._retryable("grasp", summary)
+
+    @staticmethod
+    def _same_object_again(summary: dict) -> bool:
+        """A pick that failed in the servo (the right object, never converged on): the retry goes back to it."""
+        reason = str(summary.get("fail_reason") or "")
+        return summary.get("status") == "failed" and (summary.get("fail_phase") == "servo" or "did not converge" in reason)
 
     @staticmethod
     def _retryable(kind: str, summary: dict) -> bool:
