@@ -613,22 +613,31 @@ class Store:
                 print(f"observation {oid}: Atlas insert failed ({type(e).__name__}); kept locally")
         return oid
 
-    def _obs_upload(self, rec: dict) -> None:
-        """One observation into Atlas (upsert by id); its images too while the image budget lasts."""
+    def _obs_upload(self, rec: dict, doc: bool = True) -> bool:
+        """
+        One observation into Atlas (upsert by id); its images too while the image budget lasts. doc=False: images only.
+
+        Returns whether anything was written. Images that thinning already removed from the disk cost nothing.
+        """
         from bson import Binary
 
-        self.db.observations.replace_one({"_id": rec["_id"]}, _with_date(dict(rec)), upsert=True)
+        if doc:
+            self.db.observations.replace_one({"_id": rec["_id"]}, _with_date(dict(rec)), upsert=True)
         if self._obs_atlas_bytes is None:
             agg = list(self.db.observation_images.aggregate([{"$group": {"_id": None, "b": {"$sum": "$bytes"}}}]))
             self._obs_atlas_bytes = agg[0]["b"] if agg else 0
         budget = float(os.environ.get("SORTER_OBS_ATLAS_MB", OBS_ATLAS_IMAGE_MB)) * 1e6
-        if rec["bytes"] and self._obs_atlas_bytes + rec["bytes"] <= budget:
-            img = {"_id": rec["_id"], "ts": rec["ts"], "bytes": rec["bytes"]}
-            for key, field in (("jpeg_path", "jpeg"), ("depth_path", "depth")):
-                if rec.get(key) and (self.data / rec[key]).exists():
-                    img[field] = Binary((self.data / rec[key]).read_bytes())
-            self.db.observation_images.replace_one({"_id": rec["_id"]}, img, upsert=True)
-            self._obs_atlas_bytes += rec["bytes"]
+        if not rec["bytes"] or self._obs_atlas_bytes + rec["bytes"] > budget:
+            return doc
+        images = {field: Binary((self.data / rec[key]).read_bytes())
+                  for key, field in (("jpeg_path", "jpeg"), ("depth_path", "depth"))
+                  if rec.get(key) and (self.data / rec[key]).exists()}
+        if not images:
+            return doc
+        self.db.observation_images.replace_one(
+            {"_id": rec["_id"]}, {"_id": rec["_id"], "ts": rec["ts"], "bytes": rec["bytes"], **images}, upsert=True)
+        self._obs_atlas_bytes += rec["bytes"]
+        return True
 
     def list_observations(self, since: float = None, until: float = None) -> list:
         """Observations with since <= ts < until, oldest first, from the local archive (complete in both modes)."""
@@ -711,11 +720,20 @@ class Store:
         return freed
 
     def _flush_observations(self) -> int:
-        """Upload every locally archived observation (upsert by id, so repeats are harmless)."""
+        """
+        Upload what Atlas lacks of the local archive: missing docs, and images while the budget lasts. Returns how many.
+
+        WHY: flush() runs at every start. Sending the whole archive again took minutes of the robot's uplink on each
+        reload {SFHACK4 LOG 2026-10-30 "2191 OBSERVATIONS, 124 MB"}, and every image sent again counted against the
+        budget a second time, so after a restart new frames' images stopped reaching Atlas with the budget half empty.
+        """
+        have_doc = {d["_id"] for d in self.db.observations.find({}, {"_id": 1})}
+        have_image = {d["_id"] for d in self.db.observation_images.find({}, {"_id": 1})}
         n = 0
         for rec in self.list_observations():
-            self._obs_upload(rec)
-            n += 1
+            if rec["_id"] in have_doc and rec["_id"] in have_image:
+                continue
+            n += self._obs_upload(rec, doc=rec["_id"] not in have_doc)
         return n
 
     # ---- clips: every frame of an attempt, for replay ----------------------------------------------
