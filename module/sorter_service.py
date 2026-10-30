@@ -935,12 +935,15 @@ class GraspByDescription(Generic, EasyResource):
         (slipped, closed on air, the standoff check saw something else). Not retried: every other status (not
         found, ambiguous, too wide, too close, square full are answers, not accidents); a refused move or a dead
         link (the same move fails again); a failed release check (the object may already be in the square, and
-        a retry would take it back out); a failed recovery (it may still be holding something).
+        a retry would take it back out); a failed recovery (it may still be holding something); the square not
+        found while carrying (the table does not change between tries: blue block 2026-10-29 picked 3 times, each
+        one put back after "SquareNotFound", 100 s for nothing).
         """
         if kind != "grasp" or summary.get("status") != "failed" or summary.get("fail_phase") == "check":
             return False
         reason = str(summary.get("fail_reason") or "")
-        return not any(s in reason for s in ("MoveRefused", "link", "recovery failed", "still holding"))
+        return not any(s in reason for s in ("MoveRefused", "link", "recovery failed", "still holding",
+                                             "SquareNotFound"))
 
     async def _once(self, kind: str, text: Optional[str], target: Optional[dict],
                     target_xy: Optional[list], skip_current: bool = False) -> tuple:
