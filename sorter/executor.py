@@ -15,6 +15,7 @@ Flow, clear_square(): find square -> each object in the hole: pick (<= 2 tries) 
 failed pick -> wipe (<= 2 passes) -> verify hole empty by depth -> Store.log_attempt(mode="reset").
 Contract: docs/EXEC_PLAN.md (Command flow, Reset).
 """
+import asyncio
 import inspect
 import io
 import json
@@ -686,14 +687,65 @@ def width_mm(obj, fx: float) -> float:
     return obj.width_px * obj.top_depth_mm / fx
 
 
+# Something in front of the colour lens only (the arm's cable hanging across the view, 2026-10-29): the colour image
+# shows a big dark band where the stereo depth still sees the flat table. That cut the square in two and a reset
+# ended "SquareNotFound". Dark-but-flat pixels: 81140 on that frame, <= 5252 on all 92 survey/observe frames.
+# {VIAM CENTERAL 2026-10-29 "加一个 CAMERA-OCCLUDED 检测 ... 暂停并重试，不要把它当成「找不到」"}
+# [CONFIDENCE: CONFIRMED 85% — one blocked frame vs 92 clear ones; a hand blocks depth too: the 15% rule]
+BLOCKED_DARK_FLAT_PX = 25000
+BLOCKED_DEPTH_FRAC = 0.15  # invalid or < 280 mm depth over the upper image (a hand right in front of the lens)
+BLOCKED_WAIT_S = 60.0
+BLOCKED_STATUS = "camera blocked (cable/hand in front of the lens)"
+
+
+def view_blocked(rgb: np.ndarray, depth: np.ndarray) -> tuple:
+    """(blocked?, why): something right in front of the lens hides a large part of the table."""
+    if depth is None:
+        return False, "no depth"
+    band = depth[:440]  # above the held object / fingers
+    near = float(((band == 0) | ((band > 0) & (band < 280))).mean())
+    if near > BLOCKED_DEPTH_FRAC:
+        return True, f"{near:.0%} of the view unreadable or closer than 280 mm"
+    hsv = np.asarray(Image.fromarray(rgb).convert("HSV"))
+    dark = hsv[..., 2] < 50
+    flat = (depth > 0) & (np.abs(depth - table_plane(depth)) < 4.0)
+    m = dark & flat
+    m[ppa.FINGER_ROW:] = False
+    n = int(m.sum())
+    if n > BLOCKED_DARK_FLAT_PX:
+        return True, f"{n} px dark in colour where depth sees flat table"
+    return False, "clear"
+
+
+async def clear_frame(rig) -> tuple:
+    """
+    rig.frame(), waiting (status BLOCKED_STATUS, a new frame every second) while view_blocked() says something is
+    in front of the lens; after BLOCKED_WAIT_S the last frame is returned and the caller decides. Empty gripper only.
+    """
+    t0 = time.monotonic()
+    while True:
+        rgb, depth = await rig.frame()
+        blocked, why = view_blocked(rgb, depth)
+        if not blocked or time.monotonic() - t0 > BLOCKED_WAIT_S:
+            if rig.status == BLOCKED_STATUS:
+                rig.status = None
+                print("  view clear again" if not blocked else f"  camera still blocked after {BLOCKED_WAIT_S:.0f} s")
+            return rgb, depth
+        if rig.status != BLOCKED_STATUS:
+            print(f"  {BLOCKED_STATUS}: {why}; waiting")
+            rig.status = BLOCKED_STATUS
+        await asyncio.sleep(1.0)
+
+
 async def look_here(rig, text: str, store, source: str = "demo") -> dict:
     """
     One frame from the current pose -> best match for `text` among objects outside the square.
 
     Returns clip_embed.best()'s dict plus "rgb", "depth", "pose", and "square" (square_from_frame) when the
     hole is in view. Objects cut by the image border or standing in the square are never candidates.
+    Waits while the camera is blocked (clear_frame), so a cable in front of the lens is not "not found".
     """
-    rgb, depth = await rig.frame()
+    rgb, depth = await clear_frame(rig)
     pose = pose_dict(await rig.pose())
     rig.record("observe", rgb)
     seg = perception.segment_full(rgb, depth)
@@ -1343,7 +1395,7 @@ async def go_over_square(rig) -> tuple:
     k = intr(rig)
 
     async def look():
-        rgb, depth = await rig.frame()
+        rgb, depth = await clear_frame(rig)
         q = pose_dict(await rig.pose())
         return frame_square(rgb, depth, q, k), q
 
@@ -1414,7 +1466,7 @@ async def clear_square(rig, store) -> dict:
         first = (rgb0, depth0, pose_dict(await rig.pose()))
         centre, _ = await go_over_square(rig)
         for _round in range(6):
-            rgb, depth = await rig.frame()
+            rgb, depth = await clear_frame(rig)
             q = pose_dict(await rig.pose())
             rig.record("reset", rgb)
             seen, inside, seg, hole = objects_in_hole(rgb, depth, q, k)
