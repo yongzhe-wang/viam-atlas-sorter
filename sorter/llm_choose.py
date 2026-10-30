@@ -128,6 +128,8 @@ def _call(jpeg: bytes, text: str) -> str:
     return "".join(b.get("text", "") for b in reply.get("content", []) if b.get("type") == "text")
 
 
+MAX_CALLS_PER_WINDOW, CALL_WINDOW_S = 3, 60.0  # per description
+_CALLS = {}  # description -> monotonic times of its recent calls
 LAST = {}  # last call's outcome, for the module's status: {"status", "reason", "ms", "error"}
 
 
@@ -138,6 +140,12 @@ def choose(rgb: np.ndarray, objs: list, text: str) -> dict:
     """
     if not enabled() or rgb is None or not objs:
         return None
+    # One unknown word can refuse at every search view; with the network down each of those waits for the timeout
+    now = time.monotonic()
+    recent = [t for t in _CALLS.get(text, []) if now - t < CALL_WINDOW_S]
+    if len(recent) >= MAX_CALLS_PER_WINDOW:
+        return None
+    _CALLS[text] = recent + [now]
     t0 = time.monotonic()
     try:
         out = parse(_call(annotate(rgb, objs), text), len(objs))

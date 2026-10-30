@@ -25,7 +25,7 @@ calls = []
 
 
 def fake_rank(scores):
-    return lambda objs, text, store=None, recognised=None: sorted(zip(objs, scores), key=lambda t: -t[1])
+    return lambda objs, text, store=None, recognised=None, **_: sorted(zip(objs, scores), key=lambda t: -t[1])
 
 
 def fake_call(reply):
@@ -122,6 +122,26 @@ clip_embed.rank = fake_rank([0.35, 0.20])
 llm_choose._call = fake_call('{"status":"ok","number":2,"reason":"right one"}')
 r = clip_embed.best([A, B], "the right one", rgb=RGB)
 check("always: LLM overrides", r["obj"] is B and r["decided_by"] == "llm")
+
+# --- a name the library knows, out of view, does not spend a call at every search view ---
+setenv("fallback")
+clip_embed.rank = fake_rank([0.15, 0.10])
+llm_choose._call = fake_call('{"status":"ok","number":1}')
+calls.clear()
+st = SimpleNamespace(list_labels=lambda: [["blue block"]])
+r = clip_embed.best([A, B], "blue block", st, rgb=RGB)
+check("fallback: known name out of view -> searchable, no API call", r["obj"] is None and r["searchable"] and not calls)
+# --- one description gets at most MAX_CALLS_PER_WINDOW calls ---
+calls.clear()
+llm_choose._CALLS.clear()
+for _ in range(llm_choose.MAX_CALLS_PER_WINDOW + 2):
+    clip_embed.best([A, B], "the thing", rgb=RGB)
+check("fallback: calls capped per description", len(calls) == llm_choose.MAX_CALLS_PER_WINDOW)
+llm_choose._CALLS.clear()
+setenv("always")
+clip_embed.rank = fake_rank([0.35, 0.20])
+llm_choose._call = fake_call('{"status":"ok","number":2,"reason":"right one"}')
+clip_embed.best([A, B], "the right one", rgb=RGB)
 
 # --- verb stripping reaches the prompt ---
 check("prompt gets the cleaned query", calls[-1][1] == "the right one")

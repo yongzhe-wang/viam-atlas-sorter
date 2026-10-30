@@ -419,6 +419,10 @@ def _llm_override(out: dict, objs: list, text: str, rgb) -> dict:
     m = llm_choose.mode()
     if rgb is None or not objs or m == "off" or (m == "fallback" and out["obj"] is not None and not out["ambiguous"]):
         return out
+    # A name the library knows, refused here: it is out of this view and the search moves on. Asking the model at
+    # every view of that search would add seconds per view to a grasp that needs no help.
+    if m == "fallback" and out.get("searchable"):
+        return out
     v = llm_choose.choose(rgb, objs, clean_query(text) or text)
     if v is None:  # disabled, no key, offline, timeout or unusable answer: CLIP's decision stands
         return out
