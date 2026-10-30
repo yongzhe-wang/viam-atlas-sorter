@@ -912,7 +912,8 @@ async def grasp_with_primitives(rig, found: dict, esc, times: dict, doc: dict, t
             return height, grip, tracker
         except ppa.EStop:
             raise
-        except ppa.TooClose as e:
+        except (ppa.TooClose, ppa.UnsafeGrasp) as e:
+            # Refused before the descent, nothing touched: the next candidate lands its fingers elsewhere
             last = e
         except RuntimeError:
             esc.failed(primitive)
@@ -1254,7 +1255,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
     The square comes from the found frame, else any frame of this search, else known_square() (the newer of
     LAST_SQUARE and the live map's), else it is searched only while carrying. Always ends at the observe pose.
     Never raises for an ordinary failure: status is done / not_found / ambiguous / too_wide / too_close /
-    square_full / failed.
+    unsafe_grasp / square_full / failed.
     """
     doc = {"ts": time.time(), "mode": mode, "target_text": text, "success": False, "status": "failed",
            "fail_phase": None, "fail_reason": None}
@@ -1382,6 +1383,10 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
     except ppa.TooClose as e:
         # A refusal, not a failure: nothing was grabbed; tell the person to move it out
         doc.update(status="too_close", fail_phase=times.get("at", "find"), fail_reason=str(e))
+        await recover(rig, doc)
+    except ppa.UnsafeGrasp as e:
+        # A refusal too: the arm stayed up; the table will not have changed for a retry (the module does not retry this)
+        doc.update(status="unsafe_grasp", fail_phase=times.get("at", "descend"), fail_reason=str(e))
         await recover(rig, doc)
     except Exception as e:
         doc.update(status="failed", fail_phase=times.get("at", "start"), fail_reason=f"{type(e).__name__}: {e}")

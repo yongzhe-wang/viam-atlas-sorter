@@ -1037,6 +1037,10 @@ class PickFailed(RuntimeError):
     """The grab closed on nothing; the gripper has been opened and the arm lifted."""
 
 
+class UnsafeGrasp(PickFailed):
+    """Something stands, or may stand, where a finger would land; the arm did not descend."""
+
+
 class TooClose(PickFailed):
     """The object is too close to the arm base to reach down to; the arm did not descend."""
 
@@ -1059,6 +1063,59 @@ def mark(times: dict, phase: str, t0: float) -> float:
     now = time.monotonic()
     times[phase] = round(now - t0, 1)
     return now
+
+
+# Where the fingers come down, from the jaw axis in mm: inner face 42 (84 mm stroke) less a margin, 8 mm thick plus a
+# margin, 20 mm wide plus a margin. Closed (the internal grip's entry) they stay within FINGER_CLOSED_MM of the axis
+FINGER_ACROSS_MM = (40.0, 53.0)
+FINGER_CLOSED_MM = (0.0, 11.0)
+FINGER_ALONG_MM = 13.0
+FINGER_DEPTH_TOL_MM = 3.0  # table noise: a point only this much nearer than the fingertips does not count
+FINGER_HIGH_FRAC = 0.05  # largest blob of points above the fingertips, as a share of the finger's area
+FINGER_BLIND_FRAC = 0.15  # largest blob without a believable depth, same share
+FALSE_DEEP_MM = 20.0  # farther than the table by this: nothing stands below the table, so a refraction, not a depth
+
+
+def finger_obstacle(depth: np.ndarray, fx: float, fy: float, cx: float, cy: float, tip_depth: float, table: float,
+                    closed: bool = False):
+    """
+    Why a finger cannot come down in this frame (taken at the height of the descent's start), or None if both are clear.
+
+    WHY: a mask can be a fraction of the object. The water bottle lying on its side segmented as a 85 x 21 px strip of
+    its base; grasped by that strip, a finger comes down on the bottle's body. So the fingers' own landing areas must be
+    free, whatever the mask says, for every primitive. In the frame the jaws close along image u at any wrist angle.
+    {VIAM CENTERAL 2026-10-30 "手指扫过的带子里，任何高度 >= 指尖下探高度的点，或者 DEPTH 无效的大块，都算障碍"}
+    {VIAM CENTERAL 2026-10-30 "透明物体的 DEPTH 洞就按「可能有东西」处理"}
+    [CONFIDENCE: SINGLE-SRC 75% — thresholds from recorded frames; a transparent body reading the table through it is
+    not caught, only its holes and false deep readings are]
+    Points above the fingertips (tip_depth: their depth in this frame at the end of the descent) are tested at their own
+    depth, so a tall thing is placed right. A blind patch has no depth of its own and is placed at tip_depth.
+    """
+    if depth is None:
+        return "no depth map to check the fingers' landing areas"
+    h, w = depth.shape
+    vv, uu = np.mgrid[:h, :w]
+    across = FINGER_CLOSED_MM if closed else FINGER_ACROSS_MM
+    au, av = axis_pixel(fx, fy, cx, cy, tip_depth)
+    mm_u, mm_v = tip_depth / fx, tip_depth / fy
+    x, y = (uu - au) * mm_u, (vv - av) * mm_v
+    area = (across[1] - across[0]) * 2.0 * FINGER_ALONG_MM / (mm_u * mm_v)
+    # Valid points at their own depth: back-projected around the jaw axis at that depth
+    d = np.where(depth > 0, depth, tip_depth).astype(float)
+    aud, avd = axis_pixel(fx, fy, cx, cy, d)
+    xd, yd = (uu - aud) * d / fx, (vv - avd) * d / fy
+    high = (depth > 0) & (depth < tip_depth - FINGER_DEPTH_TOL_MM)
+    blind = (depth == 0) | (depth > table + FALSE_DEEP_MM)
+    for side, name in ((-1.0, "left"), (1.0, "right")):
+        col = (side * x >= across[0]) & (side * x <= across[1]) & (np.abs(y) <= FINGER_ALONG_MM)
+        cold = (side * xd >= across[0]) & (side * xd <= across[1]) & (np.abs(yd) <= FINGER_ALONG_MM)
+        for mask, frac, what in ((high & cold, FINGER_HIGH_FRAC, "stands above the fingertips"),
+                                 (blind & col, FINGER_BLIND_FRAC, "has no believable depth")):
+            lab, n = ndimage.label(mask)
+            big = int(np.bincount(lab.ravel())[1:].max()) if n else 0
+            if big >= frac * area:
+                return f"{big / area:.0%} of the {name} finger's landing area {what}"
+    return None
 
 
 async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None, align: bool = True,
@@ -1146,6 +1203,10 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
                   f"computed {z_grasp:.0f})")
             z_grasp = hard
         print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
+        # wait_clear's frame, at this pose: both fingers' landing areas must be free, or the arm does not go down
+        why = finger_obstacle(rig.last_depth, rig.fx, rig.fy, rig.cx, rig.cy, z0 - z_grasp + TIP_BELOW_CAM, table)
+        if why is not None:
+            raise UnsafeGrasp(f"not descending: {why}")
         try:
             await rig.descend(z_grasp, settle=False)  # the grab follows, no frame
         except EStop:

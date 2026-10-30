@@ -314,6 +314,10 @@ async def pick_inside(rig, times: dict, finder, check=None, slipped=None, inner_
     hard = ppa.MIN_GRASP_Z_THIN if height < ppa.THIN_MM else ppa.MIN_GRASP_Z
     z = max(z0 - (top + grip - ppa.TIP_BELOW_CAM), rig.floor_z, hard)
     print(f"  table={table:.0f}mm top={top:.0f}mm height={height:.0f}mm hole {inner_mm:.0f}mm -> into the hole, z={z:.0f}")
+    # wait_clear's frame, at this pose: the closed fingers' way into the hole must be free
+    why = ppa.finger_obstacle(rig.last_depth, rig.fx, rig.fy, rig.cx, rig.cy, z0 - z + ppa.TIP_BELOW_CAM, table, closed=True)
+    if why is not None:
+        raise ppa.UnsafeGrasp(f"not descending into the ring: {why}")
     await rig.grab()  # nothing between the jaws yet: closed, they fit the hole
     try:
         await rig.descend(z, settle=False)  # the expansion follows, no frame
