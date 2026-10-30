@@ -130,7 +130,9 @@ await sorter.do_command({"reset": True})                    # empty the square (
   and the scan / search progress for the dashboard.
 - **Several objects in one command:** `{"grasp": "i want screw driver, and snack, and tape"}` becomes one job of up to
   5 objects, in order (`sorter/multi_objects.py` cuts at `,` `and` `&` `then` `+`, drops the spoken lead-in, ignores
-  spaces when comparing with library names, and keeps a name like "blue and black screwdriver" whole). Each item goes
+  spaces when comparing with library names, and keeps a name like "blue and black screwdriver" whole). Colours sharing
+  a noun never leave a bare colour: "red and blue screwdriver" is two objects because the library has both, "black and
+  yellow tape" is one described by both colours. Each item goes
   through the same decision and retries as a single grasp, with a fresh look from the observe pose before it, so what
   was just delivered counts. If several objects fit an item's name, the best match is taken and logged instead of
   answering `ambiguous`. `running.progress` reads `item 2/3: snack`, and the result is `done` / `partial` / `failed`

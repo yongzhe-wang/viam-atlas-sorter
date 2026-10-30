@@ -39,6 +39,28 @@ CASES = [
     ("red screwdriver and blue screwdriver", ["red screwdriver", "blue screwdriver"]),
     ("the blue box", ["blue box"]),
     ("something shiny", ["something shiny"]),
+    # Colours sharing a noun: never a bare colour in front of the rest (a bare "black" takes any black object)
+    ("red and blue screwdriver", ["red screwdriver", "blue screwdriver"]),
+    ("the red and the blue screw driver", ["red screwdriver", "blue screwdriver"]),
+    ("tape and red and blue screwdriver", ["tape", "red screwdriver", "blue screwdriver"]),
+    ("blue and yellow block, mouse", ["blue block", "yellow block", "mouse"]),
+    ("red and blue screwdrivers please", ["red screwdriver", "blue screwdriver"]),
+    ("black and yellow tape", ["black and yellow tape"]),
+    ("green and yellow bars", ["green bar", "yellow bar"]),
+    ("red and blue ones", ["red one", "blue one"]),
+    ("red and blue one", ["red and blue one"]),
+    ("black and blue scissors", ["black and blue scissors"]),
+    ("red, blue and black mug", ["red and blue and black mug"]),
+    ("green and black bar", ["black and green bar"]),
+    ("black & green bar", ["black and green bar"]),
+    ("black-and-green bar", ["black and green bar"]),
+    ("red-and-blue screwdriver", ["red screwdriver", "blue screwdriver"]),
+    ("black and blue screw driver and tape", ["blue and black screwdriver", "tape"]),
+    # A colour with nothing after it stays an item of its own
+    ("red and blue", ["red", "blue"]),
+    ("red and blue and tape", ["red", "blue", "tape"]),
+    ("red and tape", ["red", "tape"]),
+    ("red and blue then tape", ["red", "blue", "tape"]),
 ]
 bad = 0
 for text, want in CASES:
