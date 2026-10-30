@@ -24,9 +24,9 @@ def scene(neighbour: bool = False):
     for (v0, v1, u0, u1), h in (((100, 150, 650, 730), 45), ((230, 380, 610, 770), 63)):
         d[v0:v1, u0:u1] = TABLE - h
         rgb[v0:v1, u0:u1] = (200, 210, 220)
-    if neighbour:  # an opaque block touching the body's left side
-        d[300:460, 500:600] = TABLE - 30
-        rgb[300:460, 500:600] = (230, 200, 30)
+    if neighbour:  # an opaque block touching the see-through part of the body, below the label
+        d[430:590, 500:600] = TABLE - 30
+        rgb[430:590, 500:600] = (230, 200, 30)
     return rgb, d
 
 
