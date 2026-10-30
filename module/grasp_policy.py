@@ -32,7 +32,10 @@ def list_stop(item: dict) -> Optional[str]:
         return f"robot link down: {why}"
     if "overcurrent" in low:
         return f"arm stopped on overcurrent: {why}"
-    if "still holding" in low or "recovery failed" in low:
+    # "... still holding | put back where it was picked (x,y)": recover() let go on the table, the jaws are empty
+    # {RUN 14:46 "GREEN CYLINDER FAILED ... STILL HOLDING | PUT BACK" -> "BLUE LOLLIPOP NOT TRIED"}
+    put_back = "put back where it was picked" in low
+    if "recovery failed" in low or ("still holding" in low and not put_back):
         return f"may still be holding something: {why}"
     return None
 
