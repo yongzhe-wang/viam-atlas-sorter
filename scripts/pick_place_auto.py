@@ -55,6 +55,12 @@ TIP_CLEARANCE = 10.0  # fingertips never get closer than this to the table under
 # {VIAM CENTERAL 2026-10-29 "成功 X5: 175、173、173、174、174 ... OVERCURRENT X2: 171、171"}
 # [CONFIDENCE: CONFIRMED 85% — 7 grasps on this table; valid while the table height does not change]
 MIN_GRASP_Z = 174.0
+# Thin objects (< THIN_MM tall) may go 1 mm lower: at 174 the red box cutter (16 mm) slipped out on the lift; 173 is
+# the lowest height that has worked (3x), 171 hit the table (2x). Not lower on a retry: stability first for the demo.
+# {VIAM CENTERAL 2026-10-29 "物体 HEIGHT < 18 MM 时，允许下到 172.5 ... 如果你觉得不稳，就不改"}
+# [CONFIDENCE: CONFIRMED 80% — 173 seen working 3x; 172.5 untested, so not used]
+MIN_GRASP_Z_THIN = 173.0
+THIN_MM = 18.0
 PLACE_GAP = 10.0  # block bottom height above the table when released (mm)
 ALIGN_Z = 400.0  # observation height; sees the whole table scene
 SANITY_MIN_Z = 120.0  # absolute flange floor; Viam's own collision check refuses below ~132
@@ -1031,9 +1037,11 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         # Open loop from here: straight down the tool axis to the height measured at standoff.
         # Fingertips (TIP_BELOW_CAM past the camera) end `grip` below the block top
         z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
-        if z_grasp < MIN_GRASP_Z:
-            print(f"  grasp z clamped to {MIN_GRASP_Z:.0f} (hard floor; computed {z_grasp:.0f})")
-            z_grasp = MIN_GRASP_Z
+        hard = MIN_GRASP_Z_THIN if height < THIN_MM else MIN_GRASP_Z
+        if z_grasp < hard:
+            print(f"  grasp z clamped to {hard:.0f} (hard floor{', thin object' if height < THIN_MM else ''}; "
+                  f"computed {z_grasp:.0f})")
+            z_grasp = hard
         print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
         try:
             await rig.descend(z_grasp, settle=False)  # the grab follows, no frame
@@ -1061,6 +1069,13 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         await rig.goto(p.x, p.y, min(p.z + 30.0, ALIGN_Z), settle=False)
         await rig.goto(p.x, p.y, ALIGN_Z, settle=not grabbed)
         t = mark(times, "grab", t)
+        if grabbed and not await rig.holding():
+            # Held at the grab, gone after the lift: the red box cutter (16 mm, gripped by its top 3-4 mm) slipped
+            # and the reset went on to "place" an empty gripper. The caller's retry looks again.
+            # {VIAM CENTERAL 2026-10-29 "RESET 和 GRASP 都要在 LIFT 之后、CARRY 之前检查 RIG.HOLDING()"}
+            rig.picked_at = None
+            await rig.open()
+            raise ObjectLost("slipped out of the gripper during the lift")
         if grabbed:
             break
         # Missed (or the object was moved): re-align from the observation height, try again

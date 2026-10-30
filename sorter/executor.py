@@ -1630,10 +1630,10 @@ async def clear_square(rig, store) -> dict:
                 break
             if not inside:
                 # Something stands there but is not a pickable object: a person clears it (no wipe, see below)
-                raise SquareNotCleared(f"{raised} raised px on the square but no object to pick")
+                raise SquareNotCleared(f"something on the square ({raised} raised px) but no object to pick — {SQUARE_NOT_CLEARED}")
             obj = max(inside, key=lambda o: o.height_mm)  # the top of a stack first
             print(f"reset: {len(inside)} object(s) in the square; removing one ({obj.colour}, {obj.height_mm:.0f} mm)")
-            picked, gone = False, False
+            picked, gone, fails = False, False, []
             # Where it can go, from views with an empty gripper: this one and the starting view; never where an
             # earlier object of this reset went
             size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
@@ -1657,6 +1657,7 @@ async def clear_square(rig, store) -> dict:
                         if await rig.holding():
                             raise  # something in the jaws: recover() puts it back, never a silent retry
                         doc["pick_failures"] = doc.get("pick_failures", 0) + 1
+                        fails.append("slipped" if isinstance(e, ppa.ObjectLost) else "could not pick")
                         print(f"reset: pick {_try + 1}/{RESET_PICK_TRIES} failed ({e}); looking again")
                         await rig.lift()
                         centre, _, sq_est = await go_over_square(rig)
@@ -1678,14 +1679,17 @@ async def clear_square(rig, store) -> dict:
                 # No wipe during the demo: sweeping at z 171 across the table hit the tape roll / paper edge and
                 # stopped the arm on overcurrent (2026-10-29). A person clears the square instead.
                 # {VIAM CENTERAL 2026-10-29 "DEMO 期间禁用 WIPE ... STATUS 设成 'SQUARE NOT CLEARED — PLEASE CLEAR BY HAND'"}
-                raise SquareNotCleared(f"could not pick the {obj.colour} object after {RESET_PICK_TRIES} tries")
+                what = "slipped" if fails and all(f == "slipped" for f in fails) else "could not pick"
+                name = getattr(obj, "recognised", None) or f"{obj.colour} object"
+                raise SquareNotCleared(f"{name}: {what} {len(fails)}x — clear by hand")
             # Back over the square to look again (the paper may have been pushed)
             centre, _, sq_est = await go_over_square(rig)
         if not doc["success"]:
             doc.update(fail_phase="verify", fail_reason="objects still in the square")
         doc["img_after"] = jpeg((await rig.frame())[0])
     except SquareNotCleared as e:
-        doc.update(status="not_cleared", fail_phase="reset", fail_reason=f"{SQUARE_NOT_CLEARED}: {e}")
+        # e.g. "red object: slipped 3x — clear by hand" (dashboard shows the fail_reason)
+        doc.update(status="not_cleared", fail_phase="reset", fail_reason=str(e))
         await recover(rig, doc)
     except Exception as e:
         doc.update(fail_phase=doc.get("fail_phase") or "reset", fail_reason=f"{type(e).__name__}: {e}")
