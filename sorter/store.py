@@ -41,6 +41,7 @@ _ID_OK = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _PHASE_BAD = re.compile(r"[^A-Za-z0-9_-]")
 MAX_IMG_WIDTH = 640
 OBS_DIR = "observations"  # data/observations/<YYYYMMDD>/obs.jsonl + images: the module's observation log
+SHADOW_SEARCH_S = 5.0  # at most one background $vectorSearch this often (see search_views)
 OBS_ATLAS_IMAGE_MB = 300  # observation images uploaded to Atlas up to this (env SORTER_OBS_ATLAS_MB): an M0 cluster
 #                           holds 512 MB in all, and ~100 KB a frame at ~1 frame/s would fill it in under 2 hours
 OBS_MIN_FREE_BYTES = 5e9  # below this much free disk, thin_observations drops the oldest idle frames' images
@@ -138,6 +139,8 @@ class Store:
         self.db = None
         self._views_cache = None  # ((mtime_ns, size), views, normalised matrix) for offline search_views
         self._online_lib = None  # (normalised matrix, labels) loaded once from Atlas by library_matrix()
+        self._mirror = None  # (views without embedding, normalised matrix): the Atlas library held in memory for search
+        self._shadow_ts = 0.0  # when the last background $vectorSearch started
         self.last_search = None  # what the latest search_views did, for the dashboard's Atlas panel
         self.search_count = 0
         self._atlas_usage = (0.0, {})  # (asked at, {"used_mb", "limit_mb"})
@@ -282,21 +285,22 @@ class Store:
         """
         Nearest labelled views, best first, each with "score" in [0, 1] (cosine, Atlas scale).
 
-        Online: Atlas $vectorSearch on views.embedding (optionally pre-filtered by label).
+        Online: the Atlas library held in memory (see _mirror_search), SORTER_VIEW_SEARCH=atlas for $vectorSearch each time.
         Offline: brute-force cosine over data/views.jsonl.
         Returned docs omit the embedding and image bytes.
         """
         q = np.asarray(embedding, dtype=float).ravel()
         t0 = time.monotonic()
         if self.online:
-            stage = {"index": VECTOR_INDEX, "path": "embedding", "queryVector": q.tolist(),
-                     "numCandidates": max(50, 20 * k), "limit": k}
-            if label:
-                stage["filter"] = {"label": label}
-            pipeline = [{"$vectorSearch": stage},
-                        {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
-                        {"$project": {"embedding": 0, "jpeg": 0}}]
-            return self._note_search("$vectorSearch", list(self.db.views.aggregate(pipeline)), t0)
+            if os.environ.get("SORTER_VIEW_SEARCH", "mirror") != "mirror":
+                return self._vector_search(q, k, label)
+            hits = self._mirror_search(q, k, label)
+            # Atlas stays the library's home and its $vectorSearch keeps answering, only not inside the perception
+            # loop; the dashboard's Atlas panel shows these
+            if time.monotonic() - self._shadow_ts > SHADOW_SEARCH_S:
+                self._shadow_ts = time.monotonic()
+                threading.Thread(target=self._shadow_search, args=(q, k, label), daemon=True).start()
+            return hits
         views, matrix = self._views_offline()
         if label:
             keep = [i for i, v in enumerate(views) if v.get("label") == label]
@@ -311,6 +315,44 @@ class Store:
             v["score"] = float(scores[i])
             out.append(v)
         return self._note_search("local cosine", out, t0)
+
+    def _vector_search(self, q, k: int, label: str = None) -> list:
+        """Atlas $vectorSearch on views.embedding (optionally pre-filtered by label)."""
+        t0 = time.monotonic()
+        stage = {"index": VECTOR_INDEX, "path": "embedding", "queryVector": q.tolist(),
+                 "numCandidates": max(50, 20 * k), "limit": k}
+        if label:
+            stage["filter"] = {"label": label}
+        pipeline = [{"$vectorSearch": stage},
+                    {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
+                    {"$project": {"embedding": 0, "jpeg": 0}}]
+        return self._note_search("$vectorSearch", list(self.db.views.aggregate(pipeline)), t0)
+
+    def _shadow_search(self, q, k: int, label: str = None) -> None:
+        """A real $vectorSearch beside the in-memory answer; a failure only means the panel shows an older one."""
+        try:
+            self._vector_search(q, k, label)
+        except Exception as e:
+            print(f"store: background $vectorSearch failed: {type(e).__name__}: {str(e)[:160]}")
+
+    def _mirror_search(self, q, k: int, label: str = None) -> list:
+        """
+        search_views from the Atlas library held in memory: exact cosine on the Atlas score scale.
+
+        WHY: the user: "make it faster for arm and image". One $vectorSearch took 130-260 ms from this table, once per
+        object per frame, and one frame's perception went from about 430 ms to about 770-920 ms with Atlas on. It also
+        means a dropped link cannot stop a grasp. Loaded once, reloaded after a view is added.
+        {ATLAS TIMING 2026-10-30 "SEARCH_VIEWS 198 MS / 132 MS / 262 MS / 126 MS"} [CONFIDENCE: CONFIRMED 90% — measured]
+        """
+        if self._mirror is None:
+            rows = list(self.db.views.find({}, {"jpeg": 0}))
+            self._mirror = ([{a: b for a, b in r.items() if a != "embedding"} for r in rows],
+                            _normalised([r["embedding"] for r in rows]))
+        views, matrix = self._mirror
+        scores = (1.0 + matrix @ (q / max(float(np.linalg.norm(q)), 1e-12))) / 2.0
+        if label:
+            scores = np.where([v.get("label") == label for v in views], scores, -1.0)
+        return [{**views[i], "score": float(scores[i])} for i in np.argsort(-scores)[:k] if scores[i] >= 0]
 
     def _note_search(self, via: str, hits: list, t0: float) -> list:
         """Remember the latest search for the Atlas panel: the judges see $vectorSearch answering, live."""
@@ -341,6 +383,7 @@ class Store:
         if cap is not None and labels.count(label) >= cap:
             return {"skipped": f"{label!r} already has {cap} views"}
         view_id = self.add_view(label, v, jpeg, meta)
+        self._mirror = None  # the next search reads the new view too
         if self.online:
             self._online_lib = (v[None, :] if matrix is None else np.vstack([matrix, v]), [*labels, label])
         return {"id": view_id}
