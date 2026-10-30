@@ -12,7 +12,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sorter import clip_embed as C  # noqa: E402
 
-AXES = ["snack", "m&m", "kind bar", "granola bar", "tape", "object"]
+AXES = ["snack", "m&m's", "kind bar", "granola bar", "tape", "object"]
 DIM = len(AXES) + 1
 
 
@@ -25,7 +25,7 @@ def text(name):
 def crop(**w):
     v = np.zeros(DIM)
     for k, x in w.items():
-        v[AXES.index({"mm": "m&m", "kind": "kind bar", "granola": "granola bar"}.get(k, k))] = x
+        v[AXES.index({"mm": "m&m's", "kind": "kind bar", "granola": "granola bar"}.get(k, k))] = x
     v[-1] = np.sqrt(max(0.0, 1.0 - float(v @ v)))
     return v
 
