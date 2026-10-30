@@ -50,6 +50,11 @@ JAW_TIP_PX = (864.0, 685.0)  # midpoint between the fingertips in the colour ima
 APPROACH_GAP = 70.0  # fingertips this far above the block top for the second, close-range alignment (mm)
 GRIP_DEPTH = 15.0  # how far below the block top the fingertips close (mm)
 TIP_CLEARANCE = 10.0  # fingertips never get closer than this to the table under the jaws (mm)
+# Absolute flange floor for a grasp or release on this table: every real grasp at z >= 173 worked, both at 171
+# (silver box cutter, black tape) stopped the arm on overcurrent with the fingertips on the table.
+# {VIAM CENTERAL 2026-10-29 "成功 X5: 175、173、173、174、174 ... OVERCURRENT X2: 171、171"}
+# [CONFIDENCE: CONFIRMED 85% — 7 grasps on this table; valid while the table height does not change]
+MIN_GRASP_Z = 174.0
 PLACE_GAP = 10.0  # block bottom height above the table when released (mm)
 ALIGN_Z = 400.0  # observation height; sees the whole table scene
 SANITY_MIN_Z = 120.0  # absolute flange floor; Viam's own collision check refuses below ~132
@@ -523,6 +528,7 @@ class Rig:
         # (x, y, theta) of the flange at the last successful grab: the one spot known to be free for this object,
         # where a failed carry or reset puts it back instead of opening the gripper anywhere else
         self.picked_at = None
+        self.tables = []  # table depths measured at ALIGN_Z, newest last (measure keeps 5)
 
     async def connect(self) -> None:
         # The SDK's own reconnect loop is off: it fought call()'s backoff, and its native layer can abort the
@@ -732,7 +738,12 @@ class Rig:
         table, top = table_and_near(depth, finder(rgb) if finder else None, shift=self.depth_shift)
         a, b, c = fit_table(depth.astype(float))
         au, av = axis_pixel(self.fx, self.fy, self.cx, self.cy, table)
-        under = min(table, float(a * au + b * av + c))  # smaller depth = higher table = higher floor
+        if abs(p.z - ALIGN_Z) < 5.0:
+            self.tables.append(table)
+            del self.tables[:-5]
+        # Highest table of: this frame, the plane under the jaws, the median of the last 5 readings at ALIGN_Z (one
+        # frame read 378 instead of ~374 and the floor dropped 4 mm onto the table). Smaller depth = higher floor.
+        under = min(table, float(a * au + b * av + c), float(np.median(self.tables)) if self.tables else table)
         self.floor_z = p.z - (under - TIP_BELOW_CAM - TIP_CLEARANCE)
         return p.z, table, top
 
@@ -1020,6 +1031,9 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         # Open loop from here: straight down the tool axis to the height measured at standoff.
         # Fingertips (TIP_BELOW_CAM past the camera) end `grip` below the block top
         z_grasp = max(z0 - (top + grip - TIP_BELOW_CAM), rig.floor_z)
+        if z_grasp < MIN_GRASP_Z:
+            print(f"  grasp z clamped to {MIN_GRASP_Z:.0f} (hard floor; computed {z_grasp:.0f})")
+            z_grasp = MIN_GRASP_Z
         print(f"  -> grasp z={z_grasp:.0f} (floor {rig.floor_z:.0f})")
         try:
             await rig.descend(z_grasp, settle=False)  # the grab follows, no frame
@@ -1071,7 +1085,7 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
     z1, table, _ = await rig.measure()
     await rig.wait_clear(axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, table))
     # Block bottom hangs (height - grip) below the fingertips; release it PLACE_GAP above the table
-    z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z)
+    z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z, MIN_GRASP_Z)
     print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
     await rig.descend(z_place, settle=False)  # the release follows, no frame
     await rig.open()
