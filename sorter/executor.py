@@ -33,9 +33,9 @@ from scipy.spatial import ConvexHull
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import pick_place_auto as ppa  # noqa: E402  arm library (Rig, pick, place_in_square, place_at, ...)
 
-from sorter import clip_embed, drop_square, perception  # noqa: E402
+from sorter import clip_embed, drop_square, grasp, perception  # noqa: E402
+from sorter.grasp import REACH_MARGIN_MM, grasp_px, ring_geometry, ring_world  # noqa: E402
 
-MAX_OPEN_MM = 78.0  # jaws open ~84 mm; keep a margin so the fingers clear the sides
 COLOUR_TOL = 60.0  # RGB distance that still counts as the object at close range (grey/black/white objects)
 HUE_TOL = 9  # PIL hue units (~13 deg) for saturated objects: hue barely changes when the block looks brighter up close
 SAT_REF = 90  # PIL saturation above which an object is "coloured" and tracked by hue
@@ -196,122 +196,6 @@ def record_sightings(store, rgb, depth, seg, pose: dict, intrinsics: dict, sourc
     return recs
 
 
-RING_HOLE_FRAC = 0.2  # share of an object's hole-filled mask that is hole: a ring (tape roll), grasped by its wall
-
-
-RING_MAX_R_MM = 75.0  # a "ring" wider than this is a merged blob, not a tape roll (outer radius ~59 mm)
-
-
-def ring_geometry(o, wall_mm: float = None):
-    """
-    ((cu, cv) ring centre px, radius px of the middle of the wall) if `o` is ring-like, else None.
-
-    wall_mm: the object is known to be a ring (ObjTracker remembers it from the found frame) with this wall radius:
-    the centre comes from the hole-filled mask even when this frame's hole looks small. The black tape's servo did
-    not converge (65 s): frames that missed the hole switched the target from the wall to the top centroid, ~45 mm
-    away, and back.
-    """
-    u0, v0, u1, v1 = o.bbox
-    sub = o.mask[v0:v1 + 1, u0:u1 + 1]
-    filled = ndimage.binary_fill_holes(sub)
-    hole = filled & ~sub
-    if not filled.any() or (wall_mm is None and hole.sum() < RING_HOLE_FRAC * filled.sum()):
-        return None
-    vs, us = np.nonzero(filled)
-    if wall_mm is not None:
-        r = wall_mm * perception.INTRINSICS["fx"] / max(o.top_depth_mm, 1.0)
-    else:
-        r_out = math.sqrt(filled.sum() / math.pi)
-        # Too big for a ring: the mask merged the ring with something (the reset aimed 99 mm off the tape's centre)
-        if r_out * o.top_depth_mm / perception.INTRINSICS["fx"] > RING_MAX_R_MM:
-            return None
-        r = 0.5 * (r_out + math.sqrt(hole.sum() / math.pi))
-    return (u0 + float(us.mean()), v0 + float(vs.mean())), r
-
-
-def ring_world(o, pose: dict, k: dict):
-    """(ring centre table xy, outer radius mm, wall radius mm) of a ring-like object, or None."""
-    ring = ring_geometry(o)
-    if ring is None:
-        return None
-    (cu, cv), r_mid = ring
-    u0, v0, u1, v1 = o.bbox
-    filled = ndimage.binary_fill_holes(o.mask[v0:v1 + 1, u0:u1 + 1])
-    mm = o.top_depth_mm / k["fx"]
-    c = perception.world_xy(pose, k, cu, cv, o.top_depth_mm)
-    return (float(c[0]), float(c[1])), math.sqrt(filled.sum() / math.pi) * mm, r_mid * mm
-
-
-# A grasp point is moved to at least MIN_GRASP_R_MM + this from the base when possible, and approach refuses one
-# closer: near the base the arm's pose looked unsafe to the people at the table (the E-stop was pressed at r ~220)
-# {VIAM CENTERAL 2026-10-29 "DEMO 期间把 MIN_GRASP_R_MM + 15 改成 + 40（=245），宁可报 TOO_CLOSE"}
-REACH_MARGIN_MM = 40.0
-GRASP_END_MARGIN_MM = 15.0  # a grasp point moved along an object stays this far from its end
-
-
-def grasp_px(o, pose: dict = None, k: dict = None, wall_mm: float = None) -> tuple:
-    """
-    (u, v, yaw_deg): where the jaws close on `o` in this frame; yaw is the image angle align_wrist turns vertical
-    (the jaws close across it, along image u).
-
-    Default: the top-face centroid (a long object's handle / thickest part) and the object's long axis.
-    {VIAM CENTERAL 2026-10-29 "FOR ELONGATED OBJECTS, CHOOSE THE GRASP POINT AT THE HANDLE/THICKEST SECTION"}
-    [CONFIDENCE: INFERRED 75% — perception.Obj.top_centroid_px is the top band within TOP_BAND_MM]
-    Too close to the base there (< ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM): moved outward along the long axis, at
-    most to GRASP_END_MARGIN_MM from the object's end.
-    Ring (ring_geometry: the black tape roll, whose top centroid is in its hole and whose outside is wider than
-    the jaws): on the middle of its wall, the point nearest the base among those at least MIN_GRASP_R_MM +
-    REACH_MARGIN_MM from it (the far side when the near one is out of reach); yaw = the wall's tangent there, so
-    the jaws close across the wall. Needs the frame's pose and intrinsics.
-    {VIAM CENTERAL 2026-10-29 "RING 的抓取点在环壁中线上取 R >= MIN_GRASP_R + 15 MM 的点里离 BASE 最近的那个"}
-    [CONFIDENCE: INFERRED 70% — the tape at r 182 mm on its near side was refused; its far side (~250) is reachable]
-    """
-    if pose is None or k is None:
-        u, v = o.top_centroid_px or o.centroid_px
-        return float(u), float(v), float(o.yaw_deg)
-    ring = ring_geometry(o, wall_mm)
-    d = o.top_depth_mm
-    want = ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM
-
-    def image_yaw(p1, p2) -> float:
-        (u1, v1), (u2, v2) = perception.project_xy(pose, k, p1, d), perception.project_xy(pose, k, p2, d)
-        return math.degrees(math.atan2(-(v2 - v1), u2 - u1)) % 180.0
-
-    if ring is None:
-        u, v = o.top_centroid_px or o.centroid_px
-        g = np.array(perception.world_xy(pose, k, u, v, d))
-        if np.hypot(*g) >= want:
-            return float(u), float(v), float(o.yaw_deg)
-        # Along the long axis, outward (away from the base), as far as needed and the object allows
-        a = math.radians(o.yaw_deg)
-        tip = np.array(perception.world_xy(pose, k, u + 20.0 * math.cos(a), v - 20.0 * math.sin(a), d))
-        axis = (tip - g) / (np.linalg.norm(tip - g) or 1.0)
-        if axis @ g < 0:
-            axis = -axis
-        half = o.length_px * d / k["fx"] / 2.0
-        step = min(max(0.0, half - GRASP_END_MARGIN_MM), max(0.0, want - float(np.hypot(*g))))
-        for s in np.arange(0.0, step + 0.1, 2.0):
-            if np.hypot(*(g + s * axis)) >= want:
-                step = s
-                break
-        p = g + step * axis
-        pu, pv = perception.project_xy(pose, k, tuple(p), d)
-        return float(pu), float(pv), float(o.yaw_deg)
-    (cu, cv), r_px = ring
-    c = np.array(perception.world_xy(pose, k, cu, cv, d))
-    r_mm = r_px * d / k["fx"]
-    phis = np.radians(np.arange(0.0, 360.0, 5.0))
-    pts = c[None, :] + r_mm * np.stack([np.cos(phis), np.sin(phis)], axis=1)
-    rs = np.hypot(pts[:, 0], pts[:, 1])
-    ok = rs >= want
-    # Nearest the base among the reachable wall points; none reachable: the farthest (approach refuses it)
-    i = int(np.argmin(np.where(ok, rs, np.inf))) if ok.any() else int(np.argmax(rs))
-    p = pts[i]
-    tangent = np.array([-math.sin(phis[i]), math.cos(phis[i])])
-    pu, pv = perception.project_xy(pose, k, tuple(p), d)
-    return float(pu), float(pv), image_yaw(tuple(p - 10.0 * tangent), tuple(p + 10.0 * tangent))
-
-
 class ObjTracker:
     """
     Finder (rgb -> (u, v, yaw, area) or None) that follows ONE object of any colour, and only that object.
@@ -332,8 +216,9 @@ class ObjTracker:
 
     MAX_JUMP_PX = 260.0
 
-    def __init__(self, rig, obj, rgb: np.ndarray, text: str = None, store=None):
+    def __init__(self, rig, obj, rgb: np.ndarray, text: str = None, store=None, primitive: str = None):
         self.rig, self.text, self.store = rig, text, store
+        self.primitive = primitive  # grasp.choose_primitives' choice: where the servo centres the jaws (target_px)
         self.far_uv = obj.centroid_px  # last position in a far frame
         self.close_uv = None  # last position in a close frame; cleared when the arm goes back up
         self.close_target = None  # jaw pixel for the close servo, set by ppa.pick before it starts
@@ -420,7 +305,7 @@ class ObjTracker:
                 self._learn(rgb, o.mask)
             # Servo onto the grasp point (handle / ring wall, grasp_px); matching between frames stays on the
             # overall centroid (far_uv)
-            gu, gv, yaw = grasp_px(o, self.rig.at, intr(self.rig), self.wall_mm)
+            gu, gv, yaw = grasp.target_px(self.primitive, o, self.rig.at, intr(self.rig), self.wall_mm)
             return (gu, gv, yaw, int(o.mask.sum()))
         ref = self.close_uv or self.far_uv
         lab, n = ndimage.label(self._close_mask(rgb))
@@ -455,7 +340,7 @@ CONT_XY_MM = 35.0  # continuity: the object under the jaws is within this of the
 CONT_AREA = (0.35, 2.5)  # ...and its footprint this fraction of the verified one (a long shaft cut off ~halves it)
 
 
-async def under_jaws(rig) -> tuple:
+async def under_jaws(rig, primitive: str = None) -> tuple:
     """(object nearest the jaw-axis pixel at its own top depth or None, every object in view, frame pose)."""
     rgb, depth = await rig.frame()
     pose = pose_dict(await rig.pose())
@@ -466,7 +351,7 @@ async def under_jaws(rig) -> tuple:
         # The servo centres the grasp point (ObjTracker), so measure from it: a long object's overall centroid
         # sits out on its shaft, a ring's in its hole, both > 80 px from the jaws
         au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, o.top_depth_mm)
-        gu, gv, _ = grasp_px(o, pose, intr(rig))
+        gu, gv, _ = grasp.target_px(primitive, o, pose, intr(rig))
         return math.hypot(gu - au, gv - av)
 
     under = min(objs, key=off_axis) if objs else None
@@ -522,7 +407,7 @@ async def still_target(rig, text: str, store, tracker) -> tuple:
     provable (a missed grab moved it, or no reference), full recognition on this frame decides, so a different
     object (the blue block, clips_sd2) is still refused.
     """
-    under, objs, pose = await under_jaws(rig)
+    under, objs, pose = await under_jaws(rig, getattr(tracker, "primitive", None))
     if under is None:
         return False, "nothing under the jaws"
     ref, why = getattr(tracker, "ref", None), "no verified footprint"
@@ -794,6 +679,7 @@ def held_ring(rig, obj, frame_pose: dict):
     """
     For a ring grasped by its wall: {"offset": ring centre - jaw point (table xy, at the grasp), "theta": grasp
     theta, "r_out": outer radius mm}, from the found frame and rig.picked_at; None for anything else.
+    Held from inside (grasp.pick_inside): the expansion centres it on the jaws, so the offset is zero.
     """
     k = intr(rig)
     rw = ring_world(obj, frame_pose, k)
@@ -801,6 +687,8 @@ def held_ring(rig, obj, frame_pose: dict):
         return None
     (cx, cy), r_out, _ = rw
     fx, fy, theta = rig.picked_at
+    if getattr(rig, "grip_mode", "external") == "internal":
+        return {"offset": (0.0, 0.0), "theta": float(theta), "r_out": float(r_out), "internal": True}
     au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, ppa.TABLE_DEPTH_MM)
     jx, jy = perception.world_xy({"x": fx, "y": fy, "z": ppa.ALIGN_Z, "theta": theta}, k, au, av, ppa.TABLE_DEPTH_MM)
     return {"offset": (cx - jx, cy - jy), "theta": float(theta), "r_out": float(r_out)}
@@ -876,7 +764,9 @@ def square_spot(rig, size_mm: tuple = (40.0, 40.0), ring: dict = None, ref_fn=No
                     if len(occ) and ((np.abs(occ[:, 0] - C[0]) < hx) & (np.abs(occ[:, 1] - C[1]) < hy)).any():
                         continue
                 J = C - off  # where the jaws go
-                if len(occ) and ((np.abs(occ[:, 0] - J[0]) < strip[0]) & (np.abs(occ[:, 1] - J[1]) < strip[1])).any():
+                # Held from inside, the jaws close within the ring's own disc: no strip of their own to keep free
+                if (not (ring and ring.get("internal")) and len(occ)
+                        and ((np.abs(occ[:, 0] - J[0]) < strip[0]) & (np.abs(occ[:, 1] - J[1]) < strip[1])).any()):
                     continue
                 best = (d, J, C)
         if best is None:
@@ -960,6 +850,67 @@ def jpeg(rgb: np.ndarray) -> bytes:
     buf = io.BytesIO()
     Image.fromarray(rgb).save(buf, format="JPEG", quality=80)
     return buf.getvalue()
+
+
+def grip_record(rig, primitive: str, height: float, grip: float) -> dict:
+    """What a grasp did, for the attempt doc: the store keeps it with the embedding so a later run can reuse it."""
+    return {"primitive": primitive, "height_mm": round(height, 1), "grip_depth": round(grip, 1),
+            "theta": round(float(rig.theta), 1),
+            "expand_stop_mm": getattr(rig, "expand_stop_mm", None) if primitive == "ring_inside" else None}
+
+
+def embedding_of(found: dict, obj):
+    """
+    The grasped object's CLIP embedding as a plain list (the store takes no numpy), or None; never fails the attempt.
+    {VIAM CENTERAL 2026-10-30 "每次成功都把 {EMBEDDING, PRIMITIVE, GRIP 参数} 写进 STORE"}
+    [CONFIDENCE: SINGLE-SRC 80% — written only, nothing reads it yet]
+    """
+    try:
+        emb = found.get("emb")
+        emb = clip_embed.embed_images([obj.crop])[0] if emb is None else emb
+        return [round(float(x), 5) for x in emb]
+    except Exception as e:
+        print(f"  embedding not stored: {e}")
+        return None
+
+
+async def grasp_with_primitives(rig, found: dict, esc, times: dict, doc: dict, text: str = None, store=None,
+                                check_target: bool = True) -> tuple:
+    """
+    Approach and pick `found["obj"]`, with the first candidate the escalation allows. Returns (height, grip, tracker).
+
+    A candidate refused as too close moves on to the next at once and costs no failure: the tape's centre at r 227 mm
+    is refused, its far wall at r 246 mm is not. Any other failed pick counts against the primitive and raises, for
+    the caller's retry to look afresh. After two failures it gives way to the next candidate.
+    {VIAM CENTERAL 2026-10-30 "同一 PRIMITIVE 失败两次 -> 下一个候选"}
+    [CONFIDENCE: SINGLE-SRC 80% — the module's GRASP_ATTEMPTS is 3, so a request reaches the second candidate once]
+    """
+    obj = found["obj"]
+    last = None
+    for primitive in esc.order(grasp.choose_primitives(obj, rig.fx)):
+        tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store, primitive=primitive)
+        esc.attempt(primitive)
+        doc["primitive"], doc["attempt_primitives"] = primitive, list(esc.tried)
+        print(f"  grasp primitive: {primitive}")
+        check = (lambda t=tracker: still_target(rig, text, store, t)) if check_target else None
+        slipped = lambda c, d, p, t=tracker: still_on_table(rig, t, c, d, p)  # noqa: E731
+        try:
+            await approach(rig, found, tracker)
+            if primitive == "ring_inside":
+                height, grip = await grasp.pick_inside(rig, times, tracker, check=check, slipped=slipped,
+                                                       inner_mm=grasp.ring_inner_mm(obj, rig.fx))
+            else:
+                height, grip = await ppa.pick(rig, times, tracker, check=check, align=False, slipped=slipped,
+                                              grip_for=grasp.grip_fn(primitive))
+            return height, grip, tracker
+        except ppa.EStop:
+            raise
+        except ppa.TooClose as e:
+            last = e
+        except RuntimeError:
+            esc.failed(primitive)
+            raise
+    raise last if last is not None else ppa.PickFailed("no grasp primitive for this object")
 
 
 def width_mm(obj, fx: float) -> float:
@@ -1170,13 +1121,15 @@ async def approach(rig, found: dict, tracker) -> None:
     """
     pose = found["pose"]
     obj, k = found["obj"], intr(rig)
-    u, v, yaw = grasp_px(obj, pose, k)
+    primitive = getattr(tracker, "primitive", None)
+    u, v, yaw = grasp.target_px(primitive, obj, pose, k)
     xy = perception.world_xy(pose, k, u, v, obj.top_depth_mm)
     # Too close to the base to grasp (reach and the people's comfort, REACH_MARGIN_MM): refuse before moving
     if math.hypot(*xy) < ppa.MIN_GRASP_R_MM + REACH_MARGIN_MM:
         raise ppa.TooClose(ppa.too_close_msg(*xy))
     top = obj.top_depth_mm - (pose["z"] - ppa.ALIGN_Z)  # camera height above it shrinks by the z change
-    theta = wrist_for(pose, k, u, v, yaw, obj.top_depth_mm)
+    # A round target needs no turn: the wrist stays where the views and the square's check are calibrated
+    theta = 0.0 if grasp.keeps_wrist_at_zero(primitive, obj) else wrist_for(pose, k, u, v, yaw, obj.top_depth_mm)
     # Flange that puts the jaw axis (axis pixel at that depth) over xy at this theta: the offset is translation-free
     au, av = ppa.axis_pixel(rig.fx, rig.fy, rig.cx, rig.cy, top)
     jx, jy = perception.world_xy({"x": 0.0, "y": 0.0, "z": ppa.ALIGN_Z, "theta": theta}, k, au, av, top)
@@ -1292,8 +1245,7 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         if found.get("ambiguous"):
             doc.update(status="ambiguous", fail_phase="find", fail_reason=found.get("reason"))
             return doc
-        # A ring is grasped by its wall (grasp_px), so its outside width does not matter
-        if width_mm(obj, rig.fx) > MAX_OPEN_MM and ring_geometry(obj) is None:
+        if not grasp.choose_primitives(obj, rig.fx):
             doc.update(status="too_wide", fail_phase="find", fail_reason=f"{width_mm(obj, rig.fx):.0f} mm across")
             return doc
         # Where to look for the square while carrying: a full view from this task's frames, then recent
@@ -1304,14 +1256,13 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         sightings = square_sightings(rig)
         if square_xy is None and sightings:
             doc["square_path"] = sightings[0][1]
-        tracker = ObjTracker(rig, obj, found["rgb"], text=text, store=store)
         # One move (translation + wrist yaw) to the pre-grasp pose computed from the found frame, where best()
         # already accepted the whole object: identity is fixed there (tracker.ref); pick() refines and checks
         # continuity before the descent
-        await approach(rig, found, tracker)
-        height, grip = await ppa.pick(rig, times, tracker, check=lambda: still_target(rig, text, store, tracker),
-                                      align=False, slipped=lambda c, d, p: still_on_table(rig, tracker, c, d, p))
+        esc = grasp.escalation_for(text)
+        height, grip, tracker = await grasp_with_primitives(rig, found, esc, times, doc, text, store)
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
+        doc["grip"] = grip_record(rig, tracker.primitive, height, grip)
         size = (width_mm(obj, rig.fx), obj.length_px * obj.top_depth_mm / rig.fx)
         ring = held_ring(rig, obj, found["pose"])
         # Look first where the found frame saw part of the paper, then the recent sightings; search the observe
@@ -1349,6 +1300,11 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         doc["check"] = why
         if not right:
             doc.update(fail_phase="check", fail_reason=why)
+        else:
+            grasp.forget_escalation(text)
+            emb = embedding_of(found, obj)
+            if emb is not None:
+                doc["embedding"] = emb
     except ppa.EStop:
         # A person pressed the emergency stop: no recover, no retries, no move back
         doc.update(status="estop", fail_phase=times.get("at", "start"), fail_reason=ppa.ESTOP_STATUS)
@@ -1385,7 +1341,9 @@ async def recover(rig, doc: dict) -> None:
         return
     try:
         await rig.lift()
-        if await rig.holding():
+        # Held from inside: holding() says nothing about it, and only the picture can have called it a slip
+        inside = getattr(rig, "grip_mode", "external") == "internal" and rig.picked_at is not None
+        if inside or await rig.holding():
             xy = await put_back(rig, doc.get("height_mm", 30.0), (doc.get("grasp") or {}).get("grip_depth", 15.0))
             doc["put_back_at"] = [round(xy[0], 1), round(xy[1], 1)]
             doc["fail_reason"] = f"{doc.get('fail_reason')} | put back where it was picked ({xy[0]:.0f},{xy[1]:.0f})"
@@ -1827,17 +1785,16 @@ async def clear_square(rig, store) -> dict:
             spots = sorted((sp for sp in spots if all(math.hypot(sp[0][0] - d[0], sp[0][1] - d[1]) > 80.0 for d in dropped)),
                            key=lambda sp: math.hypot(sp[0][0] - centre[0], sp[0][1] - centre[1]))
             doc.setdefault("drop_spots", []).append([sp[2] for sp in spots[:4]])
-            if width_mm(obj, rig.fx) <= MAX_OPEN_MM or ring_geometry(obj) is not None:
+            if grasp.choose_primitives(obj, rig.fx):
+                esc = grasp.Escalation()  # this object's failures, over this loop's tries
                 # Picked like a grasp: one move (with the yaw) to the pre-grasp pose from this frame, a ring by its
                 # wall, open-loop descent. A failed pick (no convergence, empty grab) looks again and retries, up to
                 # RESET_PICK_TRIES; the black tape's block servo failed once and the reset gave up.
                 # {VIAM CENTERAL 2026-10-29 "RESET 抓取改走 GRASP 那条路径 ... RESET 也要重试 ... 最多 3 次"}
                 for _try in range(RESET_PICK_TRIES):
                     try:
-                        tracker = ObjTracker(rig, obj, rgb)
-                        await approach(rig, {"obj": obj, "rgb": rgb, "depth": depth, "pose": q}, tracker)
-                        height, grip = await ppa.pick(rig, None, tracker, align=False,
-                                                      slipped=lambda c, d, p, t=tracker: still_on_table(rig, t, c, d, p))
+                        height, grip, _ = await grasp_with_primitives(
+                            rig, {"obj": obj, "rgb": rgb, "depth": depth, "pose": q}, esc, {}, doc, check_target=False)
                     except ppa.EStop:
                         raise
                     except ppa.TooClose as e:
@@ -1910,7 +1867,10 @@ async def resume(rig, store):
     if ppa.ESTOP["on"]:
         return None  # nothing moves until a person resets after the emergency stop
     st = ppa.load_state()
-    if not await rig.holding():
+    # Held from inside: holding() says nothing about it, and forgetting it would leave the ring on the jaws
+    if st.get("holding") and st.get("mode") == "internal":
+        rig.grip_mode = "internal"
+    elif not await rig.holding():
         if st.get("holding"):
             ppa.save_state(False)
         return None

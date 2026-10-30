@@ -427,17 +427,18 @@ def bbox_near(bbox, uv, radius: float) -> bool:
 STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "arm_state.json"
 
 
-def save_state(holding: bool, height: float = None, grip: float = None) -> None:
+def save_state(holding: bool, height: float = None, grip: float = None, mode: str = "external") -> None:
     """
     Remember what the gripper holds, so a restarted process can finish the job.
 
     WHY: the Viam SDK can abort the process mid-run (SIGABRT in its native layer), leaving the arm holding
     an object; the supervisor restarts the program, which reads this to resume.
+    mode: "internal" = held by expanding inside it (grasp.pick_inside): only closing the jaws releases it.
     """
     import json
 
     STATE_FILE.parent.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"holding": holding, "height": height, "grip": grip, "ts": time.time()}))
+    STATE_FILE.write_text(json.dumps({"holding": holding, "height": height, "grip": grip, "mode": mode, "ts": time.time()}))
 
 
 def load_state() -> dict:
@@ -514,6 +515,9 @@ class EStop(MoveRefused):
 # {VIAM CENTERAL 2026-10-29 "FAIL_REASON 里出现 'EMERGENCY STOP' 时，立刻停止所有重试和 RECOVER ... 不做 CLEAR_ERROR"}
 ESTOP = {"on": False, "why": ""}
 ESTOP_STATUS = "E-STOP pressed — release it, then press Reset on the dashboard"
+EXPAND_WAIT_S = 6.0  # Rig.expand: longest wait for the jaws to stop against the wall
+EXPAND_SPEED = 1000  # of 1-5000: slower than the module's default 2000, it arrives at the wall gently
+EXPAND_TORQUE_PCT = 40  # of 0-100: below the G2's default grip force 50%; the force on the wall comes only from this
 READ_CALLS = ("get pose", "get images", "holding", "frame system", "geometries")
 
 
@@ -547,6 +551,9 @@ class Rig:
         # where a failed carry or reset puts it back instead of opening the gripper anywhere else
         self.picked_at = None
         self.tables = []  # table depths measured at ALIGN_Z, newest last (measure keeps 5)
+        # "internal": the jaws hold the object by pressing outward from inside it, so closing them is what lets go
+        self.grip_mode = "external"
+        self.expand_stop_mm = None  # where the last expand() stopped: logged with the grasp, for tuning on the arm
 
     async def connect(self) -> None:
         # The SDK's own reconnect loop is off: it fought call()'s backoff, and its native layer can abort the
@@ -668,6 +675,41 @@ class Rig:
 
     async def holding(self) -> bool:
         return (await self.call("holding", lambda: self.gripper.is_holding_something())).is_holding_something
+
+    async def expand(self, mm: float) -> float:
+        """
+        Open the jaws toward `mm` with limited torque, against whatever stops them; returns where they stopped in mm
+        (None if unread). The target lies past the wall on purpose: the torque limit sets the force, not the position.
+
+        WHY a separate command: Gripper.open() runs to the full opening at the module's default force. grab_with_torque
+        takes position, speed and torque; set (position only) is the fallback if the module refuses it.
+        {VIAM-UFACTORY-XARM README "GRAB_WITH_TORQUE ... POSITION (0-850), SPEED (1-5000), TORQUE (0-100%)"}
+        [CONFIDENCE: UNVERIFIED 55% — the README does not say what either does on contact while OPENING; never run]
+        A command still running after EXPAND_WAIT_S counts as stalled on the wall: the picture decides the hold.
+        """
+        pos = float(min(850.0, max(0.0, mm * 10.0)))
+
+        async def send(cmd: dict) -> None:
+            try:
+                await asyncio.wait_for(self.gripper.do_command(cmd), EXPAND_WAIT_S)
+            except asyncio.TimeoutError:
+                print(f"  expand: no reply in {EXPAND_WAIT_S:.0f} s, taken as stalled on the wall")
+        cmd = {"grab_with_torque": {"position": pos, "speed": EXPAND_SPEED, "torque": EXPAND_TORQUE_PCT}}
+        try:
+            await self.call("expand", lambda: send(cmd))
+        except EStop:
+            raise
+        except MoveRefused as e:
+            print(f"  expand: {e}; falling back to set")
+            await self.call("expand", lambda: send({"set": pos}))
+        try:
+            got = await self.call("expand", lambda: self.gripper.do_command({"get": True}))
+            return float(got["pos"]) / 10.0
+        except EStop:
+            raise
+        except (MoveRefused, KeyError, TypeError, ValueError) as e:
+            print(f"  expand: position not read ({e})")
+            return None
 
     async def goto(self, x: float, y: float, z: float, theta: float = None, settle: bool = True) -> None:
         """
@@ -993,7 +1035,7 @@ def mark(times: dict, phase: str, t0: float) -> float:
 
 
 async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=None, align: bool = True,
-               slipped=None) -> tuple:
+               slipped=None, grip_for=None) -> tuple:
     """
     Steps 1-2: align over the block, measure it, descend and grab. Returns (block height, grip depth).
 
@@ -1011,6 +1053,7 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     slipped(rgb, depth, pose) -> (bool, why): after the lift, from a frame at ALIGN_Z, is the object still lying where
     it was picked? The G2's holding() stays True with the fingers stopped half-closed after the red box cutter slid
     out, twice; the picture decides.
+    grip_for(height) -> how far below the object's top the fingertips close (default GRIP_DEPTH, at most half of it).
     {VIAM CENTERAL 2026-10-29 "确认 RESET 真的走了 APPROACH 的一次 MOVE + OPEN-LOOP，不要再进 ALIGN"}
     """
     times = {} if times is None else times
@@ -1044,7 +1087,7 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
         height = table - top
         if not 10.0 <= height <= 80.0:
             raise RuntimeError(f"implausible block height {height:.0f} mm")
-        grip = min(GRIP_DEPTH, height / 2)
+        grip = grip_for(height) if grip_for is not None else min(GRIP_DEPTH, height / 2)
         if check is not None:
             ok, why = await check()
             print(f"  continuity check: {why}")
@@ -1135,6 +1178,15 @@ async def pick(rig: Rig, times: dict = None, finder=None, verify=None, check=Non
     return height, grip
 
 
+async def release_jaws(rig: Rig) -> None:
+    """Let go of what is held: every release goes through this, since an internal grip lets go by closing, not opening."""
+    if getattr(rig, "grip_mode", "external") == "internal":
+        await rig.grab()
+        rig.grip_mode = "external"
+    else:
+        await rig.open()
+
+
 async def release_here(rig: Rig, height: float, grip: float, observe: bool = False) -> None:
     """
     Lower the held block straight down until its bottom is PLACE_GAP above the table, open, lift to ALIGN_Z.
@@ -1147,7 +1199,7 @@ async def release_here(rig: Rig, height: float, grip: float, observe: bool = Fal
     z_place = max(z1 - (table - TIP_BELOW_CAM - (height - grip) - PLACE_GAP), rig.floor_z, MIN_GRASP_Z)
     print(f"  table={table:.0f}mm -> place z={z_place:.0f}")
     await rig.descend(z_place, settle=False)  # the release follows, no frame
-    await rig.open()
+    await release_jaws(rig)
     save_state(False)
     if observe:
         # Free calibration data: the released block marks where the jaw axis really is
@@ -1325,7 +1377,8 @@ async def place_in_square(rig: Rig, height: float, grip: float, times: dict = No
     await travel(rig, *spot, theta=0.0)
     t = mark(times, "carry", t)
 
-    if not await rig.holding():
+    # An internal grip presses outward: is_holding_something was never defined for that, so it is not asked
+    if getattr(rig, "grip_mode", "external") != "internal" and not await rig.holding():
         raise ObjectLost("object no longer in the gripper during the carry")
     print("4/5 lower + release")
     times["at"] = "place"
