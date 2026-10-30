@@ -1802,12 +1802,12 @@ async def execute(rig, text: str, store, mode: str = "demo", target=None, target
         height, grip, tracker = await grasp_with_primitives(rig, found, esc, times, doc, text, store)
         doc["height_mm"], doc["grasp"] = round(height, 1), {"grip_depth": round(grip, 1), "theta": rig.theta}
         doc["grip"] = grip_record(rig, tracker.primitive, height, grip)
-        # The bucket (SORTER_TARGET=bucket) when one was seen in the found frame or the map, or when no square is known
-        # either; the square otherwise. Its position is looked at again unless it is under drop_bucket.FRESH_S old.
+        # SORTER_TARGET=bucket: always the bucket, searched for when no frame or map has it; the paper square is gone. An old
+        # square sighting sent the first job after a module restart looking for it {LOG "3/5 CARRY TO THE BLUE SQUARE"}
+        # {USER 2026-10-30 "IT COULDNT FIND THE BUCKET NOW"} [CONFIDENCE: CONFIRMED 90% — that log line and fail_reason]
         live = live_map(rig) or {}
         bk = drop_bucket.fresh_bucket(found, live, intr(rig)) if drop_bucket.enabled() else None
-        if drop_bucket.enabled() and (bk is not None or live.get("bucket") or drop_bucket.from_frame(
-                found.get("rgb"), found.get("depth"), found.get("pose"), intr(rig)) or not (found.get("square") or square_sightings(rig))):
+        if drop_bucket.enabled():
             poses = [(*ppa.HOME_XY, drop_bucket.LOOK_Z)] + [(x, y, SWEEP_Z) for x, y in SWEEP_XY]
             if bk is None:
                 times["at"] = "carry"
