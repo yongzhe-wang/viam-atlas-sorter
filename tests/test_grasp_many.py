@@ -131,9 +131,10 @@ async def main():
                       ("blue and black screwdriver", "blue and black screwdriver")):
         calls.clear()
         r = await s.do_command({"grasp": raw, "wait": True})
-        assert [c["text"] for c in calls] == [text] and s.last["kind"] == "grasp" and "items" not in r and not calls[0]["any"], (raw, calls, r)
-    r = await s.do_command({"grasp": "screw driver"})  # spelled as the library does; two in view, alone: ambiguous as ever
-    assert r["status"] == "ambiguous" and "'screwdriver'" in r["reason"], r
+        # a single grasp takes the best of equal matches too {USER 2026-10-30 "THEN JUST CHOOSE A RANDOM ONE"}
+        assert [c["text"] for c in calls] == [text] and s.last["kind"] == "grasp" and "items" not in r and calls[0]["any"], (raw, calls, r)
+    r = await s.do_command({"grasp": "screw driver", "wait": True})  # spelled as the library does; two in view, alone: the best is taken
+    assert r.get("status") != "ambiguous" and r.get("accepted"), r
     print("1. one object: the single path, text as before (spoken lead-ins and 'screw driver' now understood)")
 
     calls.clear()
@@ -187,16 +188,17 @@ async def main():
     OUTCOME.clear()
     print("5. too_close / too_wide / square_full / unsafe_grasp / failed -> next item; a slip is retried as a single grasp would be")
 
-    # Several objects fit one name: refused alone, the best one in a list
-    r = await s.do_command({"grasp": "screwdriver"})
-    assert r["status"] == "ambiguous" and not s._busy(), r
+    # Several objects fit one name: the best one, alone or in a list {USER 2026-10-30 "THEN JUST CHOOSE A RANDOM ONE"}
+    calls.clear()
+    r = await s.do_command({"grasp": "screwdriver", "wait": True})
+    assert r.get("accepted") and r.get("status") != "ambiguous" and calls[0]["any"] and not s._busy(), (calls, r)
     calls.clear()
     r = await s.do_command({"grasp": "screwdriver and tape", "wait": True})
     assert st(r) == ["done", "done"] and calls[0]["target"] and calls[0]["any"] and calls[1]["any"], (calls, r)
     MAP["tied"] = {"label": "kind bar", "xy": [300.0, 100.0], "colour": "x", "seen_ts": time.time(), "tie": True}
     s.live.map = {"ts": time.time(), "objects": [MAP["tied"]]}
     r = await s.do_command({"grasp": "tied"})
-    assert r["via"] == "search", r  # alone: the map's tie is no answer, the search decides
+    assert r["via"] == "map" and r["target_xy"] == [300.0, 100.0], r  # alone too: the map's best is looked at first
     await s.job
     calls.clear()
     r = await s.do_command({"grasp": "tied, tape", "wait": True})

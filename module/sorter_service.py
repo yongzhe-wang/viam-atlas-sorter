@@ -53,6 +53,7 @@ AGENT3's (sorter/perception.py, sorter/clip_embed.py); this file only adapts the
 """
 import asyncio
 import base64
+import difflib
 import hashlib
 import inspect
 import io
@@ -953,9 +954,10 @@ class GraspByDescription(Generic, EasyResource):
 
     async def _run(self, kind: str, text: Optional[str], target: Optional[dict] = None,
                    decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
-                   chosen: Optional[dict] = None, skip_current: bool = False) -> dict:
+                   chosen: Optional[dict] = None, skip_current: bool = False, any_match: bool = False) -> dict:
         """A job of one grasp, reset or table scan: its attempts, then its result in `last`; never raises."""
-        summary = await self._attempts(kind, text, target, decide_ms, target_xy, chosen, skip_current)
+        # any_match passes through to the executor's accept_ambiguous (a single grasp takes the best of equal matches)
+        summary = await self._attempts(kind, text, target, decide_ms, target_xy, chosen, skip_current, any_match)
         # job id lets a DoCommand caller (the dashboard in module mode) match this result to its request
         self.last = {"kind": kind, "text": text, "job": self.job_info.get("job"), "finished": time.time(), **summary}
         return summary
@@ -1195,7 +1197,8 @@ class GraspByDescription(Generic, EasyResource):
 
     async def _start(self, kind: str, text: Optional[str], wait: bool, target: Optional[dict] = None,
                      decide_ms: Optional[int] = None, target_xy: Optional[list] = None,
-                     chosen: Optional[dict] = None, skip_current: bool = False) -> Dict[str, ValueTypes]:
+                     chosen: Optional[dict] = None, skip_current: bool = False,
+                     any_match: bool = False) -> Dict[str, ValueTypes]:
         if self._busy():
             return {"accepted": False, "error": "busy", "running": dict(self.job_info)}
         job_id = uuid.uuid4().hex[:12]
@@ -1204,7 +1207,7 @@ class GraspByDescription(Generic, EasyResource):
         self.job_info = {"job": job_id, "kind": kind, "text": text or "", "started": time.time(), "via": via,
                          "fast_path": target is not None, "target_xy": target_xy}
         self.job = asyncio.get_event_loop().create_task(
-            self._run(kind, text, target, decide_ms, target_xy, chosen, skip_current))
+            self._run(kind, text, target, decide_ms, target_xy, chosen, skip_current, any_match))
         if wait:
             return {"accepted": True, "job": job_id, **(await self.job)}
         return {"accepted": True, "job": job_id}
@@ -1222,7 +1225,10 @@ class GraspByDescription(Generic, EasyResource):
         if cold:
             return cold
         rt = _runtime()
-        d = await self._decision(text)
+        # Two equal matches are no refusal: take the best one, as a list item does
+        # {USER 2026-10-30 "BLUE LOLIPOP / AMBIGUOUS ... THEN JUST CHOOSE A RANDOM ONE"}
+        # [CONFIDENCE: CONFIRMED 95% — the top-scoring match, not a coin flip: deterministic and still "any one"]
+        d = await self._decision(text, any_match=True)
         if d.get("status"):
             cached = {"decided_from_cache": True} if d.get("decided_from_cache") else {}
             self.last = {"kind": "grasp", "text": text, "job": None, "finished": time.time(), "status": d["status"],
@@ -1233,7 +1239,8 @@ class GraspByDescription(Generic, EasyResource):
         if d["via"] == "frame":
             # fast_path: the executor will skip its own first observe (needs AGENT1's execute(..., target=...))
             fast = "target" in inspect.signature(rt.executor.execute).parameters
-            res = await self._start("grasp", text, wait, target=self._frame_target(d), decide_ms=d["decide_ms"])
+            res = await self._start("grasp", text, wait, target=self._frame_target(d), decide_ms=d["decide_ms"],
+                                    any_match=True)
             if not res.get("accepted"):
                 return {**res, "ok": False}  # became busy while deciding
             return {**res, "ok": True, "via": "frame", "decided_from_cache": True, "fast_path": fast,
@@ -1242,20 +1249,44 @@ class GraspByDescription(Generic, EasyResource):
             found = d["found"]
             res = await self._start("grasp", text, wait, target_xy=found["xy"], decide_ms=found["decide_ms"],
                                     chosen={"label": found["label"], "colour": found.get("colour")},
-                                    skip_current=d["seen_miss"])
+                                    skip_current=d["seen_miss"], any_match=True)
             return {**res, "ok": bool(res.get("accepted")), "via": "map", "status_text": "searching",
                     "message": self._map_message(found) + " · looking there first"
                                + (", then searching" if found["stale"] else ""), "stale": found["stale"],
                     "target_xy": found["xy"], "label": found["label"], "map_age_s": found["map_age_s"],
                     "seen_s_ago": found["seen_s_ago"], "look_first": found["look_first"],
                     "decide_ms": found["decide_ms"]}
-        res = await self._start("grasp", text, wait, skip_current=d["seen_miss"])
+        res = await self._start("grasp", text, wait, skip_current=d["seen_miss"], any_match=True)
         return {**res, "ok": bool(res.get("accepted")), "via": "search", "status_text": "searching",
                 "message": "searching the table… (grasps at the first view that shows it)",
                 "why": "not in the cached frame" if d["pick"] is not None
                 else f"no fresh frame from the observe pose ({self.seen.get('reason') or self.seen.get('error') or 'no look yet'})"}
 
     # ---- a list of objects: one job, each item through the single-object decision ----------------------
+
+    @staticmethod
+    def _spellfix(raw: str, names: list) -> str:
+        """
+        Each typed word that is not a word of a library name but is close to one becomes that word ("lolipop" ->
+        "lollipop"): the misspelling missed the live map and CLIP split it between two objects.
+        {USER 2026-10-30 "BLUE LOLIPOP / AMBIGUOUS ... ALSO THE BLUE LOLIPOP THER EIS ONLY ONE"}
+        [CONFIDENCE: CONFIRMED 90% — preview: 'blue lollipop' is on the map at (378, 27), 'blue lolipop' is not]
+        Only words of 5+ letters at similarity 0.85: "black" vs "block" (0.80) stays, colours are never changed.
+        """
+        vocab = {w for n in names for w in re.findall(r"[a-z]+", str(n).lower())}
+        keep = vocab | {"black", "white", "brown", "green", "purple", "orange", "yellow", "silver", "grey", "gray"}
+
+        def fix(m: re.Match) -> str:
+            w = m.group(0)
+            if len(w) < 5 or w.lower() in keep:
+                return w
+            close = difflib.get_close_matches(w.lower(), vocab, n=1, cutoff=0.85)
+            return close[0] if close else w
+
+        out = re.sub(r"[A-Za-z]+", fix, raw)
+        if out != raw:
+            LOGGER.info(f"command text {raw!r} read as {out!r}")
+        return out
 
     def _parse(self, raw: str) -> tuple:
         """(objects named by a command, those over MAX_OBJECTS, the text for the single-object path)."""
@@ -1266,6 +1297,7 @@ class GraspByDescription(Generic, EasyResource):
         except Exception as e:
             LOGGER.warning(f"no library names for the command text: {type(e).__name__}: {e}")
             names = []
+        raw = self._spellfix(raw, names)
         items = split_objects(raw, names, limit=None)
         old = _runtime().clean(raw)
         # One object: exactly today's text, unless the parser really changed it ("i want tape", "screw driver")
