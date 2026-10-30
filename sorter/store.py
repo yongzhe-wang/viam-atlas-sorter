@@ -22,6 +22,7 @@ import io
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -137,7 +138,17 @@ class Store:
             from pymongo import MongoClient
 
             self.db = MongoClient(uri, serverSelectionTimeoutMS=8000)[db or os.environ.get("MONGODB_DB", "sorter")]
-            self.flush()
+            # In the background: a robot with a backlog (2191 observations, 124 MB) spent over 2 minutes here and
+            # viam-server gave up on the module {SFHACK4 LOG 2026-10-30 "TIMED OUT AFTER 2M0S DURING RECONFIGURE"}.
+            # Online writes go straight to Atlas, so nothing new is appended to the files being flushed.
+            threading.Thread(target=self._flush_in_background, name="store-flush", daemon=True).start()
+
+    def _flush_in_background(self) -> None:
+        """flush() at startup; a failure (Atlas unreachable) is only reported, the next start tries again."""
+        try:
+            print(f"store: flushed to Atlas: {self.flush()}")
+        except Exception as e:
+            print(f"store: flush to Atlas failed: {type(e).__name__}: {str(e)[:200]}")
 
     @property
     def online(self) -> bool:
