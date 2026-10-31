@@ -10,7 +10,7 @@ table between (or during) runs. Never assume its location: find it fresh for eve
 re-detecting during the servo, search the reachable table (grid/spiral from the observe height) when it
 is not in view, and keep self-reset spots away from the ring and the paper.
 
-## Judging (email from Shannon Bradshaw, Viam, Oct 29 11:16) — 5-minute demo per team
+## Judging (organizers' email, Oct 29 11:16) — 5-minute demo per team
 
 | Criterion | Weight | What we do about it |
 |---|---|---|

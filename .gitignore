@@ -7,3 +7,5 @@ __pycache__/
 scripts/poses.json
 data/
 dataset_raw/
+.claude/
+docs/scan/

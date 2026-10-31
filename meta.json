@@ -2,18 +2,20 @@
   "module_id": "sorter-team:sorter",
   "visibility": "private",
   "url": "https://github.com/yongzhe-wang/viam-atlas-sorter",
-  "description": "Grasp any object by text description and drop it in a blue tape square; depth-guided picking, CLIP object choice, self-reset, attempts logged to MongoDB Atlas.",
+  "description": "Pick any objects by text description into a movable orange bucket: open-vocabulary CLIP recognition, depth-guided grasping, live table map, queue and stop; every attempt and observation logged to MongoDB Atlas.",
   "models": [
     {
       "api": "rdk:service:generic",
       "model": "sorter-team:sorter:grasp-by-description",
-      "short_description": "DoCommand {\"grasp\": \"<description>\"} picks that object into the square; {\"reset\": true}; {\"status\": true}"
+      "short_description": "DoCommand {\"grasp\": \"red lollipop, blue block\"} puts each into the bucket; {\"stop\": true}; {\"reset\": true}; {\"status\": true}"
     }
   ],
   "entrypoint": "run.sh",
   "build": {
     "build": "sh module/build.sh",
     "path": "module/dist/archive.tar.gz",
-    "arch": ["linux/amd64"]
+    "arch": [
+      "linux/amd64"
+    ]
   }
 }

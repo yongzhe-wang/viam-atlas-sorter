@@ -1,95 +1,99 @@
-# viam-atlas-sorter
+# Trick-or-Treat Sorter
 
-Teach-once recycling sorter for the Viam x MongoDB Robot Hackathon (Oct 29-30, 2026, Robotics Center of Silicon Valley).
+**🥉 3rd place, Viam × MongoDB Robot Hackathon: Harnessing Physical AI & Data** (San Francisco, Oct 29–30, 2026, Robotics Center of Silicon Valley).
 
-## Idea
+Type a list of everyday objects into one box, for example `red lollipop, blue block, m&m snack`. A UFactory xArm6 finds each one anywhere on a cluttered table, picks it up and drops it into a pumpkin bucket. The bucket can be moved at any time; the arm searches for it.
 
-Wrist camera sees an object -> embed it -> MongoDB Atlas `$vectorSearch` finds the nearest known objects -> read back the bin and the grasp parameters that worked before -> arm picks and places -> the result is written to both Viam data capture and Atlas.
+Nothing is trained for the objects. CLIP matches the words to what the wrist camera sees, and a library of object views in MongoDB Atlas, searched with `$vectorSearch`, helps it recognise the ones it has seen before.
 
-Unknown object (similarity below threshold): arm stops, a human taps the correct bin once, the embedding is stored, and the next time it is recognized.
+![Objects delivered into the bucket](docs/demo/bucket_with_yellow_block.jpg)
 
-## Division of labor
+## What it does
 
-| Concern | Viam | Atlas |
-|---|---|---|
-| Hardware | arm, gripper, camera as components | - |
-| Perception | vision service (mlmodel / color_detector), OpenCV segmentation | - |
-| Embedding | custom Python module `sorter` | stores vectors, Vector Search index |
-| Memory | - | `objects`: embedding, bin, grasp params, n_try, n_ok |
-| Run log | data capture on the `sorter` sensor, synced to Viam cloud | `attempts`: append-only ledger |
-| Analysis | Viam Query (MQL) | Atlas Charts dashboard |
+- **Open vocabulary.** Any description works, not a fixed class list. An open-set gate refuses to grab something that clearly isn't what was asked for, and a recognised object is never taken for another name.
+- **Lists and a queue.** A comma-separated list becomes one job, run in order. Commands typed while the arm is busy are queued. If a name matches several objects (`lollipop`), all of them go in one after another.
+- **Finds things anywhere.** It starts from the live table map, then searches by coverage: straight-down views plus tilted ones around the bucket, which otherwise blocks the view. It grasps at the first view that shows the object.
+- **Movable drop target.** The orange bucket is located by colour and rim geometry, using its known size, so a partial view is enough. It is confirmed again over its mouth before the gripper opens.
+- **Recovers.** A slip is detected from the picture and the jaw opening, not from the gripper's unreliable `holding()` alone. A failed try is retried in place, with no trip back to the start pose, and the wrist turns when a finger's landing spot is blocked. If the bucket truly can't be found, the object is put back where it was picked.
+- **Smooth, fast moves.** With `SORTER_SMOOTH=1`, as run at the event, air moves are single quintic joint-space paths. The arm moves at 180°/s, and the camera loop runs at 2 Hz.
+- **Operator controls.** The dashboard has exactly three things: the command box (with Grasp, Stop and Reset), the live arm camera with recognition boxes, and the robot's internal table map. Stop ends only the current task; the arm lifts, puts back what it holds and goes on with the queue.
 
-## Data model
-
-```
-objects   { _id, label, bin, embedding[512], grasp{width, force, approach_height, yaw_offset},
-            n_try, n_ok, taught_by, created_at }
-bins      { _id: "recycle|trash|compost", pregrasp_pose, drop_pose }
-attempts  { _id, attempt_id, ts, object_id, sim, k_used[], grasp_used{},
-            success, duration_s, img_before, img_after, error }
-```
-
-Grasp parameters are stored as relative values only. Trajectories depend on where the object is and are recomputed from the current pose every time.
-
-## Runtime loop
-
-1. Move to the fixed observe pose.
-2. OpenCV segmentation: centroid, long-axis angle, crop.
-3. CLIP embedding of the crop (512-d, normalized).
-4. Top-3 neighbors from the local numpy cache (Atlas is the source of truth; cache refreshed periodically and after each teach).
-5. `sim >= tau` (start at 0.85, calibrate on site): use the neighbor's bin. Otherwise: teach flow.
-6. Choose grasp params from neighbors weighted by `n_ok / max(n_try, 1)`.
-7. Pixel -> table (x, y) via homography; yaw from long axis + `yaw_offset`.
-8. Pre-grasp, re-detect, descend, close, lift, drop at the bin, open.
-9. Judge success, write `attempts`, update `n_try` / `n_ok`, flush the local queue to Atlas when online.
-
-## Network resilience
-
-Run the loop on the Linux machine next to the arm and connect over LAN. Keep the embeddings in a local cache and queue writes locally; flush to Atlas when the connection returns.
-
-## Schedule
-
-| When | Must have | Cut line |
-|---|---|---|
-| Day 1 AM | machine online, arm controllable, homography calibrated | - |
-| Day 1 PM | fixed-position pick and place | no pick by 5 PM -> point at bins only |
-| Day 1 evening (hard close 9 PM) | embedding + Atlas write/search | use `input()` instead of teach UI |
-| Day 2 AM | any-position pick, teach-once, `attempts` logging | parameter exploration -> record only |
-| Day 2 PM | Charts, rehearse with 5 objects | no new features |
-| 3:30 PM | Demo | - |
-
-## Unverified items (check on site)
-
-- Atlas `$vectorSearch` pre-filter syntax and index definition format
-- Gripper "is holding" API
-- `motion.Move` frame-system configuration
-- Python SDK method names (`Camera.from_robot`, `arm.move_to_joint_positions`)
-
-## Layout
+## Architecture
 
 ```
-sorter/     Viam module (embedding, control loop)
-scripts/    Atlas setup, seed data, homography calibration
-teach_ui/   minimal web page for teaching new objects
-docs/       notes
+dashboard (FastAPI)  ──DoCommand──▶  Viam module  sorter-team:sorter:grasp-by-description  (generic service, runs on the robot)
+                                        │
+                                        ├─ perception   RealSense D435 colour + depth → objects by height above the fitted table plane
+                                        ├─ recognition  CLIP ViT-B-32 crop embeddings · open-set gate · in-memory mirror of the Atlas library
+                                        ├─ planning     live table map · coverage search · candidate close looks · grasp primitives
+                                        ├─ control      xArm6 + gripper through Viam · visual-servo refine · quintic joint paths
+                                        └─ memory  ──▶  MongoDB Atlas
+                                                         views (vector index views_vec) · attempts · observations
+                                                         observation_images · clips · table_map · status
 ```
 
-## Running the autonomous pick-and-place (works on sfhack4, 2026-10-29)
+| Layer | Stack |
+|---|---|
+| Robot | UFactory xArm6 with its gripper, Intel RealSense D435 on the wrist |
+| Robot software | Viam RDK, Python SDK, one packaged module (`meta.json`, `module/`) |
+| Vision | depth segmentation (`sorter/perception.py`), CLIP ViT-B-32 via `open_clip` (`sorter/clip_embed.py`) |
+| Data | MongoDB Atlas: `$vectorSearch` over object views; every attempt, observation and map logged |
+| UI | FastAPI + one static page (`dashboard/`) |
+
+## Measured on the arm (single runs, Oct 30)
+
+| Task | Result |
+|---|---|
+| `blue block`, picked from the cached frame | in the bucket, 13.4 s |
+| `yellow block` | in the bucket, 15.1 s |
+| `blue cylinder, red box cutter` as one list | 2 of 2 in the bucket, 60.5 s in total |
+| Object library in Atlas | 232 views |
+| Perception per frame, after mirroring the library in memory | 920 ms → 380 ms |
+
+These are individual runs from the event, not a success-rate benchmark.
+
+## Known limitations
+
+- Jaw calibration is coarse. Grasps land about 7 mm off across the jaws at θ 0. `scripts/fine_calib.py` exists but was not run to completion.
+- Smooth cylinders sometimes slip during the lift. Slips are detected and retried, but not every retry succeeds.
+- Objects farther than about 600 mm from the base are at the edge of the reach model, and grasping them there is unverified.
+- The M&M's bag isn't in the library. It's handled by a narrow rule: an unknown, dark, bag-sized object.
+- There is no hand detection. It was removed because it kept flagging scenery past the table's edge. **Keep a person on the E-stop.**
+
+## Repository layout
+
+```
+module/      the Viam module: service, live map, dashboard feed, build + packaging (meta.json at the root)
+sorter/      perception, recognition, search and executor, bucket, Atlas store, table map, smooth motion
+scripts/     arm library (pick_place_auto.py), calibration, Atlas setup, evaluation and data tools
+dashboard/   FastAPI app and the single-page UI
+tests/       offline tests (plain Python scripts: python tests/<name>.py)
+rlds/        export of recorded robot episodes as an RLDS dataset for VLA training
+docs/        demo script, plans, demo photos, slides (docs/slides/index.html)
+```
+
+## Run it
+
+You need a Viam machine with an arm, gripper and wrist depth camera, and optionally a MongoDB Atlas cluster. Keep credentials in environment variables. None are in this repository.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-export VIAM_MACHINE_ADDRESS=... VIAM_API_KEY_ID=... VIAM_API_KEY=...   # from the machine's CONNECT tab
-.venv/bin/python scripts/pick_place_auto.py          # full run: yellow block -> blue tape square
-.venv/bin/python scripts/pick_place_auto.py place    # resume when the block is already in the gripper
+
+# build the module archive and load it onto your machine part
+sh module/build.sh
+viam module reload-local --file module/dist/archive.tar.gz --part-id <your-part-id>
+
+# Atlas (optional): one-time setup of collections and the vector index
+MONGODB_URI=... .venv/bin/python scripts/atlas_setup.py
+
+# dashboard, talking to the module
+VIAM_MACHINE_ADDRESS=... VIAM_API_KEY_ID=... VIAM_API_KEY=... .venv/bin/python dashboard/app.py   # http://localhost:8000
 ```
 
-No human or LLM in the loop: the colour camera closes the loop on x/y (Jacobian probed on the fly), the
-RealSense depth map gives every height. Result: `docs/first_success.jpg`.
+Set `MONGODB_URI` in the module's environment in the Viam config, not in its attributes. The module's attributes, DoCommand API and feature flags (`SORTER_*`) are documented in [module/README.md](module/README.md). Offline tests: `python tests/test_grasp_many.py` and the other files in `tests/`.
 
-Lessons that cost a run each:
-- `get_images()` right after a move returns a stale frame; wait ~1 s or the servo diverges.
-- The `table` obstacle `z=-123` is the centre of a 200 mm box; the real table top is ~0. Use depth, not config.
-- The configured camera offset was ~3-4 cm off; the jaw axis is calibrated from the fingertips visible in the image.
-- Depth is not aligned to colour and is invalid closer than ~280 mm; match depth blobs by position, carry depth over on vertical moves.
-- The held block occludes the tape square; treat it as a wall when finding the hole.
-- The WebRTC link from a laptop dropped once mid-run; run the script on the Linux box next to the arm.
+## Team
+
+Andrew Wang ([@yongzhe-wang](https://github.com/yongzhe-wang)) and Junli Gu ([@gujunli](https://github.com/gujunli)).
+
+Thanks to Viam and MongoDB for hosting the hackathon and providing the robot cell.

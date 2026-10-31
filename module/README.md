@@ -1,10 +1,12 @@
 # `sorter-team:sorter:grasp-by-description`
 
-A Viam **generic service**: tell it what to pick up in plain words, and it puts that object into a blue tape
-square on the table. It works with whatever is on the table: no training, no taught poses.
+A Viam **generic service**: tell it what to pick up in plain words, and it puts that object into an orange bucket
+(`SORTER_TARGET=bucket`, the default; set `square` for the original blue tape square). It works with whatever is on
+the table: no training, no taught poses. The bucket may be moved at any time: it is searched for and confirmed again
+over its mouth before the gripper opens.
 
 ```json
-{"grasp": "the green square"}   →   finds it, picks it, drops it in the square, logs the attempt
+{"grasp": "the green square"}   →   finds it, picks it, drops it in the bucket, logs the attempt
 ```
 
 Under the hood: the wrist depth camera finds every object by height above the table, CLIP picks the one that
@@ -19,7 +21,8 @@ rate and search past objects by image embedding.
   xArm gripper G2).
 - A wrist-mounted depth camera returning colour + depth from `GetImages` (tested: RealSense D435 with
   `align_color_depth: true`).
-- A square of **blue** painter's tape on the table, roughly 15–25 cm across, within reach.
+- An orange bucket (about 200 mm across, 180 mm tall) on the table within reach, or, with `SORTER_TARGET=square`, a
+  square of **blue** painter's tape roughly 15–25 cm across.
 - Objects 10–80 mm tall and narrower than your gripper's opening (about 78 mm on the xArm gripper).
 
 ## Add it to your machine
@@ -63,10 +66,11 @@ sorter = Generic.from_robot(machine, "sorter")
 await sorter.do_command({"grasp": "candy corn"})            # returns at once: {"accepted": true, "job": "..."}
 await sorter.do_command({"status": True})                   # {"busy": ..., "running": {...}, "last": {...}}
 await sorter.do_command({"grasp": "the pumpkin", "wait": True})  # blocks, returns the attempt summary
-await sorter.do_command({"reset": True})                    # empty the square (pick out, wipe if needed)
+await sorter.do_command({"stop": True})                     # end the current task only; the queue goes on
+await sorter.do_command({"reset": True})                    # bucket: let go, back to the observe pose (square: empty it)
 ```
 
-- Leading verbs are ignored ("grasp", "pick up", "get", ...); the destination is always the square.
+- Leading verbs are ignored ("grasp", "pick up", "get", ...); the destination is always the bucket (or the square).
 - **Always ready:** `run.sh` downloads the CLIP weights during install into `$VIAM_MODULE_DATA/cache` (kept
   across redeploys). At startup a background task loads CLIP (eval, all CPU threads) and the object library
   into memory and runs one dummy pass (`"warm": true`, `"warm_ms"` in status); until then a grasp answers
@@ -134,8 +138,7 @@ await sorter.do_command({"reset": True})                    # empty the square (
   a noun never leave a bare colour: "red and blue screwdriver" is two objects because the library has both, "black and
   yellow tape" is one described by both colours. Each item goes
   through the same decision and retries as a single grasp, with a fresh look from the observe pose before it, so what
-  was just delivered counts. If several objects fit an item's name, the best match is taken and logged instead of
-  answering `ambiguous`. `running.progress` reads `item 2/3: snack`, and the result is `done` / `partial` / `failed`
+  was just delivered counts. If several objects fit a name, all of them are picked, one after another (`lollipop (1/2)`, `(2/2)`). `running.progress` reads `item 2/3: snack`, and the result is `done` / `partial` / `failed`
   with `items: [{text, status, label, duration_s, fail_reason}]`. An item already in the square counts as done.
   - Moves on to the next item: `not_found`, `ambiguous`, `too_close`, `too_wide`, `square_full`, `unsafe_grasp`,
     `failed`.
@@ -158,17 +161,17 @@ await sorter.do_command({"reset": True})                    # empty the square (
     at most 40 views from grasps. Atlas: observations stop going up at 450 MB (`SORTER_ATLAS_STOP_MB`) of the free
     tier's 512 MB, so views and attempts still fit; they stay on the robot's disk and `flush()` sends them later.
   - `{"status": true}` has `atlas` (views, labels, attempts, usage, `learned`, `last_search`) for the dashboard's panel.
-- One job at a time. A request while busy returns `{"accepted": false, "error": "busy", "running": {...}}`.
-- Summaries contain `status` (`done`, `failed`, `not_found`, `ambiguous` = two objects match about equally,
-  `already_in_square` = the named object is only in the drop square (answered at once, no sweep),
-  `already_in_bucket` = this module run put it into the bucket and nothing it names has been on the table since (the
-  bucket hides what is inside from the map; answered at once, counts as done in a list; `{"status": true}` lists them
-  as `bucket`; a reset forgets them; `module/grasp_policy.py`), `too_wide`,
-  `too_close` = too near the arm base, please move it out, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
-- A hand or arm reaching into the workspace pauses the robot; it resumes 2 s after the workspace is clear.
+- One job at a time. A grasp while busy is queued: `{"accepted": true, "queued": true, "position": n}`, each object of a
+  comma list its own entry; queued jobs start by themselves when the arm is free. `{"clear_queue": true}` and a reset
+  empty the queue. `{"stop": true}` ends only the running task: it stops at its next arm command, lifts, puts back
+  what it holds, is not retried, and reports `stopped`.
+- Summaries contain `status` (`done`, `failed`, `not_found`, `stopped`, `already_in_square` = the named object is only in
+  the drop square (square mode), `too_wide`, `too_close` = too near the arm base, please move it out, `error`), `label`, `score`, `duration_s`, and `fail_phase` / `fail_reason` on failure.
+- There is no hand detection (removed on 2026-10-30: scenery past the table's edge kept pausing the arm). Keep a
+  person on the E-stop.
 
 Our web dashboard (no Atlas needed; `DASH_MODULE_NAME` if your service is not called `sorter`) shows three live
-views: the command box (Grasp, Reset; Preview, Scan table, Clear map and Teach under "more") with the job's state,
+views: the command box (Grasp, Stop, Reset) with the queue and the job's state,
 progress and per-item results; the arm camera with the recognised boxes; and the module's map of the table with the
 bucket, the arm and what the camera sees. Its robot link sends this module one `{"dashboard": {"since": ts}}` at most
 twice a second, however many browsers are open; the picture is the newest of the idle look, every executor frame of a
