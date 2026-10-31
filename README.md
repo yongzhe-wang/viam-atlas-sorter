@@ -97,3 +97,7 @@ Set `MONGODB_URI` in the module's environment in the Viam config, not in its att
 Andrew Wang ([@yongzhe-wang](https://github.com/yongzhe-wang)) and Junli Gu ([@gujunli](https://github.com/gujunli)).
 
 Thanks to Viam and MongoDB for hosting the hackathon and providing the robot cell.
+
+## License
+
+[MIT](LICENSE)
